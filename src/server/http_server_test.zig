@@ -7,6 +7,63 @@ const closeI32Fd = helpers.closeI32Fd;
 const builtin = @import("builtin");
 const posix = std.posix;
 
+// Winsock send for the request-pump writer thread below. The test's
+// socketpair on Windows is a TCP loopback pair of raw SOCKETs — CRT
+// write() doesn't work on them, so the pump uses winsock.send there
+// (mirrors the production sendAll Windows path).
+const test_winsock = if (builtin.os.tag == .windows) struct {
+    extern "ws2_32" fn send(sockfd: c_int, buf: ?*const anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
+} else struct {};
+
+/// Write a whole buffer to a test socketpair end (both platforms).
+fn writeTestFd(fd: std.c.fd_t, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n: isize = if (comptime builtin.os.tag == .windows)
+            test_winsock.send(helpers.toI32(fd), data.ptr + off, @intCast(data.len - off), 0)
+        else
+            linux.write(fd, data.ptr + off, data.len - off);
+        if (n <= 0) return error.WriteFailed;
+        off += @as(usize, @intCast(n));
+    }
+}
+
+/// Close the write end of a test socketpair (both platforms). The
+/// reader sees EOF afterwards instead of parking forever.
+fn closeTestFd(fd: std.c.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        helpers.closeI32Fd(helpers.toI32(fd));
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
+/// Pumps headers+body into a test socketpair from a writer thread while
+/// the main thread reads. Serial write-then-read deadlocks on platforms
+/// whose socket/pipe buffer is smaller than the ~14KB payload
+/// (macOS, Windows): the writer parks forever with no concurrent
+/// reader. The writer ALWAYS closes the write end when done (success
+/// or error) so the reader sees EOF instead of parking forever on a
+/// failed pump.
+const RequestPump = struct {
+    fd: std.c.fd_t,
+    headers: []const u8,
+    body: []const u8,
+    err: ?anyerror = null,
+
+    fn run(self: *RequestPump) void {
+        defer closeTestFd(self.fd);
+        writeTestFd(self.fd, self.headers) catch |e| {
+            self.err = e;
+            return;
+        };
+        writeTestFd(self.fd, self.body) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+};
+
 // ============================================================================
 // Address Struct Tests
 // ============================================================================
@@ -351,10 +408,9 @@ test "RequestBuffer.readFullRequest with exact POST headers (13248 body)" {
         // socketpair not supported, skip test
         return;
     }
-    defer {
-        _ = std.c.close(pipe_fds[0]);
-        _ = std.c.close(pipe_fds[1]);
-    }
+    // NOTE: no close-both defer here — the writer thread owns the
+    // write end (pipe_fds[1], closed when the pump finishes) and the
+    // pump defer below owns the read end (pipe_fds[0]).
 
     // Build the exact headers you sent
     const headers = 
@@ -386,17 +442,17 @@ test "RequestBuffer.readFullRequest with exact POST headers (13248 body)" {
         body[i] = @as(u8, @truncate(i));
     }
 
-    // Send headers first
-    const written1 = linux.write(pipe_fds[1], headers.ptr, headers.len);
-    if (written1 < 0) return error.WriteFailed;
-    
-    // Send body in chunks to simulate real scenario
-    var sent: usize = 0;
-    while (sent < body_size) {
-        const chunk = @min(4096, body_size - sent);
-        const written = linux.write(pipe_fds[1], body.ptr + sent, chunk);
-        if (written < 0) return error.WriteFailed;
-        sent += @as(usize, @intCast(written));
+    // Pump headers+body from a writer thread while the main thread
+    // reads (see RequestPump above — serial write-then-read deadlocks
+    // on macOS/Windows whose socket/pipe buffer is smaller than the
+    // ~14KB payload). The writer owns the write end (closes it when
+    // done); the single defer below joins the writer first, then
+    // closes the read end.
+    var pump = RequestPump{ .fd = pipe_fds[1], .headers = headers, .body = body };
+    const writer = try std.Thread.spawn(.{}, RequestPump.run, .{&pump});
+    defer {
+        writer.join();
+        closeTestFd(pipe_fds[0]);
     }
 
     // Use RequestBuffer to read
@@ -422,6 +478,11 @@ test "RequestBuffer.readFullRequest with exact POST headers (13248 body)" {
     try std.testing.expectEqual(@as(u8, 1), result_body[1]);
     try std.testing.expectEqual(@as(u8, 100), result_body[100]);
     try std.testing.expectEqual(@as(u8, @truncate(body_size - 1)), result_body[body_size - 1]);
+
+    // The pump must have finished cleanly (the defer above already
+    // joined it — surfacing a writer-side failure as a test error
+    // keeps a broken pump from hiding behind a short read).
+    if (pump.err) |e| return e;
 }
 
 // Test getContentLength with your exact headers

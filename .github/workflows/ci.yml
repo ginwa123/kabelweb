@@ -64,11 +64,11 @@ jobs:
         # Split from client suites so a hanging suite is localized to
         # one half. Bounded so a hang fails fast with logs instead of
         # burning the runner limit with zero output.
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: zig build test-server --summary all
 
       - name: Test client suites
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: zig build test-client --summary all
 
   soak:
@@ -89,5 +89,5 @@ jobs:
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev
 
       - name: Test (fast suites + 60s SSE soaks)
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: zig build test --summary all

@@ -945,6 +945,9 @@ pub fn build(b: *std.Build) void {
     }
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    // Forward `zig build test -- --test-filter=...` to the test binary
+    // (bisecting a hanging suite without editing the runner).
+    if (b.args) |args| run_mod_tests.addArgs(args);
     const test_step = b.step("test", "Run kabelweb package tests (fast suites + 60s SSE soaks)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(b.getInstallStep());
@@ -954,6 +957,7 @@ pub fn build(b: *std.Build) void {
     // full `test` step (ubuntu job) instead of blocking mac/Windows.
     const fast_tests = b.addTest(.{ .root_module = fast_test_mod });
     const run_fast_tests = b.addRunArtifact(fast_tests);
+    if (b.args) |args| run_fast_tests.addArgs(args);
     const test_fast_step = b.step("test-fast", "Run kabelweb fast suites (no 60s SSE soaks)");
     test_fast_step.dependOn(&run_fast_tests.step);
     test_fast_step.dependOn(b.getInstallStep());
@@ -963,11 +967,13 @@ pub fn build(b: *std.Build) void {
     // half instead of stalling the whole binary with zero output.
     const server_tests = b.addTest(.{ .root_module = server_test_mod });
     const run_server_tests = b.addRunArtifact(server_tests);
+    if (b.args) |args| run_server_tests.addArgs(args);
     const test_server_step = b.step("test-server", "Run kabelweb server suites only (no soaks, no sse_chunked)");
     test_server_step.dependOn(&run_server_tests.step);
     test_server_step.dependOn(b.getInstallStep());
     const client_tests = b.addTest(.{ .root_module = client_test_mod });
     const run_client_tests = b.addRunArtifact(client_tests);
+    if (b.args) |args| run_client_tests.addArgs(args);
     const test_client_step = b.step("test-client", "Run kabelweb client suites only");
     test_client_step.dependOn(&run_client_tests.step);
     test_client_step.dependOn(b.getInstallStep());
