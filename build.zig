@@ -482,7 +482,12 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
             // symlinks under /usr/lib/<triplet>/ (e.g.
             // /usr/lib/x86_64-linux-gnu/libcurl.so from
             // libcurl4-openssl-dev) instead of /usr/lib/ — check both.
-            curl_hdr = fileExists("/usr/include/curl/curl.h");
+            // The curl headers can also live under the multiarch
+            // include dir (/usr/include/<triplet>/curl/curl.h) since
+            // curlbuild.h is arch-dependent — check those too.
+            curl_hdr = fileExists("/usr/include/curl/curl.h") or
+                fileExists("/usr/include/x86_64-linux-gnu/curl/curl.h") or
+                fileExists("/usr/include/aarch64-linux-gnu/curl/curl.h");
             found_curl_lib = fileExists("/usr/lib/libcurl.so") or
                 fileExists("/usr/lib/x86_64-linux-gnu/libcurl.so") or
                 fileExists("/usr/lib/aarch64-linux-gnu/libcurl.so");
@@ -605,15 +610,26 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always use the vendored libcurl archive",
     ) orelse false;
 
-    // Debian/Ubuntu multiarch: the unversioned linker symlinks live
-    // under /usr/lib/<triplet>/ instead of /usr/lib/. Resolve the one
-    // that exists on this host (at most one will) so the link wiring
-    // below can add it. Gated on existence — passing a nonexistent -L
-    // dir is a hard error, not a no-op.
-    const multiarch_lib_dir: ?[]const u8 = if (fileExists("/usr/lib/x86_64-linux-gnu/libcurl.so"))
-        "/usr/lib/x86_64-linux-gnu"
-    else if (fileExists("/usr/lib/aarch64-linux-gnu/libcurl.so"))
-        "/usr/lib/aarch64-linux-gnu"
+    // Debian/Ubuntu multiarch: headers AND libs can live under
+    // /usr/include/<triplet>/ + /usr/lib/<triplet>/ instead of the
+    // plain dirs. Resolve the triplet present on this host (at most
+    // one will be) so the link/include wiring below can add it.
+    // Gated on existence — passing a nonexistent -L dir is a hard
+    // error, not a no-op.
+    const multiarch_triplet: ?[]const u8 = if (fileExists("/usr/lib/x86_64-linux-gnu/libcurl.so") or
+        fileExists("/usr/include/x86_64-linux-gnu/curl/curl.h"))
+        "x86_64-linux-gnu"
+    else if (fileExists("/usr/lib/aarch64-linux-gnu/libcurl.so") or
+        fileExists("/usr/include/aarch64-linux-gnu/curl/curl.h"))
+        "aarch64-linux-gnu"
+    else
+        null;
+    const multiarch_lib_dir: ?[]const u8 = if (multiarch_triplet) |t|
+        b.fmt("/usr/lib/{s}", .{t})
+    else
+        null;
+    const multiarch_include_dir: ?[]const u8 = if (multiarch_triplet) |t|
+        b.fmt("/usr/include/{s}", .{t})
     else
         null;
 
@@ -728,12 +744,16 @@ pub fn build(b: *std.Build) void {
                     // (cli tests, package tests) — even though it works for
                     // the main exe via the root build.zig's
                     // `linkPlatformDeps`. Mirrors the macOS branch below.
-                    // The multiarch dir covers Debian/Ubuntu, whose
-                    // unversioned linker symlinks live under
-                    // /usr/lib/<triplet>/ (resolved above; null elsewhere).
+                    // The multiarch dirs cover Debian/Ubuntu, whose
+                    // headers + linker symlinks live under
+                    // /usr/<include|lib>/<triplet>/ (resolved above; null
+                    // elsewhere).
                     m.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
                     if (multiarch_lib_dir) |dir| {
                         m.addLibraryPath(.{ .cwd_relative = dir });
+                    }
+                    if (multiarch_include_dir) |dir| {
+                        m.addIncludePath(.{ .cwd_relative = dir });
                     }
                 },
                 .macos => {
@@ -886,6 +906,9 @@ pub fn build(b: *std.Build) void {
         test_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
         if (multiarch_lib_dir) |dir| {
             test_mod.addLibraryPath(.{ .cwd_relative = dir });
+        }
+        if (multiarch_include_dir) |dir| {
+            test_mod.addIncludePath(.{ .cwd_relative = dir });
         }
     }
     const mod_tests = b.addTest(.{ .root_module = test_mod });

@@ -31,6 +31,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev
 
+      - name: Diagnose system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for f in /usr/include/curl/curl.h /usr/include/openssl/ssl.h \
+                   /usr/lib/libcurl.so /usr/lib/libssl.so /usr/lib/libcrypto.so \
+                   /usr/include/x86_64-linux-gnu/curl/curl.h \
+                   /usr/lib/x86_64-linux-gnu/libcurl.so \
+                   /usr/lib/x86_64-linux-gnu/libssl.so \
+                   /usr/lib/x86_64-linux-gnu/libcrypto.so; do
+            if [ -f "$f" ]; then echo "  ok $f"; else echo "  MISSING $f"; fi
+          done
+
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
