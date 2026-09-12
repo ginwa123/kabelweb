@@ -60,5 +60,29 @@ jobs:
       - name: Build
         run: zig build --summary all
 
+      - name: Test (fast suites, no 60s SSE soaks)
+        # Bounded so a hanging test fails the job instead of burning
+        # the 6h runner limit with zero output.
+        timeout-minutes: 15
+        run: zig build test-fast --summary all
+
+  soak:
+    name: soak (ubuntu, 60s SSE soaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
       - name: Test (fast suites + 60s SSE soaks)
+        timeout-minutes: 20
         run: zig build test --summary all

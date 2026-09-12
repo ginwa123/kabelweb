@@ -651,6 +651,17 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("c", .{});
     test_mod.link_libc = true;
 
+    // Fast test module: the lib root (src/root.zig) — every suite
+    // EXCEPT the 60 s SSE soaks. CI runs this on all platforms; the
+    // full `test` step (with soaks) runs where timing is stable.
+    const fast_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fast_test_mod.linkSystemLibrary("c", .{});
+    fast_test_mod.link_libc = true;
+
     // Example binaries (living docs — see src/examples/). The server
     // demo serves the landing page + SSE/WS/template routes; the client
     // smoke CLI fires one request. Both consume the lib via
@@ -707,12 +718,13 @@ pub fn build(b: *std.Build) void {
         .found_crypto = false,
     } else probeSystemLibs(b, target);
 
-    // Lib wiring applies to ALL modules (lib + test + both example exes).
-    // The test binary compiles the same server + client sources, so it
-    // needs the same include paths + link line; the exes need it too.
+    // Lib wiring applies to ALL modules (lib + both test modules +
+    // both example exes). The test binaries compile the same server +
+    // client sources, so they need the same include paths + link line;
+    // the exes need it too.
     // Second iteration skips the Windows stub generation via the
     // fileExists check (first iteration already wrote the archive).
-    for ([_]*std.Build.Module{ mod, test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
         if (sys.use_system) {
             // System libs path. `linkSystemLibrary("curl")` does NOT auto-
             // pull libssl/libcrypto (no pkg-config Requires honour), so we
@@ -896,24 +908,35 @@ pub fn build(b: *std.Build) void {
 
     // === Tests for the package itself ===
     // `b.addTest({ .root_module = test_mod })` runs the full entry
-    // (src/full_test.zig): fast suites + the 60 s SSE soaks. test_mod
-    // carries link_libc + (system or vendored) curl/ssl/crypto (wired
-    // above) + the `helpers` import, so the TLS + in-process-server
-    // suites link and resolve cleanly. On
+    // (src/full_test.zig): fast suites + the 60 s SSE soaks. Both test
+    // modules carry link_libc + (system or vendored) curl/ssl/crypto
+    // (wired above), so the TLS + in-process-server suites link and
+    // resolve cleanly. On
     // Linux the system libssl/libcrypto live in /usr/lib, which Zig does
     // not add by default for some Compile steps.
-    if (target.result.os.tag == .linux and sys.use_system) {
-        test_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-        if (multiarch_lib_dir) |dir| {
-            test_mod.addLibraryPath(.{ .cwd_relative = dir });
-        }
-        if (multiarch_include_dir) |dir| {
-            test_mod.addIncludePath(.{ .cwd_relative = dir });
+    for ([_]*std.Build.Module{ test_mod, fast_test_mod }) |tm| {
+        if (target.result.os.tag == .linux and sys.use_system) {
+            tm.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+            if (multiarch_lib_dir) |dir| {
+                tm.addLibraryPath(.{ .cwd_relative = dir });
+            }
+            if (multiarch_include_dir) |dir| {
+                tm.addIncludePath(.{ .cwd_relative = dir });
+            }
         }
     }
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
-    const test_step = b.step("test", "Run kabelweb package tests");
+    const test_step = b.step("test", "Run kabelweb package tests (fast suites + 60s SSE soaks)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(b.getInstallStep());
+
+    // Fast suites only (no 60 s soaks) — what CI runs on every
+    // platform. The soaks are timing-sensitive; they run in the
+    // full `test` step (ubuntu job) instead of blocking mac/Windows.
+    const fast_tests = b.addTest(.{ .root_module = fast_test_mod });
+    const run_fast_tests = b.addRunArtifact(fast_tests);
+    const test_fast_step = b.step("test-fast", "Run kabelweb fast suites (no 60s SSE soaks)");
+    test_fast_step.dependOn(&run_fast_tests.step);
+    test_fast_step.dependOn(b.getInstallStep());
 }
