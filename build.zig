@@ -477,11 +477,22 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
             // (We check the unversioned `libcurl.so` symlink AND the
             // unversioned `libssl.so` / `libcrypto.so` — most distros
             // keep these as symlinks to the versioned .so.N library.)
+            //
+            // Debian/Ubuntu multiarch puts the unversioned linker
+            // symlinks under /usr/lib/<triplet>/ (e.g.
+            // /usr/lib/x86_64-linux-gnu/libcurl.so from
+            // libcurl4-openssl-dev) instead of /usr/lib/ — check both.
             curl_hdr = fileExists("/usr/include/curl/curl.h");
-            found_curl_lib = fileExists("/usr/lib/libcurl.so");
+            found_curl_lib = fileExists("/usr/lib/libcurl.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libcurl.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libcurl.so");
             ssl_hdr = fileExists("/usr/include/openssl/ssl.h");
-            found_ssl_lib = fileExists("/usr/lib/libssl.so");
-            found_crypto_lib = fileExists("/usr/lib/libcrypto.so");
+            found_ssl_lib = fileExists("/usr/lib/libssl.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libssl.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libssl.so");
+            found_crypto_lib = fileExists("/usr/lib/libcrypto.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libcrypto.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libcrypto.so");
         },
         .macos => {
             // macOS: Homebrew installs keg-only libs at
@@ -594,6 +605,18 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always use the vendored libcurl archive",
     ) orelse false;
 
+    // Debian/Ubuntu multiarch: the unversioned linker symlinks live
+    // under /usr/lib/<triplet>/ instead of /usr/lib/. Resolve the one
+    // that exists on this host (at most one will) so the link wiring
+    // below can add it. Gated on existence — passing a nonexistent -L
+    // dir is a hard error, not a no-op.
+    const multiarch_lib_dir: ?[]const u8 = if (fileExists("/usr/lib/x86_64-linux-gnu/libcurl.so"))
+        "/usr/lib/x86_64-linux-gnu"
+    else if (fileExists("/usr/lib/aarch64-linux-gnu/libcurl.so"))
+        "/usr/lib/aarch64-linux-gnu"
+    else
+        null;
+
     const mod = b.addModule("kabelweb", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -705,7 +728,13 @@ pub fn build(b: *std.Build) void {
                     // (cli tests, package tests) — even though it works for
                     // the main exe via the root build.zig's
                     // `linkPlatformDeps`. Mirrors the macOS branch below.
+                    // The multiarch dir covers Debian/Ubuntu, whose
+                    // unversioned linker symlinks live under
+                    // /usr/lib/<triplet>/ (resolved above; null elsewhere).
                     m.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+                    if (multiarch_lib_dir) |dir| {
+                        m.addLibraryPath(.{ .cwd_relative = dir });
+                    }
                 },
                 .macos => {
                     // Probe uses an OR-of-paths predicate, but link only
@@ -855,6 +884,9 @@ pub fn build(b: *std.Build) void {
     // not add by default for some Compile steps.
     if (target.result.os.tag == .linux and sys.use_system) {
         test_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        if (multiarch_lib_dir) |dir| {
+            test_mod.addLibraryPath(.{ .cwd_relative = dir });
+        }
     }
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
