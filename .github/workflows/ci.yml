@@ -1,0 +1,52 @@
+name: kabelweb CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config openssl@3 curl
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install --recurse curl:x64-windows openssl:x64-windows
+          # Runtime DLLs (libcurl.dll, libssl-3-x64.dll, ...) must be on
+          # PATH or the test binary aborts before main() runs.
+          "C:\vcpkg\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Test (fast suites + 60s SSE soaks)
+        run: zig build test --summary all

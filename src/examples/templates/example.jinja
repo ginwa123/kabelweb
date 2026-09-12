@@ -1,0 +1,30 @@
+{% extends "base.jinja" %}
+
+{% block content %}
+<h1>Jinja-Style Templating Demo</h1>
+
+<p>This page is rendered by the <code>template.zig</code> engine
+bundled with <code>custom_http_server</code>. The base layout
+(<code>base.jinja</code>) lives in <code>src/templates/</code>;
+this child overrides the <code>content</code> block.</p>
+
+<h2>{% block section_title %}Features{% endblock %}</h2>
+
+<ul>
+{% for f in features %}
+  <li class="feature">
+    <h2>{{ f.name }}</h2>
+    <p>{{ f.description }}</p>
+  </li>
+{% endfor %}
+</ul>
+
+{% if show_extra %}
+  <p>You are seeing the bonus section because <code>show_extra</code> is true.</p>
+  <p>Raw output demo: {% raw %}{{ this is not a variable }}{% endraw %}</p>
+{% else %}
+  <p>The bonus section is hidden. Set <code>show_extra=true</code> to reveal it.</p>
+{% endif %}
+
+<div class="footer">Build: {{ build_sha }} | Server started at {{ started_at }}</div>
+{% endblock %}

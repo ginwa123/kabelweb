@@ -1,0 +1,16 @@
+.{
+    .name = .kabelweb,
+    .version = "0.0.0",
+    .fingerprint = 0x4af4db419b5a16be,
+    .minimum_zig_version = "0.16.0",
+    // Zero dependencies — pure Zig server + system-or-vendored libcurl
+    // client. Keeps kabelweb consumable as a standalone library.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "README.md",
+    },
+}
