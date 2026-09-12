@@ -1,5 +1,7 @@
 # kabelweb
 
+> ⚠️ **WARNING: This repo is AI slop and experimental, DO NOT USE IN PRODUCTION!!!!!!** ⚠️
+
 Unified Zig web-framework library: a pure-Zig HTTP **server** plus a
 libcurl-backed HTTP **client** in one package.
 
