@@ -123,8 +123,7 @@ test "sse: SseManager broadcast to multiple clients delivers all messages" {
 
 test "sse: SseClient.sendEvent writes chunked-encoded frame with hex length" {
     const pair = try createSocketPair();
-    defer _ = std.c.close(pair[0]);
-    defer _ = std.c.close(pair[1]);
+    defer helpers.closeSocketPair(pair);
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -138,16 +137,17 @@ test "sse: SseClient.sendEvent writes chunked-encoded frame with hex length" {
     //   "13\r\ndata: hello there\n\n\r\n" (length=19 hex="13")
     try client.sendEvent("data: hello there\n\n");
 
-    var buf: [64]u8 = undefined;
-    const n = linux.read(pair[1], &buf, buf.len);
-    try expect(n == 25); // "13\r\n" (4) + "data: hello there\n\n" (19) + "\r\n" (2) = 25
-    try expectEqualStrings("13\r\ndata: hello there\n\n\r\n", buf[0..@intCast(n)]);
+    // Read exactly the 25-byte frame (TCP loopback pairs return
+    // partial reads; a single-shot read is only correct on POSIX
+    // socketpairs with room in the buffer).
+    var buf: [25]u8 = undefined;
+    try helpers.readTestFdFull(pair[1], &buf);
+    try expectEqualStrings("13\r\ndata: hello there\n\n\r\n", &buf);
 }
 
 test "sse: SseClient.sendEvent with empty event writes terminator chunk" {
     const pair = try createSocketPair();
-    defer _ = std.c.close(pair[0]);
-    defer _ = std.c.close(pair[1]);
+    defer helpers.closeSocketPair(pair);
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -159,17 +159,19 @@ test "sse: SseClient.sendEvent with empty event writes terminator chunk" {
 
     try client.sendEvent("");
 
-    var buf: [16]u8 = undefined;
-    const n = linux.read(pair[1], &buf, buf.len);
-    try expect(n == 5);
-    try expectEqualStrings("0\r\n\r\n", buf[0..@intCast(n)]);
+    var buf: [5]u8 = undefined;
+    try helpers.readTestFdFull(pair[1], &buf);
+    try expectEqualStrings("0\r\n\r\n", &buf);
 }
 
 test "sse: SseClient.sendEvent with disconnected fd returns ClientDisconnected" {
     const pair = try createSocketPair();
-    // Close the read end first to simulate disconnection
-    _ = std.c.close(pair[1]);
-    defer _ = std.c.close(pair[0]);
+    // Close the read end first to simulate disconnection. Must be a
+    // REAL close (closesocket on Windows — CRT close silently succeeds
+    // without closing a SOCKET, leaving the peer connected and the
+    // send below succeeding).
+    helpers.closeTestFd(pair[1]);
+    defer helpers.closeTestFd(pair[0]);
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();

@@ -1,0 +1,8 @@
+# Force LF line endings on every checkout (all platforms).
+#
+# Why: several static-contract tests grep source files for newline-
+# sensitive patterns (e.g. "\n    }\n" function-body extraction). A
+# Windows checkout with autocrlf would hand them CRLF and fail every
+# such test. Normalizing to LF keeps the suite deterministic on
+# ubuntu/macos/windows.
+* text=auto eol=lf

@@ -4,39 +4,10 @@ const http_parser = @import("http_parser.zig");
 const linux = std.posix.system;
 const helpers = @import("test_helpers.zig");
 const closeI32Fd = helpers.closeI32Fd;
+const writeTestFd = helpers.writeTestFdAll;
+const closeTestFd = helpers.closeTestFd;
 const builtin = @import("builtin");
 const posix = std.posix;
-
-// Winsock send for the request-pump writer thread below. The test's
-// socketpair on Windows is a TCP loopback pair of raw SOCKETs — CRT
-// write() doesn't work on them, so the pump uses winsock.send there
-// (mirrors the production sendAll Windows path).
-const test_winsock = if (builtin.os.tag == .windows) struct {
-    extern "ws2_32" fn send(sockfd: c_int, buf: ?*const anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
-} else struct {};
-
-/// Write a whole buffer to a test socketpair end (both platforms).
-fn writeTestFd(fd: std.c.fd_t, data: []const u8) !void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const n: isize = if (comptime builtin.os.tag == .windows)
-            test_winsock.send(helpers.toI32(fd), data.ptr + off, @intCast(data.len - off), 0)
-        else
-            linux.write(fd, data.ptr + off, data.len - off);
-        if (n <= 0) return error.WriteFailed;
-        off += @as(usize, @intCast(n));
-    }
-}
-
-/// Close the write end of a test socketpair (both platforms). The
-/// reader sees EOF afterwards instead of parking forever.
-fn closeTestFd(fd: std.c.fd_t) void {
-    if (comptime builtin.os.tag == .windows) {
-        helpers.closeI32Fd(helpers.toI32(fd));
-    } else {
-        _ = std.c.close(fd);
-    }
-}
 
 /// Pumps headers+body into a test socketpair from a writer thread while
 /// the main thread reads. Serial write-then-read deadlocks on platforms

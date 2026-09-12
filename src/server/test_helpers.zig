@@ -1,6 +1,6 @@
-// src/modules/kabelweb/src/server/test_helpers.zig
+// src/server/test_helpers.zig
 //
-// Cross-platform test helpers for the custom_http_server test suite.
+// Cross-platform test helpers for the kabelweb server test suite.
 // Tests that need to create connected socket pairs, cast fd_t → i32
 // for the production API, or call Windows-only kernel32/winsock
 // functions get their primitives from here so the per-file
@@ -67,6 +67,19 @@ const win = if (builtin.os.tag == .windows) struct {
         addrlen: [*]c_int,
     ) callconv(.c) c_int;
     extern "ws2_32" fn closesocket(sockfd: c_int) callconv(.c) c_int;
+    extern "ws2_32" fn send(
+        sockfd: c_int,
+        buf: ?*const anyopaque,
+        len: c_int,
+        flags: c_int,
+    ) callconv(.c) c_int;
+    extern "ws2_32" fn recv(
+        sockfd: c_int,
+        buf: [*]u8,
+        len: c_int,
+        flags: c_int,
+    ) callconv(.c) c_int;
+    extern "ws2_32" fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int;
 
     /// WSADATA struct passed to WSAStartup. 400 bytes is the canonical
     /// size per Winsock 2 docs; the contents are intentionally ignored
@@ -222,6 +235,60 @@ pub fn closeSocketPair(pair: [2]std.c.fd_t) void {
     } else {
         _ = std.c.close(pair[0]);
         _ = std.c.close(pair[1]);
+    }
+}
+
+/// Read from a test socketpair end (both platforms). Returns bytes read,
+/// 0 on orderly shutdown, -1 on error. On Windows the pair ends are raw
+/// winsock SOCKETs — CRT `read()` doesn't work on them (it returns an
+/// error without touching the buffer, which surfaces downstream as
+/// inexplicable content mismatches), so use winsock.recv there.
+pub fn readTestFd(fd: std.c.fd_t, buf: []u8) isize {
+    if (comptime builtin.os.tag == .windows) {
+        return win.recv(toI32(fd), buf.ptr, @intCast(buf.len), 0);
+    } else {
+        return std.c.read(fd, buf.ptr, buf.len);
+    }
+}
+
+/// Read exactly `buf.len` bytes from a test socketpair end, looping on
+/// short reads (TCP loopback pairs return partial reads). Returns
+/// error.ReadFailed on EOF-before-full or any read error.
+pub fn readTestFdFull(fd: std.c.fd_t, buf: []u8) !void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = readTestFd(fd, buf[off..]);
+        if (n <= 0) return error.ReadFailed;
+        off += @as(usize, @intCast(n));
+    }
+}
+
+/// Write all of `data` to a test socketpair end, looping on short
+/// writes (TCP loopback pairs on Windows return partial sends; a
+/// single-shot write silently truncates). Returns error.WriteFailed
+/// on any send error.
+pub fn writeTestFdAll(fd: std.c.fd_t, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n: isize = if (comptime builtin.os.tag == .windows)
+            win.send(toI32(fd), data.ptr + off, @intCast(data.len - off), 0)
+        else
+            std.c.write(fd, data.ptr + off, data.len - off);
+        if (n <= 0) return error.WriteFailed;
+        off += @as(usize, @intCast(n));
+    }
+}
+
+/// Close one end of a test socketpair (both platforms). Prefer this
+/// over bare `std.c.close` in tests — on Windows only closesocket()
+/// actually releases a SOCKET (CRT close silently succeeds without
+/// closing, leaving the peer connected and the next test's assertions
+/// observing a live socket).
+pub fn closeTestFd(fd: std.c.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.closesocket(toI32(fd));
+    } else {
+        _ = std.c.close(fd);
     }
 }
 

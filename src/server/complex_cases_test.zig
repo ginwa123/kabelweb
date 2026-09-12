@@ -851,14 +851,19 @@ test "ginwa: destroy releases router routes (no leak via destroy alone)" {
 test "address: closeFd on Address fd closes it (kernel returns EBADF on next op)" {
     const addr = try http_server.Address.init("127.0.0.1", 45713);
     const fd = addr.sock_fd;
+    // fd_t form for the read below (SOCKET-as-pointer on Windows).
+    const fd_t: std.c.fd_t = if (comptime builtin.os.tag == .windows)
+        @ptrFromInt(@as(usize, @bitCast(@as(isize, fd))))
+    else
+        @intCast(fd);
 
-    _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, fd)))) else @intCast(fd));
+    // Platform close (closesocket on Windows — CRT close silently
+    // succeeds without closing a SOCKET, leaving the peer connected).
+    helpers.closeI32Fd(fd);
 
-    // After close, a recv on this fd should fail (the socket is no longer valid).
+    // After close, a recv on this fd must fail on every platform.
     var buf: [16]u8 = undefined;
-    const fd_for_read: std.c.fd_t = if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, fd)))) else @intCast(fd);
-    const rc = std.c.read(fd_for_read, &buf, buf.len);
-    try expect(rc < 0);
+    try expect(helpers.readTestFd(fd_t, &buf) < 0);
 }
 
 // ============================================================================
@@ -952,21 +957,21 @@ fn createBsdSocketPair() ![2]std.c.fd_t {
 
 test "sse: writeChunkedFrame handles empty event (terminator chunk)" {
     const pair = try createSocketPair();
-    defer _ = std.c.close(pair[0]);
-    defer _ = std.c.close(pair[1]);
+    defer helpers.closeSocketPair(pair);
 
     try sse_manager.writeChunkedFrame(toI32(pair[0]), "");
 
+    // Read exactly the 5-byte terminator (TCP loopback pairs return
+    // partial reads; a single-shot read is only correct on POSIX
+    // socketpairs with room in the buffer).
     var buf: [16]u8 = undefined;
-    const n = std.c.read(pair[1], &buf, buf.len);
-    try expect(n == 5); // "0\r\n\r\n"
-    try expectEqualSlices(u8, "0\r\n\r\n", buf[0..@intCast(n)]);
+    try helpers.readTestFdFull(pair[1], buf[0..5]);
+    try expectEqualSlices(u8, "0\r\n\r\n", buf[0..5]);
 }
 
 test "sse: writeChunkedFrame handles large event (16 KB)" {
     const pair = try createSocketPair();
-    defer _ = std.c.close(pair[0]);
-    defer _ = std.c.close(pair[1]);
+    defer helpers.closeSocketPair(pair);
 
     var large = std.ArrayList(u8).empty;
     defer large.deinit(allocator);
@@ -976,11 +981,10 @@ test "sse: writeChunkedFrame handles large event (16 KB)" {
     try sse_manager.writeChunkedFrame(toI32(pair[0]), large.items);
 
     // Read the hex header "4000\r\n" (6 bytes) + 16384 data + "\r\n" (2 bytes) = 16392
-    var header_buf: [32]u8 = undefined;
-    const n = std.c.read(pair[1], &header_buf, header_buf.len);
-    try expect(n > 0);
+    var header_buf: [6]u8 = undefined;
+    try helpers.readTestFdFull(pair[1], &header_buf);
     // Hex length of 16384 is "4000"
-    try expectEqualStrings("4000\r\n", header_buf[0..6]);
+    try expectEqualStrings("4000\r\n", &header_buf);
 }
 
 test "sse: register 100 clients then remove all — no FD leaks" {
@@ -1090,8 +1094,7 @@ test "integration: parse 100 sequential requests from socket pair" {
     // Simulates a server parsing multiple HTTP requests from one
     // persistent connection. The parser is called once per request.
     const pair = try createSocketPair();
-    defer _ = std.c.close(pair[0]);
-    defer _ = std.c.close(pair[1]);
+    defer helpers.closeSocketPair(pair);
 
     var i: usize = 0;
     while (i < 100) : (i += 1) {
@@ -1103,8 +1106,9 @@ test "integration: parse 100 sequential requests from socket pair" {
         );
 
         // Write to client end of pair (server reads from pair[0]).
-        const written = std.c.write(pair[1], req_str.ptr, req_str.len);
-        try expect(written == @as(isize, @intCast(req_str.len)));
+        // Loop on short writes (TCP loopback pairs return partial
+        // sends; a single-shot write silently truncates).
+        try helpers.writeTestFdAll(pair[1], req_str);
 
         var rb = http_server.RequestBuffer.init(allocator);
         defer rb.deinit();
