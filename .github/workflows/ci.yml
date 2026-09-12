@@ -60,11 +60,16 @@ jobs:
       - name: Build
         run: zig build --summary all
 
-      - name: Test (fast suites, no 60s SSE soaks)
-        # Bounded so a hanging test fails the job instead of burning
-        # the 6h runner limit with zero output.
-        timeout-minutes: 15
-        run: zig build test-fast --summary all
+      - name: Test server suites
+        # Split from client suites so a hanging suite is localized to
+        # one half. Bounded so a hang fails fast with logs instead of
+        # burning the runner limit with zero output.
+        timeout-minutes: 10
+        run: zig build test-server --summary all
+
+      - name: Test client suites
+        timeout-minutes: 10
+        run: zig build test-client --summary all
 
   soak:
     name: soak (ubuntu, 60s SSE soaks)

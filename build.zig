@@ -662,6 +662,24 @@ pub fn build(b: *std.Build) void {
     fast_test_mod.linkSystemLibrary("c", .{});
     fast_test_mod.link_libc = true;
 
+    // Split test modules (server-only / client-only) — same fast set,
+    // used by CI to localize a hanging suite to one half. Permanent
+    // steps: useful for consumers working on one half too.
+    const server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/test_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_test_mod.linkSystemLibrary("c", .{});
+    server_test_mod.link_libc = true;
+    const client_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/client_suite_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_test_mod.linkSystemLibrary("c", .{});
+    client_test_mod.link_libc = true;
+
     // Example binaries (living docs — see src/examples/). The server
     // demo serves the landing page + SSE/WS/template routes; the client
     // smoke CLI fires one request. Both consume the lib via
@@ -724,7 +742,7 @@ pub fn build(b: *std.Build) void {
     // the exes need it too.
     // Second iteration skips the Windows stub generation via the
     // fileExists check (first iteration already wrote the archive).
-    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_test_mod, client_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
         if (sys.use_system) {
             // System libs path. `linkSystemLibrary("curl")` does NOT auto-
             // pull libssl/libcrypto (no pkg-config Requires honour), so we
@@ -914,7 +932,7 @@ pub fn build(b: *std.Build) void {
     // resolve cleanly. On
     // Linux the system libssl/libcrypto live in /usr/lib, which Zig does
     // not add by default for some Compile steps.
-    for ([_]*std.Build.Module{ test_mod, fast_test_mod }) |tm| {
+    for ([_]*std.Build.Module{ test_mod, fast_test_mod, server_test_mod, client_test_mod }) |tm| {
         if (target.result.os.tag == .linux and sys.use_system) {
             tm.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
             if (multiarch_lib_dir) |dir| {
@@ -939,4 +957,18 @@ pub fn build(b: *std.Build) void {
     const test_fast_step = b.step("test-fast", "Run kabelweb fast suites (no 60s SSE soaks)");
     test_fast_step.dependOn(&run_fast_tests.step);
     test_fast_step.dependOn(b.getInstallStep());
+
+    // Split halves of the fast set (server-only / client-only) — CI
+    // runs these separately so a hanging suite is localized to one
+    // half instead of stalling the whole binary with zero output.
+    const server_tests = b.addTest(.{ .root_module = server_test_mod });
+    const run_server_tests = b.addRunArtifact(server_tests);
+    const test_server_step = b.step("test-server", "Run kabelweb server suites only (no soaks, no sse_chunked)");
+    test_server_step.dependOn(&run_server_tests.step);
+    test_server_step.dependOn(b.getInstallStep());
+    const client_tests = b.addTest(.{ .root_module = client_test_mod });
+    const run_client_tests = b.addRunArtifact(client_tests);
+    const test_client_step = b.step("test-client", "Run kabelweb client suites only");
+    test_client_step.dependOn(&run_client_tests.step);
+    test_client_step.dependOn(b.getInstallStep());
 }
