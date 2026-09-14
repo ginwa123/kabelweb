@@ -333,8 +333,25 @@ const SharedState = struct {
         self.queue.deinit(self.allocator);
     }
 
+    /// Request cancellation of the transfer AND wake a consumer parked in
+    /// `ResponseStream.next()`.
+    ///
+    /// Setting the flag alone is not sufficient. `next()` parks in
+    /// `futexWaitTimeout` on `signal_gen` for the whole poll budget
+    /// (300 s), and the worker only samples `cancelled` while libcurl is
+    /// handing it bytes. A cancel issued during a silent stretch (a
+    /// reasoning model pausing mid-thought, or a stalled upstream) would
+    /// therefore go unobserved until the next body chunk or the libcurl
+    /// timeout. The bump + wake below mirror what `streamWorker` does on
+    /// completion, so the parked consumer re-checks immediately and sees
+    /// `cancelled`.
     fn cancel(self: *SharedState) void {
         self.cancelled.store(true, .release);
+        // Same ordering as the push path (`writeCallback`): bump the
+        // generation BEFORE waking, so a consumer that observes the new
+        // value is guaranteed to also observe `cancelled`.
+        _ = self.signal_gen.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.signal_gen.raw, 1);
     }
 };
 
@@ -348,6 +365,12 @@ pub const ResponseStream = struct {
     state: *SharedState,
     thread: std.Thread,
 
+    /// Pull the next chunk, or `null` when the transfer has finished.
+    ///
+    /// Returns `error.Cancelled` if `cancel()` was called — checked before the
+    /// buffered backlog, so a cancel takes effect immediately rather than after
+    /// draining queued chunks. Callers MUST treat `error.Cancelled` as distinct
+    /// from `null`: `null` means "clean EOF, or the poll budget elapsed".
     pub fn next(self: *ResponseStream) !?[]const u8 {
         // Block waiting for the worker thread to push a chunk
         // or signal completion. We use a futex-based wait keyed on
@@ -385,6 +408,13 @@ pub const ResponseStream = struct {
         const deadline_ns: u64 = monotonicNs() + poll_budget_ns;
 
         while (true) {
+            // Cancellation first: a cancelled stream stops delivering
+            // immediately rather than after the buffered backlog. This is
+            // deliberately a DISTINCT error and not `null` — `null` already
+            // means "clean EOF, or the poll budget elapsed", which callers
+            // (e.g. Agent.callStreaming) treat as a mid-stream death and
+            // retry. A user-initiated stop must never trigger a retry.
+            if (self.state.cancelled.load(.acquire)) return error.Cancelled;
             if (self.state.worker_error) |e| return e;
             if (self.state.queue.popOne()) |chunk| return chunk;
             if (self.state.finished.load(.acquire)) return null;
@@ -455,6 +485,9 @@ pub const ResponseStream = struct {
         return self.state.total_time_ms;
     }
 
+    /// Abort the transfer. Idempotent, safe to call from another thread, and
+    /// observable promptly: the worker stops at the next body chunk and a
+    /// consumer parked in `next()` is woken immediately with `error.Cancelled`.
     pub fn cancel(self: *ResponseStream) void {
         self.state.cancel();
     }
@@ -560,6 +593,14 @@ pub const StreamScanner = struct {
 ///   - `allocator.dupe` failed (real OOM).
 fn writeCallback(buf: [*]const u8, size: u64, nmemb: u64, userdata: *anyopaque) callconv(.c) u64 {
     const state: *SharedState = @ptrCast(@alignCast(userdata));
+    // Cancel is sampled on EVERY invocation, not only when the queue is
+    // full. Sampling it solely in the `.full` arm (below) made
+    // `ResponseStream.cancel()` a no-op whenever the consumer kept up with
+    // the stream: the worker kept delivering until the 64-slot ring filled
+    // — up to ~64 more chunks — and `deinit()`'s `thread.join()` stayed
+    // blocked for that whole window. Cancelling must take effect on the
+    // very next chunk.
+    if (state.cancelled.load(.acquire)) return 0;
     const slice = buf[0 .. size * nmemb];
     const start_ns = monotonicNs();
 
@@ -900,16 +941,23 @@ pub fn openStream(
     // on the worker thread, and the pointer math through userdata
     // + @ptrCast landed on freed memory in some teardown paths.
     //
-    // Cancellation now flows through `state.cancelled` being checked
-    // inside writeCallback (which already touches state.* and is
-    // guarded by the same lifetime), plus a hard timeout via
-    // CURLOPT_TIMEOUT_MS / CURLOPT_CONNECTTIMEOUT_MS (already set above
-    // from Options). writeCallback samples it on every body chunk and
-    // on every backpressure poll iteration, so `ResponseStream.cancel()`
-    // is observed within BACKPRESSURE_POLL_NS (5 ms) even when the
-    // consumer has stopped draining the queue. NOTE: headerCallback
-    // does NOT sample it — header lines arrive ahead of the body and
-    // its only early-out is a genuine allocation failure.
+    // Cancellation flows through `state.cancelled` being checked inside
+    // writeCallback (which already touches state.* and is guarded by the
+    // same lifetime), plus a hard timeout via CURLOPT_TIMEOUT_MS /
+    // CURLOPT_CONNECTTIMEOUT_MS (already set above from Options).
+    // `writeCallback` samples it on ENTRY, so `ResponseStream.cancel()` is
+    // observed on the very next body chunk, and on every backpressure poll
+    // iteration (BACKPRESSURE_POLL_NS, 5 ms) while the queue is full.
+    //
+    // LIMITATION: with zero inbound bytes (a reasoning model paused
+    // mid-thought, or a stalled upstream) `writeCallback` never runs, so the
+    // transfer itself cannot observe the flag. The consumer still returns
+    // immediately — `SharedState.cancel()` wakes it with `error.Cancelled` —
+    // but `ResponseStream.deinit()`'s `thread.join()` waits for the next body
+    // byte or `CURLOPT_TIMEOUT_MS`. Closing that last gap needs
+    // XFERINFOFUNCTION (disabled above for the segfault reason).
+    // NOTE: headerCallback does NOT sample it — header lines arrive ahead of
+    // the body and its only early-out is a genuine allocation failure.
     _ = setoptLong(handle, curl.OPT.NOPROGRESS, @as(c_long, 1));
 
     const thread = std.Thread.spawn(.{}, streamWorker, .{state}) catch |err| switch (err) {

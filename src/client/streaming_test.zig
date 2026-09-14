@@ -103,8 +103,13 @@ const TestServer = struct {
         // CURL_MAX_WRITE_SIZE = 1 MiB) and exercise the backpressure
         // path in `writeCallback`.
         try self.server.router.get("/flood", floodHandler);
-        // /delay/N — sleeps N seconds, used for cancellation/timeout tests.
+        // /delay — sleeps 2 seconds, used for cancellation/timeout tests.
         try self.server.router.get("/delay", delayHandler);
+        // /stall — sleeps 4 seconds WITHOUT sending any body bytes. Used to
+        // verify that `cancel()` wakes a consumer parked in
+        // `ResponseStream.next()` while the stream is silent (no
+        // `writeCallback` invocation to sample the flag).
+        try self.server.router.get("/stall", stallHandler);
     }
 
     /// Spawn the listen worker thread.
@@ -206,6 +211,18 @@ fn delayHandler(ctx: HttpContext, _: HttpRequest, _: HttpResponse) !HttpResponse
     // Stub delay: v1 sleeps 2 seconds. Tests cancel before completion.
     const io = std.testing.io;
     std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_s }, .real) catch {};
+    return HttpResponse.init(200, "OK", ctx.allocator);
+}
+
+/// Sleeps 4 s before sending ANY bytes. The client's worker is parked in a
+/// socket read for that whole window, so `writeCallback` never runs and
+/// `cancelled` cannot be sampled from the transfer side — the only way a
+/// parked consumer learns about a cancel is the `signal_gen` wake in
+/// `SharedState.cancel()`. That makes this route the fixture for the
+/// silent-stream cancellation test.
+fn stallHandler(ctx: HttpContext, _: HttpRequest, _: HttpResponse) !HttpResponse {
+    const io = std.testing.io;
+    std.Io.sleep(io, .{ .nanoseconds = 4 * std.time.ns_per_s }, .real) catch {};
     return HttpResponse.init(200, "OK", ctx.allocator);
 }
 
@@ -567,6 +584,123 @@ test "stream: cancel() unblocks a worker parked on a full queue" {
     // timeout. 10 s is a generous ceiling that still catches a no-op
     // cancel by an order of magnitude.
     try testing.expect(elapsed_ms < 10_000);
+}
+
+// `cancel()` must wake a consumer parked in `next()` on a SILENT stream.
+//
+// `next()` parks in `futexWaitTimeout` on `signal_gen` for its whole poll
+// budget (300 s), and the worker only samples `cancelled` when libcurl hands
+// it body bytes. On a stream that has gone quiet there is no `writeCallback`
+// invocation to observe the flag, so without the generation bump +
+// `futexWake` in `SharedState.cancel()` the consumer sleeps straight through
+// the cancel. `/stall` sends nothing for 4 s, which makes the two outcomes
+// unambiguous: fixed → milliseconds, broken → the full 4 s (and 300 s in
+// production).
+test "stream: cancel() wakes a consumer parked on a silent stream" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+
+    const ts = try makeTestServer(allocator, io);
+    defer ts.deinit();
+
+    var url_buf: [256]u8 = undefined;
+    const url = try ts.urlBuf("/stall", &url_buf);
+
+    var client = custom_http_client.Client.init(allocator);
+    defer client.deinit();
+    var stream = client.openStream(io, .{ .method = .GET, .url = url }, .{
+        .timeout_ms = 60_000,
+    }) catch |err| switch (err) {
+        error.ConnectionRefused, error.ConnectionTimeout,
+        error.OperationTimedOut => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const Parked = struct {
+        stream: *custom_http_client.ResponseStream,
+        /// Set when the parked `next()` came back with `error.Cancelled`.
+        cancelled_seen: bool = false,
+        /// Set if a real chunk arrived (would mean we never parked).
+        chunk_seen: bool = false,
+        /// Set if `next()` returned `null` (clean EOF / budget elapsed).
+        null_seen: bool = false,
+
+        fn run(self: *@This()) void {
+            if (self.stream.next()) |maybe_chunk| {
+                if (maybe_chunk) |chunk| {
+                    testing.allocator.free(chunk);
+                    self.chunk_seen = true;
+                } else {
+                    self.null_seen = true;
+                }
+            } else |err| {
+                if (err == error.Cancelled) self.cancelled_seen = true;
+            }
+        }
+    };
+
+    var parked = Parked{ .stream = &stream };
+    const t = try std.Thread.spawn(.{}, Parked.run, .{&parked});
+
+    // Let the consumer actually park — no bytes will arrive for 4 s, so this
+    // only ever returns early via the cancel wake.
+    std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .real) catch {};
+
+    const cancel_started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    stream.cancel();
+    t.join();
+    const cancel_elapsed_ms = @divTrunc(
+        std.Io.Timestamp.now(io, .awake).nanoseconds - cancel_started,
+        std.time.ns_per_ms,
+    );
+
+    // A parked consumer must surface the DISTINCT cancel error — not `null`,
+    // which already means "clean EOF or poll budget elapsed" and which callers
+    // interpret as a mid-stream death worth retrying.
+    try testing.expect(parked.cancelled_seen);
+    try testing.expect(!parked.chunk_seen);
+    try testing.expect(!parked.null_seen);
+    // 1.5 s is far below the 4 s stall, and a futex wake costs microseconds,
+    // so this catches a no-op cancel with a wide margin over CI jitter.
+    try testing.expect(cancel_elapsed_ms < 1_500);
+
+    stream.deinit(); // cancel() again + join()
+}
+
+// A cancel must also win over chunks ALREADY sitting in the queue: the
+// consumer stops immediately instead of draining the backlog. This pins the
+// ordering of the `cancelled` check in `next()` (it sits before the queue
+// pop), which is easy to "tidy up" into the wrong order during a refactor.
+test "stream: cancel() wins over buffered chunks and returns error.Cancelled" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+
+    const ts = try makeTestServer(allocator, io);
+    defer ts.deinit();
+
+    var url_buf: [256]u8 = undefined;
+    const url = try ts.urlBuf("/flood", &url_buf);
+
+    var client = custom_http_client.Client.init(allocator);
+    defer client.deinit();
+    var stream = client.openStream(io, .{ .method = .GET, .url = url }, .{
+        .timeout_ms = 60_000,
+    }) catch |err| switch (err) {
+        error.ConnectionRefused, error.ConnectionTimeout,
+        error.OperationTimedOut => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Never drain: 300 ms is ample for `/flood` to queue up chunks over
+    // loopback, so `next()` below has a non-empty queue to ignore.
+    std.Io.sleep(io, .{ .nanoseconds = 300 * std.time.ns_per_ms }, .real) catch {};
+
+    stream.cancel();
+    try testing.expectError(error.Cancelled, stream.next());
+
+    stream.deinit();
 }
 
 fn countFdsViaShell() !usize {
