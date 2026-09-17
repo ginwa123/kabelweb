@@ -73,6 +73,24 @@ test "isWebSocketRequest: matches when all required headers are present" {
     try testing.expect(ws_handshake.isWebSocketRequest(&req));
 }
 
+test "isWebSocketRequest: matches lowercased headers from proxies" {
+    // Node's http-proxy (Vite dev) lowercases forwarded header names.
+    // Exact bytes captured from a Vite-forwarded browser handshake.
+    const raw =
+        "GET /api/terminal/ws?id=term-9 HTTP/1.1\r\n" ++
+        "host: 127.0.0.1:18081\r\n" ++
+        "upgrade: websocket\r\n" ++
+        "connection: Upgrade\r\n" ++
+        "sec-websocket-key: m12rDugA9B29Lw7lH0qxuA==\r\n" ++
+        "sec-websocket-version: 13\r\n" ++
+        "\r\n";
+
+    var req = try http_parser.parseRequest(raw, testing.allocator, undefined, -1);
+    defer req.deinit(testing.allocator);
+
+    try testing.expect(ws_handshake.isWebSocketRequest(&req));
+}
+
 test "isWebSocketRequest: rejects HTTP/1.0 request" {
     const raw =
         "GET /chat HTTP/1.0\r\n" ++

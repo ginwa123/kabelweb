@@ -99,15 +99,15 @@ pub fn isWebSocketRequest(req: *const http_parser.HttpRequest) bool {
     // GET only
     if (!std.mem.eql(u8, req.method, "GET")) return false;
 
-    // Required headers must be present (the parser stores them with the
-    // original case; we look up case-sensitively to avoid false matches).
-    if (req.headers.get("Sec-WebSocket-Key") == null) return false;
-    if (req.headers.get("Sec-WebSocket-Version") == null) return false;
-
-    // Walk headers for case-insensitive Upgrade/Connection match.
-    // We don't rely on the hashmap's case-insensitive lookup because the
-    // gserverz parser preserves the original header case and a strict
-    // lookup would fail on "upgrade" or "UPGRADE".
+    // Walk headers for case-insensitive match. Header names are
+    // case-insensitive per RFC 9110 §5.1 (RFC 6455 §4.1 inherits the
+    // rule), and the parser preserves the original case — so an
+    // exact-case hashmap lookup would fail on "upgrade"/"UPGRADE",
+    // and (worse) on the lowercased names proxies forward: Node's
+    // http-proxy (Vite dev) sends sec-websocket-key /
+    // sec-websocket-version, which the old exact-case presence check
+    // rejected with "WebSocket upgrade required" for real browsers.
+    var key_ok = false;
     var upgrade_ok = false;
     var connection_ok = false;
     var version_ok = false;
@@ -115,7 +115,9 @@ pub fn isWebSocketRequest(req: *const http_parser.HttpRequest) bool {
     while (it.next()) |entry| {
         const k = entry.key_ptr.*;
         const v = entry.value_ptr.*;
-        if (std.ascii.eqlIgnoreCase(k, "upgrade")) {
+        if (std.ascii.eqlIgnoreCase(k, "sec-websocket-key")) {
+            key_ok = true;
+        } else if (std.ascii.eqlIgnoreCase(k, "upgrade")) {
             // Per RFC 6455 §4.1, the value is a comma-separated list of
             // protocols; "websocket" must appear as one of the tokens.
             if (containsTokenIgnoreCase(v, "websocket")) {
@@ -132,7 +134,7 @@ pub fn isWebSocketRequest(req: *const http_parser.HttpRequest) bool {
         }
     }
 
-    return upgrade_ok and connection_ok and version_ok;
+    return key_ok and upgrade_ok and connection_ok and version_ok;
 }
 
 /// Extract the client's Sec-WebSocket-Key from the request headers.
