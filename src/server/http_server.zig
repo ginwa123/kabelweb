@@ -400,6 +400,16 @@ pub const GinwaServer = struct {
     /// per-request `HttpContext` — no per-handler config needed.
     security_headers: security.SecurityHeaders = .{},
 
+    /// Master switch for the server-level security headers applied by the
+    /// dispatch loop (`applySecurityHeadersTo`). Defaults to true
+    /// (historical behaviour — every routed response carries the 7
+    /// headers). High-throughput services that don't need the headers
+    /// (e.g. internal JSON APIs behind a gateway that already sets them)
+    /// can opt out with `server.enable_security_headers = false`, which
+    /// saves 7 hash-map inserts + ~300 wire bytes per response.
+    /// Per-handler `.withSecurityHeaders()` calls are unaffected.
+    enable_security_headers: bool = true,
+
     /// Optional fallback handler invoked when no route matches. It is
     /// expected to write a complete HTTP response directly to `fd` (status
     /// line, headers, body) — the listen loop will NOT call toBytes() /
@@ -531,10 +541,10 @@ pub const GinwaServer = struct {
 
     pub fn listen(self: *GinwaServer) !void {
         if (builtin.os.tag == .windows) {
-            const rc = winsock.listen(self.address.sock_fd, 128);
+            const rc = winsock.listen(self.address.sock_fd, 1024);
             if (rc != 0) return error.ListenFailed;
         } else {
-            const rc = socket.listen(self.address.sock_fd, 128);
+            const rc = socket.listen(self.address.sock_fd, 1024);
             if (rc < 0) return error.ListenFailed;
         }
 
@@ -652,24 +662,52 @@ pub const GinwaServer = struct {
                             }
                         }
 
-                        var rb = RequestBuffer.init(allocator);
-                        defer rb.deinit();
+                        // ─── HTTP/1.1 keep-alive loop ───────────────────
+                        // One TCP connection serves many sequential requests
+                        // (wrk/browsers reuse connections). Without this loop
+                        // every request paid a TCP handshake + a slot in the
+                        // accept queue — the ~13k rps ceiling seen in the
+                        // sparringhttp benchmark. HTTP/1.1 persists by
+                        // default; HTTP/1.0 closes unless the client sends
+                        // `Connection: keep-alive`. The SSE/WS arms hijack
+                        // the fd and `return` out of the loop (manager owns
+                        // it). Per-iteration arena storage is reaped by
+                        // resetting the connection arena at the top of
+                        // iterations 2+ (retain_capacity keeps hot buffers
+                        // alive); per-request `defer`s still run on
+                        // `continue`/`break` (they scope to the loop body).
+                        var keep_alive_count: u32 = 0;
+                        keep_alive_loop: while (true) {
+                            if (keep_alive_count > 0) {
+                                _ = arena_allocator.reset(.retain_capacity);
+                            }
+                            keep_alive_count += 1;
 
-                        // Hand the sniffed bytes to the HTTP/1.1 reader so the
-                        // pre-read is not lost (it is a no-op when the sniff is
-                        // disabled: `cr` then holds nothing).
-                        if (cr.buffered().len > 0) {
-                            rb.buf.appendSlice(allocator, cr.buffered()) catch {
-                                _ = closeFd(fd);
-                                return;
-                            };
-                            _ = cr.takeBuffered() catch {};
-                        }
+                            var rb = RequestBuffer.init(allocator);
+                            defer rb.deinit();
+
+                            // Hand the sniffed bytes to the HTTP/1.1 reader so the
+                            // pre-read is not lost (it is a no-op when the sniff is
+                            // disabled: `cr` then holds nothing). Only the first
+                            // iteration can hold buffered bytes (the h2-preface
+                            // sniff runs once per connection, before the loop).
+                            if (keep_alive_count == 1 and cr.buffered().len > 0) {
+                                rb.buf.appendSlice(allocator, cr.buffered()) catch {
+                                    _ = closeFd(fd);
+                                    return;
+                                };
+                                _ = cr.takeBuffered() catch {};
+                            }
 
                         const request_data = rb.readFullRequestStream(stream) catch |err| {
-                            std.debug.print("HTTP_SERVER: readFullRequest failed: {s}\n", .{@errorName(err)});
-                            _ = closeFd(fd);
-                            return;
+                            // Normal keep-alive teardown (client closed an
+                            // idle persistent connection) is silent; anything
+                            // else is logged. Either way the loop exits and
+                            // the fd is closed once, below.
+                            if (err != error.ConnectionClosed) {
+                                std.debug.print("HTTP_SERVER: readFullRequest failed: {s}\n", .{@errorName(err)});
+                            }
+                            break :keep_alive_loop;
                         };
                         defer allocator.free(request_data);
 
@@ -895,6 +933,21 @@ pub const GinwaServer = struct {
                                     // default so policy lives in ONE place.
                                     server.applySecurityHeadersTo(&final_res);
 
+                                    // Frame the keep-alive decision BEFORE
+                                    // serialising: `toBytes()` stamps
+                                    // `Connection: keep-alive` vs `close`
+                                    // from this flag. Reuse requires an
+                                    // explicit or default keep-alive from the
+                                    // client AND a framed response
+                                    // (Content-Length) so the client can
+                                    // delimit the next message; otherwise the
+                                    // connection must close. Capped at 1000
+                                    // requests per connection (matches the
+                                    // `Keep-Alive: max=1000` hint).
+                                    final_res.keep_alive = server.clientWantsKeepAlive(&h.req) and
+                                        final_res.headers.contains("Content-Length") and
+                                        keep_alive_count < 1000;
+
                                     const res_bytes = final_res.toBytes() catch {
                                         std.debug.print("Failed to build response\n", .{});
                                         _ = closeFd(fd);
@@ -903,7 +956,13 @@ pub const GinwaServer = struct {
                                     defer final_res.allocator.free(res_bytes);
                                     _ = server.sendToStream(stream, res_bytes) catch {
                                         std.debug.print("Failed to send response\n", .{});
+                                        break :keep_alive_loop;
                                     };
+                                    if (final_res.keep_alive) {
+                                        continue :keep_alive_loop;
+                                    } else {
+                                        break :keep_alive_loop;
+                                    }
                                 },
                                 .websocket => |ws| {
                                     // WebSocket upgrade path. We must:
@@ -1066,15 +1125,35 @@ pub const GinwaServer = struct {
                                 // echoed) instead of an opaque browser-blocked
                                 // response.
                                 server.applyCORSResponse(&req, &not_found) catch @panic("OOM");
+                                // Same keep-alive framing rule as the routed
+                                // path (see above): reuse only when the client
+                                // asked (or defaulted) and the 404 is framed.
+                                not_found.keep_alive = server.clientWantsKeepAlive(&req) and
+                                    not_found.headers.contains("Content-Length") and
+                                    keep_alive_count < 1000;
                                 const res_bytes = not_found.toBytes() catch {
                                     _ = closeFd(fd);
                                     return;
                                 };
                                 defer not_found.allocator.free(res_bytes);
-                                _ = server.sendToStream(stream, res_bytes) catch {};
+                                if (server.sendToStream(stream, res_bytes)) |_| {
+                                    if (not_found.keep_alive) {
+                                        continue :keep_alive_loop;
+                                    }
+                                } else |_| {}
+                                break :keep_alive_loop;
                             }
+                            // Static-dir fallback wrote its own (unframed)
+                            // response — the connection cannot be reused.
+                            break :keep_alive_loop;
                         }
 
+                            // Safety net: every arm above exits explicitly
+                            // (continue / break / return). Reaching here
+                            // would re-enter the loop on a served connection,
+                            // so close instead.
+                            break :keep_alive_loop;
+                        }
                         _ = closeFd(fd);
                     }
                 }.handle,
@@ -1194,6 +1273,11 @@ pub const GinwaServer = struct {
             }
             posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&keepintvl)) catch {};
             posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&keepcnt)) catch {};
+            // Disable Nagle's algorithm: benchmark/small-JSON responses
+            // would otherwise wait up to ~40ms for ACK coalescing on
+            // keep-alive connections. Best-effort like the keepalive
+            // tunables above.
+            posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
         }
 
         return fd;
@@ -1300,7 +1384,26 @@ pub const GinwaServer = struct {
     /// app-level policy (set once after init) governs all handlers —
     /// handlers that also call `.withSecurityHeaders()` simply get their
     /// values overwritten here (put replaces).
+    /// Decide whether the connection may be reused for another request
+    /// after this response (HTTP keep-alive). HTTP/1.1 and later persist
+    /// by default; HTTP/1.0 closes unless the client sends
+    /// `Connection: keep-alive`. An explicit `Connection: close` always
+    /// wins (also covers `Connection: keep-alive, close`).
+    fn clientWantsKeepAlive(_: *GinwaServer, req: *const HttpRequest) bool {
+        var it = req.headers.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "connection")) {
+                const v = entry.value_ptr.*;
+                if (std.ascii.indexOfIgnoreCase(v, "close") != null) return false;
+                if (std.ascii.indexOfIgnoreCase(v, "keep-alive") != null) return true;
+                break;
+            }
+        }
+        return !std.mem.eql(u8, req.version, "HTTP/1.0");
+    }
+
     pub fn applySecurityHeadersTo(self: *GinwaServer, resp: *HttpResponse) void {
+        if (!self.enable_security_headers) return;
         security.applySecurityHeadersWith(resp, self.security_headers);
     }
 
