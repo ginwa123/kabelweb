@@ -445,6 +445,14 @@ pub const HttpResponse = struct {
     headers: std.StringHashMap([]const u8),
     body: []const u8,
     allocator: std.mem.Allocator,
+    /// When true, `toBytes()` emits `Connection: keep-alive` (+ `Keep-Alive`
+    /// timeout hint) instead of `Connection: close`, so the server's
+    /// keep-alive loop can reuse the connection for the next request.
+    /// Defaults to false (close) to preserve the historical wire format —
+    /// the dispatch loop sets it per-request from the client's
+    /// `Connection` header + HTTP version. SSE/WS upgrade paths always
+    /// leave it false (they hijack or close the connection).
+    keep_alive: bool = false,
 
     pub fn init(status_code: u16, status_text: []const u8, allocator: std.mem.Allocator) HttpResponse {
         return .{
@@ -699,7 +707,12 @@ pub const HttpResponse = struct {
         try buf.appendSlice(self.allocator, self.status_text);
         try buf.appendSlice(self.allocator, "\r\n");
         try buf.appendSlice(self.allocator, "Server: Server/1.0\r\n"); // todo change i think
-        try buf.appendSlice(self.allocator, "Connection: close\r\n");
+        if (self.keep_alive) {
+            try buf.appendSlice(self.allocator, "Connection: keep-alive\r\n");
+            try buf.appendSlice(self.allocator, "Keep-Alive: timeout=5, max=1000\r\n");
+        } else {
+            try buf.appendSlice(self.allocator, "Connection: close\r\n");
+        }
 
         var it = self.headers.iterator();
         while (it.next()) |entry| {
