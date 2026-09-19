@@ -1512,16 +1512,13 @@ pub const RequestBuffer = struct {
         return self.readFullRequestStream(.{ .plain = fd });
     }
 
-    /// Hand over the buffered bytes WITHOUT copying: the caller takes
-    /// ownership (frees exactly once) and the buffer is forgotten, so a
-    /// later `deinit` is a no-op. Replaces `toOwnedSlice` on the hot path
-    /// — saves one full-request-size alloc + memcpy per request. Safe for
-    /// both arena and testing allocators: exactly one owner either way
-    /// (toOwnedSlice also emptied the buffer).
-    fn takeBytes(self: *RequestBuffer) []u8 {
-        const out = self.buf.items;
-        self.buf = .empty;
-        return out;
+    /// Hand over the buffered bytes: the caller takes ownership (frees
+    /// exactly once) and the buffer is emptied, so a later `deinit` is a
+    /// no-op. Uses `toOwnedSlice` so the returned slice's len == capacity
+    /// and `allocator.free` is valid (returning `buf.items` directly would
+    /// free with the wrong length when capacity > len -> "Invalid free").
+    fn takeBytes(self: *RequestBuffer) ![]u8 {
+        return self.buf.toOwnedSlice(self.allocator);
     }
 
     /// Read one complete request from a `Stream` (plain socket OR TLS).

@@ -476,11 +476,10 @@ pub const HttpResponse = struct {
     }
 
     pub fn withBody(self: HttpResponse, body: []const u8) HttpResponse {
-        // No Content-Length header stored: `toBytes`/`writeTo` always frame
-        // the body length on the wire from `body.len` (zero allocs). Storing
-        // it here used to cost 1 allocPrint + 1 map insert per response.
         var copy = self;
         copy.body = body;
+        const len_str = std.fmt.allocPrint(self.allocator, "{}", .{body.len}) catch @panic("OOM");
+        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
         return copy;
     }
 
@@ -556,10 +555,11 @@ pub const HttpResponse = struct {
     }
 
     pub fn withJson(self: HttpResponse, json: []const u8) HttpResponse {
-        // Content-Length framed on the wire by toBytes/writeTo (see withBody).
         var copy = self;
         copy.body = json;
+        const len_str = std.fmt.allocPrint(self.allocator, "{}", .{json.len}) catch @panic("OOM");
         copy.headers.put("Content-Type", "application/json") catch @panic("OOM");
+        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
         return copy;
     }
 
@@ -603,8 +603,8 @@ pub const HttpResponse = struct {
         copy.body = "";
         copy.headers.put("Location", location) catch @panic("OOM");
         copy.headers.put("Content-Type", "text/html; charset=utf-8") catch @panic("OOM");
-        // Empty body frames as `Content-Length: 0` on the wire via
-        // toBytes/writeTo — no heap string needed here.
+        const len_str = std.fmt.allocPrint(self.allocator, "0", .{}) catch @panic("OOM");
+        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
         return copy;
     }
 
