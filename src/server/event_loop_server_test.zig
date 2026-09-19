@@ -8,11 +8,10 @@
 //! for plain routes.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
 
 const http_server = @import("http_server.zig");
 const event_loop = @import("event_loop.zig");
+const test_tcp = @import("test_tcp.zig");
 
 fn helloHandler(
     ctx: http_server.HttpContext,
@@ -57,34 +56,14 @@ const ServerThread = struct {
 };
 
 fn tcpConnect(port: u16) !i32 {
-    const sys = posix.system;
-    const raw = sys.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
-    if (raw < 0) return error.SocketFailed;
-    const fd: i32 = @intCast(raw);
-    errdefer _ = sys.close(fd);
-    var caddr: sys.sockaddr.in = .{
-        .family = 2,
-        .port = @byteSwap(port),
-        .addr = @bitCast(@as(u32, 0x0100007f)),
-        .zero = undefined,
-    };
-    if (sys.connect(fd, @ptrCast(&caddr), @sizeOf(sys.sockaddr.in)) != 0)
-        return error.ConnectFailed;
-    return fd;
+    return test_tcp.connect(port);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
-    const sys = posix.system;
-    var off: usize = 0;
-    while (off < data.len) {
-        const n: isize = sys.write(fd, data.ptr + off, data.len - off);
-        if (n <= 0) return error.WriteFailed;
-        off += @as(usize, @intCast(n));
-    }
+    return test_tcp.writeAll(fd, data);
 }
 
 fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {
-    const sys = posix.system;
     var len: usize = 0;
     while (true) {
         if (event_loop.findHeaderEnd(buf[0..len])) |he| {
@@ -92,25 +71,25 @@ fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {
             if (len >= he + cl) return buf[0 .. he + cl];
         }
         if (len >= buf.len) return error.TooMuch;
-        const n: isize = sys.read(fd, buf.ptr + len, buf.len - len);
-        if (n <= 0) return error.Closed;
-        len += @as(usize, @intCast(n));
+        const n = try test_tcp.read(fd, buf[len..]);
+        if (n == 0) return error.Closed;
+        len += n;
     }
 }
 
-test "listenEventLoop serves routes, echo, 404 and 501s (POSIX)" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+/// Ephemeral port of a bound server socket (port 0 → OS-picked).
+fn serverPort(sock_fd: i32) !u16 {
+    const port = try test_tcp.boundPort(sock_fd);
+    try std.testing.expect(port != 0);
+    return port;
+}
+
+test "listenEventLoop serves routes, echo, 404 and 501s" {
     const alloc = std.testing.allocator;
-    const sys = posix.system;
 
     // Ephemeral port: bind 0, then discover via getsockname.
     const addr = try http_server.Address.init("127.0.0.1", 0);
-    var bound: sys.sockaddr.in = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(sys.sockaddr.in);
-    if (sys.getsockname(addr.sock_fd, @ptrCast(&bound), &bound_len) != 0)
-        return error.GetSockNameFailed;
-    const port = @byteSwap(bound.port);
-    try std.testing.expect(port != 0);
+    const port = try serverPort(addr.sock_fd);
 
     var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
@@ -136,7 +115,7 @@ test "listenEventLoop serves routes, echo, 404 and 501s (POSIX)" {
     if (st.err) |err| return err;
 
     const cfd = try tcpConnect(port);
-    defer _ = sys.close(cfd);
+    defer test_tcp.close(cfd);
 
     var buf: [8192]u8 = undefined;
 
@@ -170,18 +149,11 @@ test "listenEventLoop serves routes, echo, 404 and 501s (POSIX)" {
     try std.testing.expect(std.mem.indexOf(u8, r4, "501") != null);
 }
 
-test "listenEventLoop worker_pool mode serves correctly (POSIX)" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+test "listenEventLoop worker_pool mode serves correctly" {
     const alloc = std.testing.allocator;
-    const sys = posix.system;
 
     const addr = try http_server.Address.init("127.0.0.1", 0);
-    var bound: sys.sockaddr.in = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(sys.sockaddr.in);
-    if (sys.getsockname(addr.sock_fd, @ptrCast(&bound), &bound_len) != 0)
-        return error.GetSockNameFailed;
-    const port = @byteSwap(bound.port);
-    try std.testing.expect(port != 0);
+    const port = try serverPort(addr.sock_fd);
 
     var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
@@ -205,7 +177,7 @@ test "listenEventLoop worker_pool mode serves correctly (POSIX)" {
     if (st.err) |err| return err;
 
     const cfd = try tcpConnect(port);
-    defer _ = sys.close(cfd);
+    defer test_tcp.close(cfd);
 
     var buf: [8192]u8 = undefined;
 
@@ -237,18 +209,13 @@ test "listenEventLoop worker_pool mode serves correctly (POSIX)" {
     try std.testing.expectEqual(@as(u64, 0), server.el_stats.inline_fallback);
 }
 
-test "listenEventLoopMulti serves across loops with agg stats (POSIX)" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+test "listenEventLoop loop_count=2 serves across loops with agg stats (POSIX)" {
+    // Multi-loop needs SO_REUSEPORT: POSIX-only by design.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const sys = posix.system;
 
     const addr = try http_server.Address.init("127.0.0.1", 0);
-    var bound: sys.sockaddr.in = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(sys.sockaddr.in);
-    if (sys.getsockname(addr.sock_fd, @ptrCast(&bound), &bound_len) != 0)
-        return error.GetSockNameFailed;
-    const port = @byteSwap(bound.port);
-    try std.testing.expect(port != 0);
+    const port = try serverPort(addr.sock_fd);
 
     var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
@@ -259,7 +226,7 @@ test "listenEventLoopMulti serves across loops with agg stats (POSIX)" {
         srv: *http_server.GinwaServer,
         err: ?anyerror = null,
         fn run(self: *@This()) void {
-            self.srv.listenEventLoopMulti(.{
+            self.srv.listenEventLoop(.{
                 .max_conns = 64,
                 .idle_timeout_ms = 10_000,
                 .header_timeout_ms = 2_000,
@@ -280,7 +247,7 @@ test "listenEventLoopMulti serves across loops with agg stats (POSIX)" {
     var fds: [n_conns]i32 = undefined;
     for (&fds) |*fd| fd.* = try tcpConnect(port);
     defer {
-        for (fds) |fd| _ = sys.close(fd);
+        for (fds) |fd| test_tcp.close(fd);
     }
 
     var buf: [8192]u8 = undefined;

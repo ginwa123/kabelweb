@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 
 test {
     _ = @import("test_helpers.zig"); // Compile-only — ensures the cross-platform helpers stay in sync.
+    _ = @import("test_tcp.zig"); // Compile-only — cross-platform TCP helpers for the event-loop tests.
     _ = @import("http_server_test.zig");
     _ = @import("sse_manager_test.zig");
     _ = @import("router_test.zig");

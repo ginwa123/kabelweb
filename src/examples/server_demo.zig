@@ -902,17 +902,19 @@ pub fn run(init: std.process.Init) !void {
         }
     }
     const dispatch_mode = if (use_pool) gserverz.EventLoopConfig{ .dispatch_mode = .worker_pool } else gserverz.EventLoopConfig{};
-    if (loop_count > 0) {
-        std.debug.print("Serving via {d} event loops (REUSEPORT)...\n", .{loop_count});
-        var mcfg = dispatch_mode;
-        mcfg.loop_count = loop_count;
-        try gs.listenEventLoopMulti(mcfg);
-    } else if (use_event_loop) {
-        std.debug.print("Serving via single event loop...\n", .{});
-        try gs.listenEventLoop(dispatch_mode);
-    } else {
+    if (!use_event_loop) {
         try gs.listen();
+        return;
     }
+    // One entry point: loop_count 0/1 = single loop, N = N REUSEPORT loops.
+    var lcfg = dispatch_mode;
+    lcfg.loop_count = loop_count;
+    if (loop_count > 1) {
+        std.debug.print("Serving via {d} event loops (REUSEPORT)...\n", .{loop_count});
+    } else {
+        std.debug.print("Serving via single event loop...\n", .{});
+    }
+    try gs.listenEventLoop(lcfg);
 }
 
 // curl http://127.0.0.1:29590/       # → HTML landing page

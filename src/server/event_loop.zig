@@ -4,10 +4,11 @@
 //! `GinwaServer.listenEventLoop` runs this instead of the accept+
 //! `group.concurrent` loop. Scope of v1:
 //!
-//!   - POSIX only (`nb_socket` returns `Unsupported` on Windows).
-//!   - Plain HTTP/1.1 only. SSE / WebSocket / H2 / TLS routes get a
-//!     `501 Not Implemented` (same status the threaded path already uses
-//!     for SSE+WS-over-TLS) so long-lived upgrades never silently hang.
+//!   - Cross-platform: `poll(2)` on POSIX, `WSAPoll` on Windows
+//!     (see `nb_socket.zig`). Plain HTTP/1.1 only. SSE / WebSocket / H2 /
+//!     TLS routes get a `501 Not Implemented` (same status the threaded
+//!     path already uses for SSE+WS-over-TLS) so long-lived upgrades
+//!     never silently hang.
 //!   - One poll loop per `listenEventLoop` call. Multi-loop
 //!     (SO_REUSEPORT, one per core) is Phase 6 — the `Config` already
 //!     carries `loop_id`/`loop_count` so the cutover is additive.
@@ -28,7 +29,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
 
 const nb = @import("nb_socket.zig");
 const http_parser = @import("http_parser.zig");
@@ -61,8 +61,12 @@ pub const Config = struct {
     /// Max requests served per keep-alive connection before close.
     /// Mirrors the threaded path's `keep_alive_count < 1000` rule.
     max_requests_per_conn: u32 = 1000,
-    /// This loop's index / total loops (Phase 6 multi-loop; informational v1).
+    /// This loop's index (`listenEventLoop` sets it per loop in multi
+    /// mode) and the total loop count. Read-only inside the loop.
     loop_id: usize = 0,
+    /// Loop shape for `GinwaServer.listenEventLoop`: `0`/`1` = single
+    /// loop on the calling thread, `>1` = that many `SO_REUSEPORT` loops
+    /// (POSIX-only, clamped to `max_multi_loops`).
     loop_count: usize = 1,
     /// Where dispatch runs (see `DispatchMode`).
     dispatch_mode: DispatchMode = .direct,
@@ -218,8 +222,7 @@ fn nowMs(io: std.Io) i64 {
 }
 
 fn closeFd(fd: i32) void {
-    if (comptime nb.is_windows) return;
-    _ = posix.system.close(fd);
+    nb.closeSocket(fd);
 }
 
 /// The reactor. Owns its conns; borrows listener fd + dispatch callback.
@@ -318,7 +321,6 @@ pub const EventLoop = struct {
         on_request_ctx: *anyopaque,
         http_ctx_template: HttpContext,
     ) !void {
-        if (comptime nb.is_windows) return error.Unsupported;
         self.listener_fd = listener_fd;
         self.on_request = on_request;
         self.on_request_ctx = on_request_ctx;
@@ -328,21 +330,17 @@ pub const EventLoop = struct {
         const use_pool = self.cfg.dispatch_mode == .worker_pool;
         if (use_pool) {
             // Wake channel: loop polls wake_read, workers write one byte
-            // per completion. socketpair (not pipe) so both ends are
-            // pollable sockets, same primitive as the test helpers.
-            var fds: [2]std.c.fd_t = undefined;
-            if (posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds) < 0)
-                return error.SocketPairFailed;
-            self.wake_read = @intCast(fds[0]);
-            self.wake_write = @intCast(fds[1]);
+            // per completion. `nb.socketPair` is socketpair(2) on POSIX,
+            // TCP loopback on Windows (Winsock has no socketpair).
+            const pair = try nb.socketPair();
+            self.wake_read = pair.read;
+            self.wake_write = pair.write;
             errdefer {
                 closeFd(self.wake_read);
                 closeFd(self.wake_write);
                 self.wake_read = -1;
                 self.wake_write = -1;
             }
-            try nb.setNonBlocking(self.wake_read);
-            try nb.setNonBlocking(self.wake_write);
             // Assign BEFORE start (threading contract above).
             self.pool = try worker_pool_mod.WorkerPool.init(self.alloc, self.io, .{
                 .thread_count = self.cfg.worker_threads,
@@ -369,7 +367,7 @@ pub const EventLoop = struct {
         };
 
         self.running = true;
-        var pollfds_buf: [4096 + 2]posix.pollfd = undefined;
+        var pollfds_buf: [4096 + 2]nb.PollFd = undefined;
 
         while (self.running) {
             const n_conns = self.conns.items.len;

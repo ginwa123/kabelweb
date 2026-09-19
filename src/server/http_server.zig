@@ -40,7 +40,7 @@ const nb_socket_mod = @import("nb_socket.zig");
 pub const EventLoop = event_loop_mod.EventLoop;
 pub const EventLoopConfig = event_loop_mod.Config;
 pub const EventLoopStats = event_loop_mod.Stats;
-/// Max poll loops `listenEventLoopMulti` will run (fixed server-side
+/// Max poll loops one `listenEventLoop` call will run (fixed server-side
 /// arrays; raise if a 16-core box ever wants more than one loop per core).
 pub const max_multi_loops = 16;
 // Router re-exports — let module users (and other modules referencing
@@ -452,17 +452,18 @@ pub const GinwaServer = struct {
     max_worker_threads: usize,
     worker_sem: std.Io.Semaphore,
 
-    /// Last event-loop run's counters. Written by `listenEventLoop` /
-    /// `listenEventLoopMulti` on exit (summed across loops for multi);
-    /// untouched by the threaded `listen()`. Read after `shutdown`+join.
+    /// Last event-loop run's counters. Written by `listenEventLoop` on exit
+    /// (summed across loops when `loop_count > 1`); untouched by the
+    /// threaded `listen()`. Read after `shutdown`+join.
     el_stats: EventLoopStats = .{},
 
-    /// Multi-loop listener fds owned by `listenEventLoopMulti` (fixed cap;
-    /// see `max_multi_loops`). Registered BEFORE loop threads spawn so
-    /// `shutdown()` can close them mid-run; entries flip to -1 on close.
+    /// Multi-loop listener fds owned by the `loop_count > 1` path of
+    /// `listenEventLoop` (fixed cap; see `max_multi_loops`). Registered
+    /// BEFORE loop threads spawn so `shutdown()` can close them mid-run;
+    /// entries flip to -1 on close.
     el_multi_fds: [max_multi_loops]i32 = [_]i32{-1} ** max_multi_loops,
     /// Live loop pointers for `shutdown()`'s `requestShutdown` backup.
-    /// Valid only while `listenEventLoopMulti` runs (it joins everything).
+    /// Valid only while a multi-loop `listenEventLoop` runs (it joins all).
     el_multi_loops: [max_multi_loops]?*EventLoop = [_]?*EventLoop{null} ** max_multi_loops,
     /// How many of the above slots are registered.
     el_multi_count: usize = 0,
@@ -1260,22 +1261,34 @@ pub const GinwaServer = struct {
         try group.await(self.io);
     }
 
-    /// Serve plain HTTP/1.1 through a single-threaded poll reactor instead
-    /// of the thread-per-connection `listen()` loop.
+    /// Serve plain HTTP/1.1 through the poll reactor instead of the
+    /// thread-per-connection `listen()` loop. One entry point:
+    /// `cfg.loop_count` selects the shape — `0`/`1` runs a single loop
+    /// on the calling thread, `>1` runs that many loops sharing the port
+    /// via `SO_REUSEPORT` (kernel-balanced accepts, stats summed into
+    /// `el_stats`; POSIX-only, clamped to `max_multi_loops`).
     ///
     /// Non-breaking: `listen()` is untouched; callers opt in by calling
-    /// this. v1 scope (see `event_loop.zig` header):
-    ///   - POSIX only (Windows returns `error.Unsupported`).
+    /// this. Scope (see `event_loop.zig` header):
     ///   - No TLS (`error.TlsNotSupported` when `tls_ctx` is set — use
     ///     `listen()` for https until the non-blocking handshake lands).
     ///   - No SSE / WebSocket / H2C upgrades: matching routes get
     ///     `501 Not Implemented` + close. No static-dir fallback either
     ///     (`501` when `static_dir_handler` is set and no route matches).
-    ///   - `shutdown()` works for both paths: it closes the listener fd,
-    ///     which makes the reactor's `poll` report HUP and exit.
+    ///   - `shutdown()` works for every path: it closes the listener
+    ///     fd(s), which makes each reactor's `poll` report HUP and exit.
     pub fn listenEventLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
-        if (comptime builtin.os.tag == .windows) return error.Unsupported;
         if (self.tls_ctx != null) return error.TlsNotSupported;
+        if (cfg.loop_count > 1) {
+            if (comptime builtin.os.tag == .windows) return error.Unsupported;
+            return self.serveMultiLoop(cfg);
+        }
+        return self.serveSingleLoop(cfg);
+    }
+
+    /// Single-loop path: `listen()` on the bound socket, one reactor on
+    /// the calling thread. Cross-platform (Windows via `WSAPoll`).
+    fn serveSingleLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
         _ = nb_socket_mod.POLL.IN; // keep import live on all POSIX targets
 
         if (builtin.os.tag == .windows) {
@@ -1314,10 +1327,8 @@ pub const GinwaServer = struct {
         self.is_running = false;
     }
 
-    /// Serve plain HTTP/1.1 on N poll loops sharing one port via
-    /// `SO_REUSEPORT` (Phase 6). Same v1 scope as `listenEventLoop`
-    /// (POSIX, no TLS, upgrades → 501); `cfg.loop_count` selects N
-    /// (0 = one per CPU, clamped to `max_multi_loops`).
+    /// Multi-loop path: N poll loops sharing one port via `SO_REUSEPORT`.
+    /// POSIX-only (no Windows equivalent; the caller fails fast there).
     ///
     /// Mechanics: the bound ip:port is read off `address.sock_fd` with
     /// `getsockname` (so ephemeral port 0 works), the original socket is
@@ -1326,10 +1337,7 @@ pub const GinwaServer = struct {
     /// accepts; per-loop `EventLoop.stats` are summed into `el_stats`.
     /// `shutdown()` closes every listener (loops exit on HUP) and flags
     /// the loops; this function joins all threads before returning.
-    pub fn listenEventLoopMulti(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
-        if (comptime builtin.os.tag == .windows) return error.Unsupported;
-        if (self.tls_ctx != null) return error.TlsNotSupported;
-
+    fn serveMultiLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
         var bound: socket.sockaddr.in = undefined;
         var bound_len: posix.socklen_t = @sizeOf(socket.sockaddr.in);
         if (socket.getsockname(self.address.sock_fd, @ptrCast(&bound), &bound_len) != 0)
@@ -1337,8 +1345,8 @@ pub const GinwaServer = struct {
         const host_le: u32 = @bitCast(bound.addr);
         var port: u16 = @byteSwap(bound.port);
 
+        // Caller guarantees loop_count > 1; clamp to the fixed slots.
         var n: usize = cfg.loop_count;
-        if (n == 0) n = @max(1, std.Thread.getCpuCount() catch 2);
         if (n > max_multi_loops) {
             std.debug.print("HTTP_SERVER: clamping loops {d} → {d} (max_multi_loops)\n", .{ n, max_multi_loops });
             n = max_multi_loops;
@@ -1674,8 +1682,8 @@ pub const GinwaServer = struct {
         }
         // Event-loop multi-run: close every registered REUSEPORT listener
         // (each loop's poll reports HUP and exits) and flag the loops to
-        // stop. Slots flip to -1/null so a later `listenEventLoopMulti`
-        // return path (which also closes leftovers) never double-closes.
+        // stop. Slots flip to -1/null so the `listenEventLoop` return path
+        // (which also closes leftovers) never double-closes.
         for (self.el_multi_fds[0..self.el_multi_count]) |*fd| {
             if (fd.* != -1) {
                 shutdownListenerFd(fd.*);

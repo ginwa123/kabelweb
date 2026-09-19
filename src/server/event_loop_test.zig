@@ -6,13 +6,12 @@
 //! without the threaded `listen()` path.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
 
 const event_loop = @import("event_loop.zig");
 const EventLoop = event_loop.EventLoop;
 const Config = event_loop.Config;
 const nb = @import("nb_socket.zig");
+const test_tcp = @import("test_tcp.zig");
 
 test "framing: incomplete head needs more bytes" {
     const r = try event_loop.extractRequestLen("GET / HTTP/1.1\r\nHost: x", 1024);
@@ -88,7 +87,6 @@ fn stubDispatch(
 }
 
 fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {
-    const sys = posix.system;
     var len: usize = 0;
     while (true) {
         const head_end = event_loop.findHeaderEnd(buf[0..len]);
@@ -97,79 +95,28 @@ fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {
             if (len >= he + cl) return buf[0 .. he + cl];
         }
         if (len >= buf.len) return error.TooMuch;
-        const n: isize = sys.read(fd, buf.ptr + len, buf.len - len);
-        if (n <= 0) return error.Closed;
-        len += @as(usize, @intCast(n));
+        const n = try test_tcp.read(fd, buf[len..]);
+        if (n == 0) return error.Closed;
+        len += n;
     }
 }
 
 fn tcpConnect(port: u16) !i32 {
-    const sys = posix.system;
-    const raw = sys.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
-    if (raw < 0) return error.SocketFailed;
-    const fd: i32 = @intCast(raw);
-    errdefer _ = sys.close(fd);
-    var caddr: sys.sockaddr.in = .{
-        .family = 2,
-        .port = @byteSwap(port),
-        .addr = @bitCast(@as(u32, 0x0100007f)),
-        .zero = undefined,
-    };
-    const rc = sys.connect(fd, @ptrCast(&caddr), @sizeOf(sys.sockaddr.in));
-    if (rc != 0) return error.ConnectFailed;
-    return fd;
+    return test_tcp.connect(port);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
-    const sys = posix.system;
-    var off: usize = 0;
-    while (off < data.len) {
-        const n: isize = sys.write(fd, data.ptr + off, data.len - off);
-        if (n <= 0) return error.WriteFailed;
-        off += @as(usize, @intCast(n));
-    }
+    return test_tcp.writeAll(fd, data);
 }
 
-test "event loop serves GET over loopback (POSIX)" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+test "event loop serves GET over loopback" {
     const alloc = std.testing.allocator;
-    const sys = posix.system;
 
-    // Bind ephemeral loopback listener (same raw-syscall shape as
-    // `http_server.zig:Address`, which is why `rc < 0` checks read oddly —
-    // raw syscalls return -errno on failure).
-    const lfd_raw = sys.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
-    if (lfd_raw < 0) return error.SocketFailed;
-    const lfd: i32 = @intCast(lfd_raw);
-    defer _ = sys.close(lfd);
-    const opt: i32 = 1;
-    try posix.setsockopt(
-        lfd,
-        @intCast(posix.SOL.SOCKET),
-        @intCast(posix.SO.REUSEADDR),
-        std.mem.asBytes(&opt),
-    );
-    var addr: sys.sockaddr.in = .{
-        .family = 2,
-        .port = 0, // ephemeral
-        .addr = @bitCast(@as(u32, 0x0100007f)), // 127.0.0.1 LE
-        .zero = undefined,
-    };
-    {
-        const rc = sys.bind(lfd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in));
-        if (rc < 0) return error.BindFailed;
-    }
-    {
-        const rc = sys.listen(lfd, 16);
-        if (rc < 0) return error.ListenFailed;
-    }
-    var bound: sys.sockaddr.in = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(sys.sockaddr.in);
-    {
-        const rc = sys.getsockname(lfd, @ptrCast(&bound), &bound_len);
-        if (rc != 0) return error.GetSockNameFailed;
-    }
-    const port = @byteSwap(bound.port);
+    // Ephemeral loopback listener; the port is OS-picked on both families.
+    const listener = try test_tcp.listenEphemeral();
+    const lfd = listener.fd;
+    const port = listener.port;
+    defer test_tcp.close(lfd);
 
     var loop = EventLoop.init(alloc, std.testing.io, .{
         .max_conns = 16,
@@ -190,7 +137,7 @@ test "event loop serves GET over loopback (POSIX)" {
         // Wake poll: connect+close a dummy client (poll timeout is 250 ms
         // max anyway, so this just speeds the join).
         if (tcpConnect(port)) |w| {
-            _ = posix.system.close(w);
+            test_tcp.close(w);
         } else |_| {}
         t.join();
     }
@@ -199,7 +146,7 @@ test "event loop serves GET over loopback (POSIX)" {
     std.Io.sleep(std.testing.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .real) catch {};
 
     const cfd = try tcpConnect(port);
-    defer _ = posix.system.close(cfd);
+    defer test_tcp.close(cfd);
 
     // Request 1: keep-alive.
     const req1 = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";

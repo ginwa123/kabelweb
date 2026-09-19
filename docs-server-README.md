@@ -110,7 +110,9 @@ dropped past the cap). `shutdown()` works for both paths (listener close
 surfaces as `POLLHUP` and exits the loop).
 
 v1 scope (deliberate, non-breaking — `listen()` is untouched):
-- POSIX only (Windows returns `error.Unsupported`).
+- Cross-platform single loop: `poll(2)` on POSIX, `WSAPoll` on Windows.
+  `loop_count > 1` (multi) is POSIX-only — Windows has no `SO_REUSEPORT`
+  equivalent and fails fast with `error.Unsupported` (use one loop there).
 - No TLS (`error.TlsNotSupported` when `tls_ctx` is set).
 - SSE / WebSocket / H2C upgrades and the static-dir fallback answer
   `501 Not Implemented` + close (same status the threaded path already
@@ -142,19 +144,21 @@ try server.listenEventLoop(.{}); // instead of try server.listen();
 try server.listenEventLoop(.{ .dispatch_mode = .worker_pool });
 ```
 
-### Multi-loop: one port, N reactors
+### Loops: one entry point, `loop_count` selects the shape
 
-`GinwaServer.listenEventLoopMulti(cfg)` runs `cfg.loop_count` poll
-loops (0 = one per CPU, clamped to `max_multi_loops = 16`) sharing one
-port via `SO_REUSEPORT` (`nb_socket.bindReusePort`). The kernel
-balances accepts; per-loop stats sum into `server.el_stats`
-(`Stats.combine`). The bound ip:port is read off the server socket with
-`getsockname`, so ephemeral port 0 works. `shutdown()` closes every
-listener (loops exit on `POLLHUP`) and flags the loops, then the call
-joins all threads.
+`GinwaServer.listenEventLoop(cfg)` is the only reactor entry point:
+`loop_count` `0`/`1` runs a single loop on the calling thread, `>1`
+runs that many loops sharing one port via `SO_REUSEPORT`
+(`nb_socket.bindReusePort`). The kernel balances accepts; per-loop
+stats sum into `server.el_stats` (`Stats.combine`). The bound ip:port
+is read off the server socket with `getsockname`, so ephemeral port 0
+works. `shutdown()` closes every listener (loops exit on `POLLHUP`)
+and flags the loops, then the call joins all threads. Multi is
+POSIX-only (`loop_count > 1` returns `error.Unsupported` on Windows —
+use the single loop there); at most `max_multi_loops = 16` loops.
 
 ```zig
-try server.listenEventLoopMulti(.{ .loop_count = 4 });
+try server.listenEventLoop(.{ .loop_count = 4 });
 ```
 
 `server.el_stats` (also written by single-loop `listenEventLoop`)
