@@ -91,6 +91,90 @@ all stay present across edits — see "Running Tests" below.
 
 ## Architecture
 
+### Serve paths: threaded (default) vs event loop (opt-in)
+
+`GinwaServer.listen()` is the default: blocking `accept()` + one thread
+per connection (`std.Io.Group.concurrent`, capped at `cpu_count * 12` by
+`worker_sem`; excess waits in the kernel backlog). Simple, portable
+(Linux/macOS/Windows), correct for SSE/WS/H2/TLS — but one thread per
+idle keep-alive connection.
+
+`GinwaServer.listenEventLoop(cfg)` is the opt-in reactor for plain
+HTTP/1.1: one thread runs `poll(2)` over the listener + all connections
+(`src/server/event_loop.zig`), with non-blocking helpers in
+`src/server/nb_socket.zig`. No per-connection threads; per-conn state is
+a small `Conn` struct (read buffer + write outbox + deadlines). Timers
+replace threads: idle keep-alive timeout (default 60 s), header-read
+timeout (default 5 s), backpressure cap (default 1024 conns, newest
+dropped past the cap). `shutdown()` works for both paths (listener close
+surfaces as `POLLHUP` and exits the loop).
+
+v1 scope (deliberate, non-breaking — `listen()` is untouched):
+- POSIX only (Windows returns `error.Unsupported`).
+- No TLS (`error.TlsNotSupported` when `tls_ctx` is set).
+- SSE / WebSocket / H2C upgrades and the static-dir fallback answer
+  `501 Not Implemented` + close (same status the threaded path already
+  uses for SSE+WS-over-TLS).
+- Handler signature unchanged (`HandlerFn`); dispatch reuses the same
+  pre-gate → CORS preflight → router → 404 pipeline.
+
+```zig
+var server = try kabelweb.GinwaServer.init(alloc, io, addr);
+try server.router.get("/hello", helloHandler);
+try server.listenEventLoop(.{}); // instead of try server.listen();
+```
+
+### Dispatch modes: direct vs worker pool
+
+`EventLoopConfig.dispatch_mode` (default `.direct`):
+- `.direct` — dispatch runs on the loop thread. Fastest for fast
+  handlers; one slow handler stalls every connection on that loop.
+- `.worker_pool` — complete requests go to a bounded
+  `worker_pool.zig:WorkerPool` (`worker_threads`, default ncpu;
+  `worker_queue_depth`, default 1024). The loop thread does I/O only;
+  completions return via a mutex queue + socketpair wake fd. A full
+  queue falls back to direct dispatch (counted in
+  `Stats.inline_fallback`, never dropped). The loop allocator must be
+  thread-safe in this mode. Per-conn ordering holds (one in-flight
+  offload per connection; pipelined bytes wait their turn).
+
+```zig
+try server.listenEventLoop(.{ .dispatch_mode = .worker_pool });
+```
+
+### Multi-loop: one port, N reactors
+
+`GinwaServer.listenEventLoopMulti(cfg)` runs `cfg.loop_count` poll
+loops (0 = one per CPU, clamped to `max_multi_loops = 16`) sharing one
+port via `SO_REUSEPORT` (`nb_socket.bindReusePort`). The kernel
+balances accepts; per-loop stats sum into `server.el_stats`
+(`Stats.combine`). The bound ip:port is read off the server socket with
+`getsockname`, so ephemeral port 0 works. `shutdown()` closes every
+listener (loops exit on `POLLHUP`) and flags the loops, then the call
+joins all threads.
+
+```zig
+try server.listenEventLoopMulti(.{ .loop_count = 4 });
+```
+
+`server.el_stats` (also written by single-loop `listenEventLoop`)
+carries the last run's counters — handy for tests and `/health`.
+
+### Bench harness
+
+`scripts/bench-event-loop.sh [--quick]` builds the demo, serves it
+three ways (`threaded` / `event-loop` / `loops-4` via the demo's
+`--event-loop` / `--pool` / `--loops N` flags), and loads `/health` +
+`/hello/:name` with a stdlib-only python3 concurrent loader
+(keep-alive reuse per thread). No `wrk` needed.
+
+Tests: `src/server/event_loop_test.zig` (framing units + live loopback
+keep-alive test), `src/server/event_loop_server_test.zig` (real server
++ routes through `listenEventLoop`: GET, POST echo, 404 reuse, SSE 501;
+worker-pool mode with ordering + stats asserts; multi-loop with
+aggregate-stats asserts), `src/server/worker_pool_test.zig` (exactly-
+once, queue-full backpressure, stop-drains).
+
 ```
 src/
 ├── main.zig                  # Server entry point, route setup, and static HTML page (LANDING_PAGE_HTML)

@@ -877,7 +877,42 @@ pub fn run(init: std.process.Init) !void {
 
     std.debug.print("WebSocket listening on ws://127.0.0.1:29590/ws\n", .{});
 
-    try gs.listen();
+    // Serve-path flags (bench harness `scripts/bench-event-loop.sh` uses
+    // these; default = threaded `listen()`):
+    //   --event-loop   plain HTTP/1.1 via the single poll reactor
+    //   --pool         dispatch via worker pool (implies --event-loop)
+    //   --loops N      N REUSEPORT loops (implies --event-loop)
+    // NOTE: SSE/WS routes answer 501 on the event-loop paths (documented
+    // v1 scope) — bench against /health and /hello/:name.
+    var use_event_loop = false;
+    var use_pool = false;
+    var loop_count: usize = 0;
+    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = arg_it.skip(); // argv[0]
+    while (arg_it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--event-loop")) {
+            use_event_loop = true;
+        } else if (std.mem.eql(u8, arg, "--pool")) {
+            use_event_loop = true;
+            use_pool = true;
+        } else if (std.mem.eql(u8, arg, "--loops")) {
+            use_event_loop = true;
+            const n_str = arg_it.next() orelse continue;
+            loop_count = std.fmt.parseInt(usize, n_str, 10) catch 0;
+        }
+    }
+    const dispatch_mode = if (use_pool) gserverz.EventLoopConfig{ .dispatch_mode = .worker_pool } else gserverz.EventLoopConfig{};
+    if (loop_count > 0) {
+        std.debug.print("Serving via {d} event loops (REUSEPORT)...\n", .{loop_count});
+        var mcfg = dispatch_mode;
+        mcfg.loop_count = loop_count;
+        try gs.listenEventLoopMulti(mcfg);
+    } else if (use_event_loop) {
+        std.debug.print("Serving via single event loop...\n", .{});
+        try gs.listenEventLoop(dispatch_mode);
+    } else {
+        try gs.listen();
+    }
 }
 
 // curl http://127.0.0.1:29590/       # → HTML landing page

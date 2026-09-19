@@ -32,6 +32,17 @@ pub const WsManager = ws_manager.WsManager;
 pub const CronjobManager = cronjob_manager.CronjobManager;
 pub const WsOpcode = ws_frames.Opcode;
 pub const WsConnection = ws_manager.WsClient;
+// Event-loop reactor (non-blocking alternative to `listen()`).
+// `listenEventLoop` serves plain HTTP/1.1 through a single poll loop;
+// the threaded `listen()` path is unchanged.
+const event_loop_mod = @import("event_loop.zig");
+const nb_socket_mod = @import("nb_socket.zig");
+pub const EventLoop = event_loop_mod.EventLoop;
+pub const EventLoopConfig = event_loop_mod.Config;
+pub const EventLoopStats = event_loop_mod.Stats;
+/// Max poll loops `listenEventLoopMulti` will run (fixed server-side
+/// arrays; raise if a 16-core box ever wants more than one loop per core).
+pub const max_multi_loops = 16;
 // Router re-exports — let module users (and other modules referencing
 // `gserverz.MiddlewareFn` / `gserverz.MiddlewareChain`) wire up groups
 // and middlewares without reaching into the file-private Router module.
@@ -440,6 +451,21 @@ pub const GinwaServer = struct {
 
     max_worker_threads: usize,
     worker_sem: std.Io.Semaphore,
+
+    /// Last event-loop run's counters. Written by `listenEventLoop` /
+    /// `listenEventLoopMulti` on exit (summed across loops for multi);
+    /// untouched by the threaded `listen()`. Read after `shutdown`+join.
+    el_stats: EventLoopStats = .{},
+
+    /// Multi-loop listener fds owned by `listenEventLoopMulti` (fixed cap;
+    /// see `max_multi_loops`). Registered BEFORE loop threads spawn so
+    /// `shutdown()` can close them mid-run; entries flip to -1 on close.
+    el_multi_fds: [max_multi_loops]i32 = [_]i32{-1} ** max_multi_loops,
+    /// Live loop pointers for `shutdown()`'s `requestShutdown` backup.
+    /// Valid only while `listenEventLoopMulti` runs (it joins everything).
+    el_multi_loops: [max_multi_loops]?*EventLoop = [_]?*EventLoop{null} ** max_multi_loops,
+    /// How many of the above slots are registered.
+    el_multi_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, address: Address) !*GinwaServer {
         const gs = try allocator.create(GinwaServer);
@@ -1233,6 +1259,217 @@ pub const GinwaServer = struct {
 
         try group.await(self.io);
     }
+
+    /// Serve plain HTTP/1.1 through a single-threaded poll reactor instead
+    /// of the thread-per-connection `listen()` loop.
+    ///
+    /// Non-breaking: `listen()` is untouched; callers opt in by calling
+    /// this. v1 scope (see `event_loop.zig` header):
+    ///   - POSIX only (Windows returns `error.Unsupported`).
+    ///   - No TLS (`error.TlsNotSupported` when `tls_ctx` is set — use
+    ///     `listen()` for https until the non-blocking handshake lands).
+    ///   - No SSE / WebSocket / H2C upgrades: matching routes get
+    ///     `501 Not Implemented` + close. No static-dir fallback either
+    ///     (`501` when `static_dir_handler` is set and no route matches).
+    ///   - `shutdown()` works for both paths: it closes the listener fd,
+    ///     which makes the reactor's `poll` report HUP and exit.
+    pub fn listenEventLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
+        if (self.tls_ctx != null) return error.TlsNotSupported;
+        _ = nb_socket_mod.POLL.IN; // keep import live on all POSIX targets
+
+        if (builtin.os.tag == .windows) {
+            const rc = winsock.listen(self.address.sock_fd, 1024);
+            if (rc != 0) return error.ListenFailed;
+        } else {
+            const rc = socket.listen(self.address.sock_fd, 1024);
+            if (rc < 0) return error.ListenFailed;
+        }
+
+        // Same best-effort cron start as `listen()`.
+        if (self.cronjob_manager.start()) |_| {
+            std.debug.print("Cronjob manager running (1s tick)\n", .{});
+        } else |err| {
+            std.debug.print("HTTP_SERVER: cronjob manager start failed: {s}\n", .{@errorName(err)});
+        }
+
+        self.is_running = true;
+        var loop = event_loop_mod.EventLoop.init(self.allocator, self.io, cfg);
+        defer loop.deinit();
+        const template = HttpContext{
+            .allocator = self.allocator,
+            .io = self.io,
+            .allowed_origins = self.cors.allowed_origins,
+        };
+        // Listener close (via `shutdown()`) surfaces as POLLHUP inside
+        // `run` and breaks the loop; `is_running` is cleared on exit so
+        // `shutdown()` remains idempotent across both serve paths.
+        // Loop stats are copied out for observability (tests, /health).
+        loop.run(self.address.sock_fd, dispatchEventLoopRequest, @ptrCast(self), template) catch |err| {
+            self.el_stats = loop.stats;
+            self.is_running = false;
+            return err;
+        };
+        self.el_stats = loop.stats;
+        self.is_running = false;
+    }
+
+    /// Serve plain HTTP/1.1 on N poll loops sharing one port via
+    /// `SO_REUSEPORT` (Phase 6). Same v1 scope as `listenEventLoop`
+    /// (POSIX, no TLS, upgrades → 501); `cfg.loop_count` selects N
+    /// (0 = one per CPU, clamped to `max_multi_loops`).
+    ///
+    /// Mechanics: the bound ip:port is read off `address.sock_fd` with
+    /// `getsockname` (so ephemeral port 0 works), the original socket is
+    /// closed (it never listened), and each loop thread binds its own
+    /// REUSEPORT listener on the same ip:port. The kernel balances
+    /// accepts; per-loop `EventLoop.stats` are summed into `el_stats`.
+    /// `shutdown()` closes every listener (loops exit on HUP) and flags
+    /// the loops; this function joins all threads before returning.
+    pub fn listenEventLoopMulti(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
+        if (self.tls_ctx != null) return error.TlsNotSupported;
+
+        var bound: socket.sockaddr.in = undefined;
+        var bound_len: posix.socklen_t = @sizeOf(socket.sockaddr.in);
+        if (socket.getsockname(self.address.sock_fd, @ptrCast(&bound), &bound_len) != 0)
+            return error.GetSockNameFailed;
+        const host_le: u32 = @bitCast(bound.addr);
+        var port: u16 = @byteSwap(bound.port);
+
+        var n: usize = cfg.loop_count;
+        if (n == 0) n = @max(1, std.Thread.getCpuCount() catch 2);
+        if (n > max_multi_loops) {
+            std.debug.print("HTTP_SERVER: clamping loops {d} → {d} (max_multi_loops)\n", .{ n, max_multi_loops });
+            n = max_multi_loops;
+        }
+
+        // Same best-effort cron start as the other serve paths.
+        if (self.cronjob_manager.start()) |_| {
+            std.debug.print("Cronjob manager running (1s tick)\n", .{});
+        } else |err| {
+            std.debug.print("HTTP_SERVER: cronjob manager start failed: {s}\n", .{@errorName(err)});
+        }
+
+        // Bind every listener up front (sequentially — binds are cheap).
+        // Loop 0 may resolve an ephemeral port; the rest reuse it.
+        var fds: [max_multi_loops]i32 = [_]i32{-1} ** max_multi_loops;
+        errdefer for (fds[0..n]) |fd| {
+            if (fd != -1) closeFd(fd);
+        };
+        for (0..n) |i| {
+            fds[i] = try nb_socket_mod.bindReusePort(host_le, port);
+            if (i == 0 and port == 0) {
+                var b0: socket.sockaddr.in = undefined;
+                var l0: posix.socklen_t = @sizeOf(socket.sockaddr.in);
+                if (socket.getsockname(fds[i], @ptrCast(&b0), &l0) != 0) return error.GetSockNameFailed;
+                port = @byteSwap(b0.port);
+            }
+        }
+
+        // The original Address socket never listened; release it now so no
+        // fd leaks and `shutdown()` routes through the multi slots below.
+        if (self.address.sock_fd != -1) {
+            closeFd(self.address.sock_fd);
+            self.address.sock_fd = -1;
+        }
+        for (0..n) |i| self.el_multi_fds[i] = fds[i];
+        self.el_multi_count = n;
+        errdefer {
+            for (self.el_multi_fds[0..n]) |*fd| {
+                if (fd.* != -1) {
+                    closeFd(fd.*);
+                    fd.* = -1;
+                }
+            }
+            self.el_multi_count = 0;
+        }
+
+        const template = HttpContext{
+            .allocator = self.allocator,
+            .io = self.io,
+            .allowed_origins = self.cors.allowed_origins,
+        };
+        const Slot = struct {
+            server: *GinwaServer,
+            fd: i32,
+            cfg: event_loop_mod.Config,
+            template: HttpContext,
+            stats: EventLoopStats = .{},
+            err: ?anyerror = null,
+            fn run(s: *@This()) void {
+                var loop = event_loop_mod.EventLoop.init(s.server.allocator, s.server.io, s.cfg);
+                defer loop.deinit();
+                s.server.el_multi_loops[s.cfg.loop_id] = &loop;
+                defer s.server.el_multi_loops[s.cfg.loop_id] = null;
+                loop.run(s.fd, dispatchEventLoopRequest, @ptrCast(s.server), s.template) catch |err| {
+                    s.err = err;
+                    s.stats = loop.stats;
+                    return;
+                };
+                s.stats = loop.stats;
+            }
+        };
+        var slots: [max_multi_loops]Slot = undefined;
+        var threads: [max_multi_loops]std.Thread = undefined;
+        var spawned: usize = 0;
+        errdefer {
+            // A spawn failed mid-way: stop what started via the same path
+            // `shutdown()` uses (closes listeners → loops exit on HUP),
+            // join, and reset the slots so no stale state survives.
+            self.shutdown();
+            for (threads[0..spawned]) |t| t.join();
+            for (self.el_multi_fds[0..n]) |*fd| {
+                if (fd.* != -1) {
+                    closeFd(fd.*);
+                    fd.* = -1;
+                }
+            }
+            for (self.el_multi_loops[0..n]) |*maybe| maybe.* = null;
+            self.el_multi_count = 0;
+        }
+        for (0..n) |i| {
+            var lc = cfg;
+            lc.loop_id = i;
+            lc.loop_count = n;
+            slots[i] = .{
+                .server = self,
+                .fd = fds[i],
+                .cfg = lc,
+                .template = template,
+            };
+            threads[i] = try std.Thread.spawn(.{}, Slot.run, .{&slots[i]});
+            spawned += 1;
+        }
+
+        self.is_running = true;
+        for (threads[0..n]) |t| t.join();
+        self.is_running = false;
+
+        // Aggregate + release. `shutdown()` may already have closed some
+        // fds (marked -1); close only the leftovers, then reset the count
+        // so the slots read "no multi run active" again.
+        var total = EventLoopStats{};
+        var first_err: ?anyerror = null;
+        for (0..n) |i| {
+            total = total.combine(slots[i].stats);
+            if (slots[i].err) |e| {
+                if (first_err == null) first_err = e;
+            }
+            if (self.el_multi_fds[i] != -1) {
+                closeFd(self.el_multi_fds[i]);
+                self.el_multi_fds[i] = -1;
+            }
+            self.el_multi_loops[i] = null;
+        }
+        self.el_multi_count = 0;
+        self.el_stats = total;
+        std.debug.print(
+            "HTTP_SERVER: multi-loop exit loops={d} accepted={d} served={d}\n",
+            .{ n, total.accepted, total.served },
+        );
+        if (first_err) |e| return e;
+    }
     pub fn getContentLength(data: []const u8) ?usize {
         const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
         const headers = data[0..header_end];
@@ -1435,6 +1672,20 @@ pub const GinwaServer = struct {
             closeFd(self.address.sock_fd);
             self.address.sock_fd = -1;
         }
+        // Event-loop multi-run: close every registered REUSEPORT listener
+        // (each loop's poll reports HUP and exits) and flag the loops to
+        // stop. Slots flip to -1/null so a later `listenEventLoopMulti`
+        // return path (which also closes leftovers) never double-closes.
+        for (self.el_multi_fds[0..self.el_multi_count]) |*fd| {
+            if (fd.* != -1) {
+                shutdownListenerFd(fd.*);
+                closeFd(fd.*);
+                fd.* = -1;
+            }
+        }
+        for (self.el_multi_loops[0..self.el_multi_count]) |maybe_loop| {
+            if (maybe_loop) |lp| lp.requestShutdown();
+        }
     }
 
     /// Apply CORS response headers to a response built elsewhere (a
@@ -1478,6 +1729,111 @@ pub const GinwaServer = struct {
         return security.buildPreflightResponse(allocator, request, self.cors);
     }
 };
+
+/// Reactor dispatch for `GinwaServer.listenEventLoop` (matches
+/// `event_loop_mod.OnRequestFn`). Synchronous, plain HTTP/1.1 only:
+/// pre-gate → CORS preflight → router handler → 404. SSE / WebSocket
+/// upgrades and the static-dir fallback answer `501` + close (v1 scope).
+/// `Session.deinit` is a no-op so wiring `req.session` here is safe: the
+/// reactor serializes the returned response from the same arena.
+fn dispatchEventLoopRequest(
+    ctx_ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    req_in: *const HttpRequest,
+    http_ctx_in: HttpContext,
+) anyerror!HttpResponse {
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    var req = req_in.*;
+    var http_ctx = http_ctx_in;
+    http_ctx.allocator = alloc;
+    http_ctx.allowed_origins = server.cors.allowed_origins;
+
+    const lookup: context.LookupResult = if (server.context_store) |store|
+        context.contextFromRequest(req, store)
+    else
+        .{ .context = null, .id = null };
+    var session = Session.init(server.context_store, lookup.context, lookup.id);
+    req.session = &session;
+
+    // Engine pre-gate (body cap + origin allowlist). Threaded path closes
+    // on block; here `keep_alive = false` makes the reactor close after
+    // flushing the page.
+    {
+        const gate = security.preGateCheck(&req, server.cors, server.max_body_bytes) catch .pass;
+        if (gate != .pass) {
+            const origin: ?[]const u8 = blk: {
+                var oit = req.headers.iterator();
+                while (oit.next()) |entry| {
+                    if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "origin")) break :blk entry.value_ptr.*;
+                }
+                break :blk null;
+            };
+            const host = if (server.cors.allowed_origins.len > 0) server.cors.allowed_origins[0] else "your-domain";
+            var page = try security.buildEngineBlockPage(alloc, gate, origin, host);
+            server.applySecurityHeadersTo(&page);
+            if (origin) |o| {
+                security.applyCORSHeaders(
+                    &page.headers,
+                    o,
+                    server.cors.allowed_origins,
+                    server.cors.allowed_methods,
+                    server.cors.allowed_headers,
+                    server.cors.allow_credentials,
+                ) catch {};
+            }
+            page.keep_alive = false;
+            return page;
+        }
+    }
+
+    // CORS preflight short-circuit (threaded path closes afterwards).
+    if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
+        var preflight = try server.buildCORSPreflight(&req, alloc);
+        preflight.keep_alive = false;
+        return preflight;
+    }
+
+    if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
+        switch (result) {
+            .handler => |h| {
+                if (h.max_body_bytes != 0) {
+                    const gate = security.preGateCheck(&req, .{ .enabled = false }, h.max_body_bytes) catch .pass;
+                    if (gate != .pass) {
+                        var page = try security.buildEngineBlockPage(alloc, gate, null, "your-domain");
+                        page.keep_alive = false;
+                        return page;
+                    }
+                }
+                var final = try h.chain.run(h.ctx, h.req, h.res);
+                server.applyCORSResponse(&req, &final) catch {};
+                server.applySecurityHeadersTo(&final);
+                final.keep_alive = server.clientWantsKeepAlive(&req);
+                return final;
+            },
+            .websocket, .sse => {
+                var res = HttpResponse.init(501, "Not Implemented", alloc)
+                    .withBody("SSE and WebSocket are not available on the event-loop path yet; use listen().");
+                res.keep_alive = false;
+                return res;
+            },
+        }
+    }
+
+    // No route: static-dir fallback is a blocking Stream writer, so the
+    // reactor answers 501 when one is configured; otherwise 404 with
+    // keep-alive framing like the threaded path.
+    if (server.static_dir_handler != null) {
+        var res = HttpResponse.init(501, "Not Implemented", alloc)
+            .withBody("Static-dir fallback is not available on the event-loop path yet; use listen().");
+        res.keep_alive = false;
+        return res;
+    }
+    var not_found = http_parser.notFound(alloc);
+    server.applyCORSResponse(&req, &not_found) catch {};
+    server.applySecurityHeadersTo(&not_found);
+    not_found.keep_alive = server.clientWantsKeepAlive(&req);
+    return not_found;
+}
 
 fn recvFromSock(fd: SocketFd, buf: [*]u8, len: usize) isize {
     if (builtin.os.tag == .windows) {

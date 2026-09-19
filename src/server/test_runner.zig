@@ -70,6 +70,15 @@ test {
     // Peekable connection buffer — the piece that lets the server sniff the h2
     // preface BEFORE the HTTP/1.1 request reader consumes it.
     _ = @import("connection_reader.zig");
+    // Event-loop reactor (non-blocking alternative to listen()).
+    // nb_socket: fcntl O_NONBLOCK + poll helpers; event_loop: poll reactor
+    // + HTTP/1.1 framing; event_loop_test: framing units + loopback test.
+    _ = @import("nb_socket.zig");
+    _ = @import("event_loop.zig");
+    // Bounded worker pool for offloaded dispatch (Phase 5).
+    _ = @import("worker_pool.zig");
+    // Dual-path proof: real GinwaServer + routes served via listenEventLoop.
+    _ = @import("event_loop_server_test.zig");
     // Transport abstraction (plain socket | TLS). Its own tests cover short
     // writes, EOF and the TLS op-table dispatch.
     _ = @import("stream.zig");
