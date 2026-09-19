@@ -438,6 +438,9 @@ pub const GinwaServer = struct {
     /// with the handler via `setStaticDirHandler`.
     static_dir_cfg: ?*const anyopaque = null,
 
+    max_worker_threads: usize,
+    worker_sem: std.Io.Semaphore,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, address: Address) !*GinwaServer {
         const gs = try allocator.create(GinwaServer);
         errdefer allocator.destroy(gs);
@@ -451,6 +454,9 @@ pub const GinwaServer = struct {
         const store = try gserverz_context.ContextStore.create(allocator);
         errdefer store.deinit();
 
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        const max_workers = cpu_count * 12; // starting point — tune against benchmark
+        //
         gs.* = .{
             .allocator = allocator,
             .io = io,
@@ -462,6 +468,8 @@ pub const GinwaServer = struct {
             .ctx = null,
             .environment = null,
             .context_store = store,
+            .max_worker_threads = max_workers,
+            .worker_sem = std.Io.Semaphore{ .permits = max_workers },
         };
         return gs;
     }
@@ -563,7 +571,12 @@ pub const GinwaServer = struct {
 
         self.is_running = true;
         while (self.is_running) {
-            const client_fd = self.acceptClient() catch break;
+            _ = try self.worker_sem.wait(self.io);
+
+            const client_fd = self.acceptClient() catch {
+                self.worker_sem.post(self.io);
+                break;
+            };
 
             // Blocks the accept loop (not already-served connections) once
             // `max_concurrent_connections` are in flight. This is the
@@ -571,6 +584,7 @@ pub const GinwaServer = struct {
             // accept backlog instead of spawning unbounded threads.
 
             const arena = self.allocator.create(std.heap.ArenaAllocator) catch {
+                self.worker_sem.post(self.io);
                 _ = closeFd(client_fd);
                 continue;
             };
@@ -595,9 +609,19 @@ pub const GinwaServer = struct {
                         defer {
                             arena_allocator.deinit();
                             server.allocator.destroy(arena_allocator);
+                            server.worker_sem.post(server.io); // release on every exit path
                         }
 
-                        const allocator = arena_allocator.allocator();
+                        // FIX (arena growth on keep-alive connections):
+                        // `arena_allocator` (the connection arena) is now used
+                        // ONLY for state that must live for the whole
+                        // connection — currently just `cr` below. Anything
+                        // scoped to a single request/response is allocated
+                        // from `request_arena`, which is reset every
+                        // keep-alive iteration so a long-lived connection
+                        // doesn't accumulate hundreds of requests' worth of
+                        // headers/bodies/responses before it finally closes.
+                        const conn_allocator = arena_allocator.allocator();
 
                         // ─── TLS handshake (when configured) ───────────────
                         // Done inside the per-connection task so a slow or
@@ -627,7 +651,7 @@ pub const GinwaServer = struct {
                         if (alpn_is_h2) {
                             // The preface is still on the wire; the driver consumes
                             // it from the Stream itself (empty initial buffer).
-                            http2_server.serveConnection(server, stream, allocator, "", .{}) catch |err| {
+                            http2_server.serveConnection(server, stream, conn_allocator, "", .{}) catch |err| {
                                 std.debug.print("HTTP_SERVER: h2 (TLS) connection ended: {s}\n", .{@errorName(err)});
                             };
                             _ = closeFd(fd);
@@ -639,7 +663,13 @@ pub const GinwaServer = struct {
                         // preface contains the CRLFCRLF the h1 reader stops at
                         // (byte 14), so parsing h1 first would consume the
                         // preface AND the frames that arrived with it.
-                        var cr = connection_reader.ConnectionReader.init(allocator, stream);
+                        //
+                        // NOTE: `cr` is intentionally allocated from
+                        // `conn_allocator` (connection-lifetime), not the
+                        // per-request arena below — `cr.deinit()` runs after
+                        // the keep-alive loop exits, so its internal state
+                        // must not be reset out from under it mid-loop.
+                        var cr = connection_reader.ConnectionReader.init(conn_allocator, stream);
                         defer cr.deinit();
                         if (server.enable_h2c) {
                             _ = cr.fillOnce() catch |err| {
@@ -654,7 +684,7 @@ pub const GinwaServer = struct {
                                         _ = closeFd(fd);
                                         return;
                                     };
-                                    http2_server.serveConnection(server, stream, allocator, initial, .{}) catch |err| {
+                                    http2_server.serveConnection(server, stream, conn_allocator, initial, .{}) catch |err| {
                                         std.debug.print("HTTP_SERVER: h2 connection ended: {s}\n", .{@errorName(err)});
                                     };
                                     _ = closeFd(fd);
@@ -668,7 +698,7 @@ pub const GinwaServer = struct {
                                             _ = closeFd(fd);
                                             return;
                                         };
-                                        http2_server.serveConnection(server, stream, allocator, initial, .{}) catch |err| {
+                                        http2_server.serveConnection(server, stream, conn_allocator, initial, .{}) catch |err| {
                                             std.debug.print("HTTP_SERVER: h2 connection ended: {s}\n", .{@errorName(err)});
                                         };
                                         _ = closeFd(fd);
@@ -679,31 +709,28 @@ pub const GinwaServer = struct {
                             }
                         }
 
+                        // FIX (arena growth on keep-alive connections):
+                        // Per-request arena, child of the connection's
+                        // allocator. Reset (not destroyed) at the top of
+                        // every keep-alive iteration so memory from request N
+                        // is released before request N+1 starts, instead of
+                        // accumulating for the life of the connection (up to
+                        // 1000 requests per the keep-alive cap below).
+                        // `.retain_capacity` keeps the backing pages mapped
+                        // across resets so we're not paying repeated
+                        // malloc/munmap cost per request.
+                        var request_arena = std.heap.ArenaAllocator.init(server.allocator);
+                        defer request_arena.deinit();
+
                         // ─── HTTP/1.1 keep-alive loop ───────────────────
                         var keep_alive_count: u32 = 0;
-                        var recent_peak: usize = 0;
-                        var samples: u32 = 0;
                         keep_alive_loop: while (true) {
-                            if (keep_alive_count > 0) {
-                                const cap = arena_allocator.queryCapacity();
-
-                                // Update running peak
-                                if (cap > recent_peak) recent_peak = cap;
-                                samples += 1;
-
-                                // Free when current capacity is much larger than what we normally need,
-                                // or every N requests as a safety net
-                                const should_free = (recent_peak > 0 and cap > recent_peak * 2) or (samples % 64 == 0);
-
-                                _ = arena_allocator.reset(if (should_free) .free_all else .retain_capacity);
-
-                                // Slowly forget the peak so it adapts downward
-                                if (should_free) {
-                                    recent_peak = cap / 2; // or set to 0
-                                    samples = 0;
-                                }
-                            }
                             keep_alive_count += 1;
+
+                            // FIX: release last request's allocations before
+                            // this one starts.
+                            _ = request_arena.reset(.retain_capacity);
+                            const allocator = request_arena.allocator();
 
                             var rb = RequestBuffer.init(allocator);
                             defer rb.deinit();
@@ -845,6 +872,11 @@ pub const GinwaServer = struct {
                                 _ = server.sendToStream(stream, preflight_bytes) catch {
                                     std.debug.print("HTTP_SERVER: preflight send failed\n", .{});
                                 };
+                                // FIX: this path used to `return` without
+                                // closing `fd` — leaked one fd per preflight
+                                // request. Every other exit from this handler
+                                // closes fd; this one now does too.
+                                _ = closeFd(fd);
                                 return;
                             }
 
@@ -1088,6 +1120,19 @@ pub const GinwaServer = struct {
                                             _ = closeFd(fd);
                                             return;
                                         };
+                                        // FIX: nothing previously removed this
+                                        // client from sse_manager once the
+                                        // handler returned — every SSE
+                                        // connection left a permanent entry
+                                        // behind, an unbounded leak for any
+                                        // server that serves SSE traffic.
+                                        // `defer` (rather than a single call
+                                        // right before `return`) guarantees
+                                        // cleanup runs on every exit path out
+                                        // of this branch, including any added
+                                        // later.
+                                        defer server.sse_manager.removeClient(client_id, .explicit_shutdown);
+
                                         var sse_ctx = sse.ctx;
                                         sse_ctx.client_id = client_id;
                                         const res = http_parser.HttpResponse.init(200, "OK", allocator);
@@ -1180,6 +1225,7 @@ pub const GinwaServer = struct {
                 std.debug.print("Failed to spawn handler: {s}\n", .{@errorName(err)});
                 arena.deinit();
                 self.allocator.destroy(arena);
+                self.worker_sem.post(self.io); // spawn failed — handler's defer never registered
                 _ = closeFd(client_fd);
                 continue;
             };
