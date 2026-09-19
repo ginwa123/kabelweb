@@ -887,7 +887,10 @@ pub fn run(init: std.process.Init) !void {
     var use_event_loop = false;
     var use_pool = false;
     var loop_count: usize = 0;
-    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    // `initAllocator` (not `init`): the plain iterator is a compileError
+    // on Windows — the allocator variant works on all three CI targets.
+    var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer arg_it.deinit();
     _ = arg_it.skip(); // argv[0]
     while (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--event-loop")) {

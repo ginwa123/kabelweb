@@ -126,19 +126,23 @@ pub fn setNonBlocking(fd: i32) !void {
     }
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
-    const O_NONBLOCK: i32 = 0o4000;
+    // O_NONBLOCK differs per OS (this is why the flag lives in each
+    // branch, not in one shared constant):
+    //   - Linux: 0o4000 (0x800). macOS/BSD: 0x0004.
+    // Using Linux's value on macOS is silently masked off by the kernel,
+    // leaving the fd BLOCKING — the loop then parks forever in accept()
+    // and CI hangs until the 30-minute timeout. F_GETFL/F_SETFL are 3/4
+    // on both, so only this constant branches.
     if (comptime builtin.os.tag == .linux) {
+        const O_NONBLOCK: usize = 0o4000;
         const getfl_rc = std.os.linux.fcntl(fd, F_GETFL, 0);
         if (std.os.linux.errno(getfl_rc) != .SUCCESS) return error.FcntlFailed;
         const flags: usize = @intCast(getfl_rc);
-        const setfl_rc = std.os.linux.fcntl(
-            fd,
-            F_SETFL,
-            flags | @as(usize, @intCast(O_NONBLOCK)),
-        );
+        const setfl_rc = std.os.linux.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         if (std.os.linux.errno(setfl_rc) != .SUCCESS) return error.FcntlFailed;
         return;
     }
+    const O_NONBLOCK: i32 = 0x0004;
     const c = std.c;
     const flags = c.fcntl(fd, F_GETFL);
     if (flags < 0) return error.FcntlFailed;
