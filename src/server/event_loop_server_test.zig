@@ -239,7 +239,12 @@ test "listenEventLoop loop_count=2 serves across loops with agg stats (POSIX)" {
     var mt = MultiThread{ .srv = server };
     const t = try std.Thread.spawn(.{}, MultiThread.run, .{&mt});
     std.Io.sleep(std.testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .real) catch {};
-    if (mt.err) |err| return err;
+    if (mt.err) |err| {
+        // Log the name: on CI the interesting case is a macOS REUSEPORT
+        // bind failure, and the bare `return err` hides which step failed.
+        std.debug.print("listenEventLoop(multi) failed: {s}\n", .{@errorName(err)});
+        return err;
+    }
 
     // 8 connections × 2 keep-alive requests = 16 served, spread by the
     // kernel across both REUSEPORT loops.

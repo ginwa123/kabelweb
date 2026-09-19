@@ -83,7 +83,7 @@ const winsock = if (is_windows) struct {
     const WSAESHUTDOWN: c_int = 10058;
     const WSAENOTCONN: c_int = 10057;
 
-    const FIONBIO: c_long = 0x8004667E;
+    const FIONBIO: c_long = @bitCast(@as(u32, 0x8004667E));
     const SOCKET_ERROR: c_int = -1;
 } else struct {};
 
