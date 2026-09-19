@@ -1361,6 +1361,15 @@ pub const GinwaServer = struct {
 
         // Bind every listener up front (sequentially — binds are cheap).
         // Loop 0 may resolve an ephemeral port; the rest reuse it.
+        //
+        // The original Address socket is closed FIRST (it never listened):
+        // macOS refuses REUSEPORT binds while ANY non-REUSEPORT socket
+        // holds the same tuple (EADDRINUSE), even one that never called
+        // listen() — Linux tolerates the overlap, macOS does not.
+        if (self.address.sock_fd != -1) {
+            closeFd(self.address.sock_fd);
+            self.address.sock_fd = -1;
+        }
         var fds: [max_multi_loops]i32 = [_]i32{-1} ** max_multi_loops;
         errdefer for (fds[0..n]) |fd| {
             if (fd != -1) closeFd(fd);
@@ -1375,12 +1384,6 @@ pub const GinwaServer = struct {
             }
         }
 
-        // The original Address socket never listened; release it now so no
-        // fd leaks and `shutdown()` routes through the multi slots below.
-        if (self.address.sock_fd != -1) {
-            closeFd(self.address.sock_fd);
-            self.address.sock_fd = -1;
-        }
         for (0..n) |i| self.el_multi_fds[i] = fds[i];
         self.el_multi_count = n;
         errdefer {
