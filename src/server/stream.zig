@@ -129,7 +129,7 @@ pub const Stream = union(enum) {
     fn readIo(fd: i32, io: std.Io, buf: []u8) !usize {
         const s: std.Io.net.Stream = .{
             .socket = .{
-                .handle = fd,
+                .handle = ioHandleFromFd(fd),
                 .address = unspecifiedAddress(),
             },
         };
@@ -143,6 +143,23 @@ pub const Stream = union(enum) {
     /// never reports the peer address through this wrapper.
     fn unspecifiedAddress() std.Io.net.IpAddress {
         return .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    }
+
+    /// Convert the repo-wide `SocketFd` (`i32`) into the Io socket-handle
+    /// type (`std.Io.net.Socket.Handle`).
+    ///
+    /// On POSIX `Handle` is `i32` so this is a no-op. On Windows `Handle`
+    /// is `std.c.fd_t` (= `windows.HANDLE` = `*anyopaque`) while the
+    /// production server keeps sockets as truncated `i32` (`SocketFd`,
+    /// see `http_server.zig` + `test_helpers.socketToFdT`); the
+    /// `@ptrFromInt(@bitCast)` round-trip recovers the original SOCKET
+    /// value bit-for-bit (Windows HANDLEs are sign-extended small ints).
+    fn ioHandleFromFd(fd: i32) std.Io.net.Socket.Handle {
+        if (comptime builtin.os.tag == .windows) {
+            return @ptrFromInt(@as(usize, @bitCast(@as(isize, fd))));
+        } else {
+            return fd;
+        }
     }
 
     /// Write every byte of `bytes`, looping until the whole slice is out (a
@@ -186,7 +203,7 @@ pub const Stream = union(enum) {
     fn writeAllIo(fd: i32, io: std.Io, bytes: []const u8) !void {
         const s: std.Io.net.Stream = .{
             .socket = .{
-                .handle = fd,
+                .handle = ioHandleFromFd(fd),
                 .address = unspecifiedAddress(),
             },
         };

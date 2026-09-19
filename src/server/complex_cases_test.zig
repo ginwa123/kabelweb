@@ -1168,13 +1168,16 @@ test "stress: parse 1000 random-ish requests without crash" {
 test "stress: 50 sequential server init/destroy cycles" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
-        const port: u16 = 45800 + @as(u16, @intCast(i % 50)); // stay within test range
-        const addr = try http_server.Address.init("127.0.0.1", port);
-        const _close_fd = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
-        _ = _close_fd;
-
+        // Port 0 = let the OS pick a free one. Fixed ports in the
+        // 45800-range sit INSIDE the kernel's ephemeral range
+        // (32768-60999), so any concurrent OUTBOUND connection using one
+        // of those ports as its source port makes bind() fail with
+        // EADDRINUSE — the flaky `BindFailed` this test used to hit.
+        // Same fix as the 500-cycle test in complex_cases_extra_test.zig.
+        const addr = try http_server.Address.init("127.0.0.1", 0);
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
         server.destroy(allocator);
+        closeI32Fd(addr.sock_fd);
     }
     // No leak reported by testing.allocator on scope exit.
 }
