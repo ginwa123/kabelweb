@@ -57,10 +57,27 @@ var tls_ops: ?Stream.TlsOps = null;
 pub const Stream = union(enum) {
     /// A raw accepted socket. Holds the exact `SocketFd` (`i32`) the server
     /// already carries around, so no wrapping/casting happens on this path.
+    /// I/O is raw blocking syscalls — kept for tests, tools, and callers
+    /// without an `std.Io`. Production serving uses `conn` below.
     plain: i32,
+    /// An Io-driven accepted socket: the same raw fd, but reads/writes go
+    /// through `std.Io.net.Stream` so the calling task SUSPENDS instead of
+    /// parking its worker thread. This is what makes `Group.async`
+    /// (fiber multiplexing over ~ncpu workers) viable: 200 connections no
+    /// longer need 200 threads. The fd itself stays blocking — the Io
+    /// layer issues per-call `DONTWAIT` recvmmsg-style reads and parks the
+    /// fiber until readable.
+    conn: Conn,
     /// An established TLS connection, owned by the TLS layer. Opaque here:
     /// this file never looks inside and never names the concrete type.
     tls: *anyopaque,
+
+    /// An accepted socket plus the Io used to drive it. Constructed once
+    /// per connection by the accept loop (`server.io`).
+    pub const Conn = struct {
+        fd: i32,
+        io: std.Io,
+    };
 
     /// Register the TLS read/write/close implementations once, at startup
     /// (called by the TLS integration with `tls.Conn`'s functions).
@@ -75,8 +92,11 @@ pub const Stream = union(enum) {
     /// `recvFromSock` consumers rely on today.
     ///
     /// Plain: the same `read` syscall (POSIX) / `winsock.recv` (Windows) the
-    /// server issues today. TLS: `TlsOps.read`, or
-    /// `error.TlsOpsNotInstalled` if no implementation was registered.
+    /// server issues today. Conn: the same bytes via `std.Io.net.Stream`,
+    /// suspending the calling fiber instead of parking its worker thread
+    /// (errors collapse to `error.ReadFailed`, matching plain). TLS:
+    /// `TlsOps.read`, or `error.TlsOpsNotInstalled` if no implementation
+    /// was registered.
     pub fn read(self: Stream, buf: []u8) !usize {
         switch (self) {
             .plain => |fd| {
@@ -90,6 +110,9 @@ pub const Stream = union(enum) {
                     return @as(usize, @intCast(rc));
                 }
             },
+            .conn => |c| {
+                return readIo(c.fd, c.io, buf) catch return error.ReadFailed;
+            },
             .tls => |conn| {
                 const ops = tls_ops orelse return error.TlsOpsNotInstalled;
                 return ops.read(conn, buf);
@@ -97,13 +120,39 @@ pub const Stream = union(enum) {
         }
     }
 
+    /// Io-driven short read for the `conn` variant. Wraps the raw fd in a
+    /// `std.Io.net.Stream` per call (no allocation — the wrapper is two
+    /// words; the address field is never inspected on the read path, so it
+    /// carries the unspecified address).
+    /// `readSliceShort` copies straight into `buf` (no extra copy) and
+    /// returns 0 at EOF, matching the plain convention.
+    fn readIo(fd: i32, io: std.Io, buf: []u8) !usize {
+        const s: std.Io.net.Stream = .{
+            .socket = .{
+                .handle = fd,
+                .address = unspecifiedAddress(),
+            },
+        };
+        var scratch: [256]u8 = undefined;
+        var r = s.reader(io, &scratch);
+        return try r.interface.readSliceShort(buf);
+    }
+
+    /// Placeholder peer address for Io-wrapped accepted sockets. Only the
+    /// fd `handle` is ever used by the read/write/close paths; the server
+    /// never reports the peer address through this wrapper.
+    fn unspecifiedAddress() std.Io.net.IpAddress {
+        return .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    }
+
     /// Write every byte of `bytes`, looping until the whole slice is out (a
     /// single `write`/`send` may accept only part of a large payload).
     ///
     /// Plain: the same `write` (POSIX) / `winsock.send` (Windows) primitive
     /// `sendToClient` uses. A 0-byte result is treated as a failure so a
-    /// stalled peer can never spin this loop forever. TLS: `TlsOps.write_all`,
-    /// or `error.TlsOpsNotInstalled`.
+    /// stalled peer can never spin this loop forever. Conn: buffered
+    /// Io-driven send (suspends instead of parking; flushed before
+    /// return). TLS: `TlsOps.write_all`, or `error.TlsOpsNotInstalled`.
     pub fn writeAll(self: Stream, bytes: []const u8) !void {
         switch (self) {
             .plain => |fd| {
@@ -120,11 +169,31 @@ pub const Stream = union(enum) {
                     }
                 }
             },
+            .conn => |c| {
+                try writeAllIo(c.fd, c.io, bytes);
+            },
             .tls => |conn| {
                 const ops = tls_ops orelse return error.TlsOpsNotInstalled;
                 try ops.write_all(conn, bytes);
             },
         }
+    }
+
+    /// Io-driven send for the `conn` variant. Buffered through a 4 KiB
+    /// stack scratch (one send syscall for typical responses) and always
+    /// flushed, so bytes are on the wire at return — same guarantee as
+    /// the plain loop.
+    fn writeAllIo(fd: i32, io: std.Io, bytes: []const u8) !void {
+        const s: std.Io.net.Stream = .{
+            .socket = .{
+                .handle = fd,
+                .address = unspecifiedAddress(),
+            },
+        };
+        var scratch: [4096]u8 = undefined;
+        var w = s.writer(io, &scratch);
+        try w.interface.writeAll(bytes);
+        try w.interface.flush();
     }
 
     /// Close the underlying transport.
@@ -142,6 +211,15 @@ pub const Stream = union(enum) {
                     _ = socket.close(fd);
                 }
             },
+            // Same fd lifetime as plain; closing never blocks, so the raw
+            // primitive is correct here (no Io round-trip needed).
+            .conn => |c| {
+                if (comptime builtin.os.tag == .windows) {
+                    _ = winsock.closesocket(c.fd);
+                } else {
+                    _ = socket.close(c.fd);
+                }
+            },
             .tls => |conn| {
                 if (tls_ops) |ops| ops.close(conn);
             },
@@ -153,6 +231,7 @@ pub const Stream = union(enum) {
     pub fn isTls(self: Stream) bool {
         return switch (self) {
             .plain => false,
+            .conn => false,
             .tls => true,
         };
     }

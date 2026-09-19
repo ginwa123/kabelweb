@@ -2,6 +2,7 @@ const std = @import("std");
 const Template = @import("template.zig");
 const context_mod = @import("context.zig");
 const ContextStore = context_mod.ContextStore;
+const Stream = @import("stream.zig").Stream;
 
 pub const HttpContext = struct {
     allocator: std.mem.Allocator,
@@ -25,8 +26,18 @@ fn nextContextId() u64 {
     return context_id_counter.fetchAdd(1, .seq_cst);
 }
 
-/// Decode URL-encoded string (handles %XX, +, and all special chars)
+/// Decode URL-encoded string (handles %XX, +, and all special chars.
+/// Fast path: when the input contains no '%' and no '+', it is already
+/// decoded — a single `dupe` avoids the two-pass scan + parseInt loop.
 pub fn urlDecode(data: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    var needs_decode = false;
+    for (data) |c| {
+        if (c == '%' or c == '+') {
+            needs_decode = true;
+            break;
+        }
+    }
+    if (!needs_decode) return allocator.dupe(u8, data);
     // Calculate exact size needed
     var decoded_len: usize = 0;
     var i: usize = 0;
@@ -465,10 +476,11 @@ pub const HttpResponse = struct {
     }
 
     pub fn withBody(self: HttpResponse, body: []const u8) HttpResponse {
+        // No Content-Length header stored: `toBytes`/`writeTo` always frame
+        // the body length on the wire from `body.len` (zero allocs). Storing
+        // it here used to cost 1 allocPrint + 1 map insert per response.
         var copy = self;
         copy.body = body;
-        const len_str = std.fmt.allocPrint(self.allocator, "{}", .{body.len}) catch @panic("OOM");
-        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
         return copy;
     }
 
@@ -544,11 +556,10 @@ pub const HttpResponse = struct {
     }
 
     pub fn withJson(self: HttpResponse, json: []const u8) HttpResponse {
+        // Content-Length framed on the wire by toBytes/writeTo (see withBody).
         var copy = self;
         copy.body = json;
-        const len_str = std.fmt.allocPrint(self.allocator, "{}", .{json.len}) catch @panic("OOM");
         copy.headers.put("Content-Type", "application/json") catch @panic("OOM");
-        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
         return copy;
     }
 
@@ -592,8 +603,8 @@ pub const HttpResponse = struct {
         copy.body = "";
         copy.headers.put("Location", location) catch @panic("OOM");
         copy.headers.put("Content-Type", "text/html; charset=utf-8") catch @panic("OOM");
-        const len_str = std.fmt.allocPrint(self.allocator, "0", .{}) catch @panic("OOM");
-        copy.headers.put("Content-Length", len_str) catch @panic("OOM");
+        // Empty body frames as `Content-Length: 0` on the wire via
+        // toBytes/writeTo — no heap string needed here.
         return copy;
     }
 
@@ -694,38 +705,114 @@ pub const HttpResponse = struct {
     }
 
     pub fn toBytes(self: HttpResponse) ![]u8 {
-        var buf = std.ArrayList(u8).empty;
-        errdefer buf.deinit(self.allocator);
+        // Heap path (owns the returned slice). Exactly one allocation,
+        // sized up front — no regrowth, no transient 2x peak. The hot
+        // loop prefers `writeTo` (zero allocs for small responses); this
+        // stays for tests, error pages, and large bodies.
+        const hlen = self.headLen();
+        const total = hlen + 2 + self.body.len;
+        const out = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(out);
+        const n = try self.formatHeadInto(out);
+        std.debug.assert(n == hlen); // headLen/formatHeadInto must agree
+        @memcpy(out[n..][0..2], "\r\n");
+        @memcpy(out[n + 2 ..][0..self.body.len], self.body);
+        return out;
+    }
 
-        try buf.appendSlice(self.allocator, "HTTP/1.1 ");
+    /// Length to frame on the wire, or null when no Content-Length line
+    /// is emitted: an explicit header wins (manual framing), and
+    /// 1xx/204/304 must not carry one (RFC 9110 §8.6).
+    fn autoContentLength(self: HttpResponse) ?usize {
+        if (self.headers.contains("Content-Length")) return null;
+        if (self.status_code == 204 or self.status_code == 304) return null;
+        if (self.status_code >= 100 and self.status_code < 200) return null;
+        return self.body.len;
+    }
 
-        var status_buf: [20]u8 = undefined;
-        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{self.status_code}) catch return error.OutOfMemory;
-        try buf.appendSlice(self.allocator, status_str);
+    /// Shared response-head formatter (status line + Server/Connection +
+    /// headers + auto Content-Length). Single source of truth for both
+    /// `toBytes` (heap) and `writeTo` (stack fast path) so the wire bytes
+    /// can never drift apart. Hand-rolled cursor appends (no Writer
+    /// vtable): this runs ~100k times/sec on the hot path.
+    const Head = struct {
+        buf: []u8,
+        pos: usize = 0,
+        fn put(h: *Head, s: []const u8) !void {
+            if (h.pos + s.len > h.buf.len) return error.Overflow;
+            @memcpy(h.buf[h.pos..][0..s.len], s);
+            h.pos += s.len;
+        }
+        fn int(h: *Head, v: anytype) !void {
+            const s = std.fmt.bufPrint(h.buf[h.pos..], "{d}", .{v}) catch return error.Overflow;
+            h.pos += s.len;
+        }
+    };
 
-        try buf.appendSlice(self.allocator, " ");
-        try buf.appendSlice(self.allocator, self.status_text);
-        try buf.appendSlice(self.allocator, "\r\n");
-        try buf.appendSlice(self.allocator, "Server: Server/1.0\r\n"); // todo change i think
+    /// Exact byte length of `formatHeadInto` output. Must stay in sync
+    /// (enforced by `std.debug.assert` in `toBytes`, covered by tests).
+    fn headLen(self: HttpResponse) usize {
+        var n: usize = "HTTP/1.1 ".len + std.fmt.count("{d}", .{self.status_code}) + 1 + self.status_text.len + 2;
+        n += "Server: Server/1.0\r\n".len;
+        n += if (self.keep_alive) "Connection: keep-alive\r\nKeep-Alive: timeout=5, max=1000\r\n".len else "Connection: close\r\n".len;
+        var it = self.headers.iterator();
+        while (it.next()) |entry| {
+            n += entry.key_ptr.*.len + 2 + entry.value_ptr.*.len + 2;
+        }
+        if (self.autoContentLength()) |len| {
+            n += "Content-Length: ".len + std.fmt.count("{d}", .{len}) + 2;
+        }
+        return n;
+    }
+
+    fn formatHeadInto(self: HttpResponse, buf: []u8) !usize {
+        var h: Head = .{ .buf = buf };
+        try h.put("HTTP/1.1 ");
+        try h.int(self.status_code);
+        try h.put(" ");
+        try h.put(self.status_text);
+        try h.put("\r\n");
+        try h.put("Server: Server/1.0\r\n"); // todo change i think
         if (self.keep_alive) {
-            try buf.appendSlice(self.allocator, "Connection: keep-alive\r\n");
-            try buf.appendSlice(self.allocator, "Keep-Alive: timeout=5, max=1000\r\n");
+            try h.put("Connection: keep-alive\r\n");
+            try h.put("Keep-Alive: timeout=5, max=1000\r\n");
         } else {
-            try buf.appendSlice(self.allocator, "Connection: close\r\n");
+            try h.put("Connection: close\r\n");
         }
 
         var it = self.headers.iterator();
         while (it.next()) |entry| {
-            try buf.appendSlice(self.allocator, entry.key_ptr.*);
-            try buf.appendSlice(self.allocator, ": ");
-            try buf.appendSlice(self.allocator, entry.value_ptr.*);
-            try buf.appendSlice(self.allocator, "\r\n");
+            try h.put(entry.key_ptr.*);
+            try h.put(": ");
+            try h.put(entry.value_ptr.*);
+            try h.put("\r\n");
         }
 
-        try buf.appendSlice(self.allocator, "\r\n");
-        try buf.appendSlice(self.allocator, self.body);
+        if (self.autoContentLength()) |len| {
+            try h.put("Content-Length: ");
+            try h.int(len);
+            try h.put("\r\n");
+        }
+        return h.pos;
+    }
 
-        return buf.toOwnedSlice(self.allocator);
+    /// Stream this response with minimum allocation: responses whose
+    /// head + blank line + body fit 4 KiB go out with ZERO heap allocs
+    /// (covers health/hello/echo/redirect); larger ones fall back to the
+    /// `toBytes` heap path. Wire bytes are identical either way.
+    pub fn writeTo(self: HttpResponse, stream: Stream) !void {
+        var stack: [4096]u8 = undefined;
+        const n = self.formatHeadInto(&stack) catch return self.writeToHeap(stream);
+        if (n + 2 + self.body.len > stack.len) return self.writeToHeap(stream);
+        @memcpy(stack[n..][0..2], "\r\n");
+        @memcpy(stack[n + 2 ..][0..self.body.len], self.body);
+        try stream.writeAll(stack[0 .. n + 2 + self.body.len]);
+    }
+
+    fn writeToHeap(self: HttpResponse, stream: Stream) !void {
+        const bytes = try self.toBytes();
+        defer self.allocator.free(bytes);
+        try stream.writeAll(bytes);
     }
 
     pub fn jsonResponse(self: HttpResponse, jsonStruct: JsonStruct) HttpResponse {

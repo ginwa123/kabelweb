@@ -555,8 +555,10 @@ pub const StreamScanner = struct {
             // appendSlice copies chunk bytes into carry; the chunk
             // itself is a heap-owned slice (allocated by the worker's
             // push() via dupe) and is no longer needed once carry has
-            // absorbed the bytes. Free it now.
+            // absorbed the bytes. Free it now. Cap line length at 1 MiB
+            // so a missing '\n' can't grow carry unbounded.
             defer allocator.free(chunk);
+            if (self.carry.items.len + chunk.len > 1024 * 1024) return error.OutOfMemory;
             try self.carry.appendSlice(allocator, chunk);
         }
     }

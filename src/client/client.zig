@@ -102,7 +102,15 @@ pub const Client = struct {
 
     /// Make a HTTP call. Always buffers the entire response.
     /// Caller owns the returned `Response` and MUST call `.deinit()`.
+    /// Memory bounds (from `Options`): URL capped at `max_url_bytes`,
+    /// single header line at 8 KiB, total headers at `max_headers` /
+    /// `max_header_bytes`, body at `max_body_bytes`. Exceeding a cap
+    /// aborts with `Error.OutOfMemory` (write/header callback returns 0).
     pub fn perform(self: *Client, req: Request, options: Options) Error!Response {
+        if (req.url.len > options.max_url_bytes) return Error.OutOfMemory;
+        for (req.headers) |h| {
+            if (h.name.len + 2 + h.value.len > 8 * 1024) return Error.OutOfMemory;
+        }
         const handle = curl.easy_init() orelse return Error.InitFailed;
         // Every code path that exits must call easy_cleanup. The `defer`
         // runs on both the success path (right before returning) and the
@@ -211,20 +219,28 @@ pub const Client = struct {
         _ = setoptLong(handle, curl.OPT.SSL_VERIFYHOST, if (options.verify_ssl) @as(c_long, 2) else @as(c_long, 0));
 
         // ----- Write callback: buffers response body into an ArrayList.
+        // Bounded by Options.max_body_bytes (default 10 MiB) so a
+        // malicious/large body can't OOM the caller. Use openStream
+        // for large downloads.
         const BodyCtx = struct {
             list: *std.ArrayList(u8),
             allocator: std.mem.Allocator,
+            max_bytes: ?usize,
         };
         var body_list: std.ArrayList(u8) = .empty;
         errdefer body_list.deinit(self.allocator);
-        var body_ctx = BodyCtx{ .list = &body_list, .allocator = self.allocator };
+        var body_ctx = BodyCtx{ .list = &body_list, .allocator = self.allocator, .max_bytes = options.max_body_bytes };
         _ = curl.easy_setopt_raw(handle, curl.OPT.WRITEFUNCTION, @as(curl.WriteCallback, @ptrCast(&writeCallback)));
         _ = curl.easy_setopt_raw(handle, curl.OPT.WRITEDATA, @as(*anyopaque, @ptrCast(&body_ctx)));
 
         // ----- Header callback: parses "Name: Value\r\n" into the headers list.
+        // Bounded by Options.max_headers / max_header_bytes.
         const HeaderCtx = struct {
             list: *std.ArrayList(Header),
             allocator: std.mem.Allocator,
+            max_headers: usize,
+            max_bytes: usize,
+            total_bytes: usize = 0,
         };
         var header_list: std.ArrayList(Header) = .empty;
         // Cleanup on any error path. The errdefer reverses partial state.
@@ -235,7 +251,7 @@ pub const Client = struct {
             }
             header_list.deinit(self.allocator);
         }
-        var header_ctx = HeaderCtx{ .list = &header_list, .allocator = self.allocator };
+        var header_ctx = HeaderCtx{ .list = &header_list, .allocator = self.allocator, .max_headers = options.max_headers, .max_bytes = options.max_header_bytes };
         _ = curl.easy_setopt_raw(handle, curl.OPT.HEADERFUNCTION, @as(curl.HeaderCallback, @ptrCast(&headerCallback)));
         _ = curl.easy_setopt_raw(handle, curl.OPT.HEADERDATA, @as(*anyopaque, @ptrCast(&header_ctx)));
 
@@ -294,8 +310,13 @@ fn writeCallback(buf: [*]const u8, size: u64, nmemb: u64, userdata: *anyopaque) 
     const BodyCtx = struct {
         list: *std.ArrayList(u8),
         allocator: std.mem.Allocator,
+        max_bytes: ?usize,
     };
     const ctx: *BodyCtx = @ptrCast(@alignCast(userdata));
+    const n: usize = @intCast(size * nmemb);
+    if (ctx.max_bytes) |cap| {
+        if (ctx.list.items.len + n > cap) return 0;
+    }
     const slice = buf[0 .. size * nmemb];
     ctx.list.appendSlice(ctx.allocator, slice) catch return 0;
     return size * nmemb;
@@ -308,8 +329,12 @@ fn headerCallback(buf: [*]const u8, size: u64, nmemb: u64, userdata: *anyopaque)
     const HeaderCtx = struct {
         list: *std.ArrayList(struct { name: []const u8, value: []const u8 }),
         allocator: std.mem.Allocator,
+        max_headers: usize,
+        max_bytes: usize,
+        total_bytes: usize = 0,
     };
     const ctx: *HeaderCtx = @ptrCast(@alignCast(userdata));
+    if (ctx.list.items.len >= ctx.max_headers) return 0;
     const slice = buf[0 .. size * nmemb];
 
     // Skip status line and blank separator.
@@ -329,10 +354,15 @@ fn headerCallback(buf: [*]const u8, size: u64, nmemb: u64, userdata: *anyopaque)
 
     // Find the ": " separator.
     const sep = std.mem.indexOf(u8, trimmed, ": ") orelse return size * nmemb;
+    // Enforce total header-bytes cap before duping (prevents header-bomb OOM).
+    const entry_bytes = sep + (trimmed.len - sep - 2);
+    if (ctx.total_bytes + entry_bytes > ctx.max_bytes) return 0;
+    if (trimmed.len > 8 * 1024) return 0;
     const name_owned = ctx.allocator.dupe(u8, trimmed[0..sep]) catch return 0;
     errdefer ctx.allocator.free(name_owned);
     const value_owned = ctx.allocator.dupe(u8, trimmed[sep + 2 ..]) catch return 0;
     errdefer ctx.allocator.free(value_owned);
+    ctx.total_bytes += entry_bytes;
 
     ctx.list.append(ctx.allocator, .{ .name = name_owned, .value = value_owned }) catch {
         // Allocation failed — return 0 to abort. Libcurl will report

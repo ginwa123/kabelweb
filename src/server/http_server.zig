@@ -565,12 +565,29 @@ pub const GinwaServer = struct {
         while (self.is_running) {
             const client_fd = self.acceptClient() catch break;
 
+            // Blocks the accept loop (not already-served connections) once
+            // `max_concurrent_connections` are in flight. This is the
+            // backpressure point — excess connections queue in the kernel
+            // accept backlog instead of spawning unbounded threads.
+
             const arena = self.allocator.create(std.heap.ArenaAllocator) catch {
                 _ = closeFd(client_fd);
                 continue;
             };
             arena.* = std.heap.ArenaAllocator.init(self.allocator);
 
+            // Thread-per-connection task via `Group.concurrent` — NOT
+            // `Group.async`. Under `Io.Threaded`, `.async` carries no
+            // concurrency guarantee and may run the handler inline on the
+            // calling thread — which is the accept loop itself. That blocks
+            // the loop from returning to acceptClient() until the current
+            // connection's keep-alive loop finishes, which is what produced
+            // a stall when this was tried (verified live: /health never
+            // answered). `.concurrent` is the only primitive that
+            // guarantees dedicated execution, which is why the accept loop
+            // needs it despite the thread-growth cost — the semaphore above
+            // is what actually bounds that cost, not the choice of `.async`
+            // vs `.concurrent` itself.
             group.concurrent(
                 self.io,
                 struct {
@@ -663,23 +680,28 @@ pub const GinwaServer = struct {
                         }
 
                         // ─── HTTP/1.1 keep-alive loop ───────────────────
-                        // One TCP connection serves many sequential requests
-                        // (wrk/browsers reuse connections). Without this loop
-                        // every request paid a TCP handshake + a slot in the
-                        // accept queue — the ~13k rps ceiling seen in the
-                        // sparringhttp benchmark. HTTP/1.1 persists by
-                        // default; HTTP/1.0 closes unless the client sends
-                        // `Connection: keep-alive`. The SSE/WS arms hijack
-                        // the fd and `return` out of the loop (manager owns
-                        // it). Per-iteration arena storage is reaped by
-                        // resetting the connection arena at the top of
-                        // iterations 2+ (retain_capacity keeps hot buffers
-                        // alive); per-request `defer`s still run on
-                        // `continue`/`break` (they scope to the loop body).
                         var keep_alive_count: u32 = 0;
+                        var recent_peak: usize = 0;
+                        var samples: u32 = 0;
                         keep_alive_loop: while (true) {
                             if (keep_alive_count > 0) {
-                                _ = arena_allocator.reset(.retain_capacity);
+                                const cap = arena_allocator.queryCapacity();
+
+                                // Update running peak
+                                if (cap > recent_peak) recent_peak = cap;
+                                samples += 1;
+
+                                // Free when current capacity is much larger than what we normally need,
+                                // or every N requests as a safety net
+                                const should_free = (recent_peak > 0 and cap > recent_peak * 2) or (samples % 64 == 0);
+
+                                _ = arena_allocator.reset(if (should_free) .free_all else .retain_capacity);
+
+                                // Slowly forget the peak so it adapts downward
+                                if (should_free) {
+                                    recent_peak = cap / 2; // or set to 0
+                                    samples = 0;
+                                }
                             }
                             keep_alive_count += 1;
 
@@ -699,454 +721,450 @@ pub const GinwaServer = struct {
                                 _ = cr.takeBuffered() catch {};
                             }
 
-                        const request_data = rb.readFullRequestStream(stream) catch |err| {
-                            // Normal keep-alive teardown (client closed an
-                            // idle persistent connection) is silent; anything
-                            // else is logged. Either way the loop exits and
-                            // the fd is closed once, below.
-                            if (err != error.ConnectionClosed) {
-                                std.debug.print("HTTP_SERVER: readFullRequest failed: {s}\n", .{@errorName(err)});
-                            }
-                            break :keep_alive_loop;
-                        };
-                        defer allocator.free(request_data);
-
-                        var req = http_parser.parseRequest(request_data, allocator, server.io, fd) catch |err| {
-                            std.debug.print("HTTP_SERVER: parseRequest failed: {s}\n", .{@errorName(err)});
-                            _ = closeFd(fd);
-                            return;
-                        };
-                        defer req.headers.deinit();
-
-                        const http_ctx = http_parser.HttpContext{
-                            .allocator = allocator,
-                            .io = server.io,
-                            // Handlers read the server's CORS allowlist from
-                            // here — no hardcoded hosts in handler code.
-                            .allowed_origins = server.cors.allowed_origins,
-                        };
-                        // Build the Session right after parsing. `incoming`
-                        // is populated from the Cookie header via
-                        // `contextFromRequest` so handlers can `session.getString`
-                        // without knowing about cookies, ContextStore, or
-                        // contextFromRequest. When the server has no
-                        // `context_store` wired, Session.context_store is
-                        // `null` and `session.set` returns
-                        // `error.NoContextStore` (handlers that need set
-                        // don't register against a no-store server).
-                        const lookup: context.LookupResult = if (server.context_store) |store|
-                            context.contextFromRequest(req, store)
-                        else
-                            .{ .context = null, .id = null };
-                        var session = http_parser.Session.init(
-                            server.context_store,
-                            lookup.context,
-                            lookup.id,
-                        );
-                        defer session.deinit();
-                        // Wire the session into the request so handlers can
-                        // call `req.session.set / getString` directly. The
-                        // pointer outlives the listen loop's handle scope.
-                        req.session = &session;
-
-                        // ─── Engine auto-gate (zero-config) ─────────────
-                        // Two engine-owned protections, both before route
-                        // matching:
-                        //   1. Body-size cap (ALWAYS on; effective cap =
-                        //      route/group override or server.max_body_bytes)
-                        //   2. Origin allowlist (when server.cors.enabled)
-                        // Failure → built-in 403/413 explanation page +
-                        // console log so the developer sees the issue.
-                        {
-                            const gate = security.preGateCheck(&req, server.cors, server.max_body_bytes) catch .pass;
-                            if (gate != .pass) {
-                                const origin = blk: {
-                                    var oit = req.headers.iterator();
-                                    while (oit.next()) |entry| {
-                                        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "origin")) {
-                                            break :blk entry.value_ptr.*;
-                                        }
-                                    }
-                                    break :blk null;
-                                };
-                                std.debug.print(
-                                    "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) origin={s} — add it to server.cors.allowed_origins\n",
-                                    .{ req.method, req.path, @tagName(gate), origin orelse "-" },
-                                );
-                                const host = if (server.cors.allowed_origins.len > 0) server.cors.allowed_origins[0] else "your-domain";
-                                var block_page = security.buildEngineBlockPage(allocator, gate, origin, host) catch {
-                                    _ = closeFd(fd);
-                                    return;
-                                };
-                                defer block_page.headers.deinit();
-                                server.applySecurityHeadersTo(&block_page);
-                                if (origin) |o| {
-                                    security.applyCORSHeaders(
-                                        &block_page.headers,
-                                        o,
-                                        server.cors.allowed_origins,
-                                        server.cors.allowed_methods,
-                                        server.cors.allowed_headers,
-                                        server.cors.allow_credentials,
-                                    ) catch {};
+                            const request_data = rb.readFullRequestStream(stream) catch |err| {
+                                // Normal keep-alive teardown (client closed an
+                                // idle persistent connection) is silent; anything
+                                // else is logged. Either way the loop exits and
+                                // the fd is closed once, below.
+                                if (err != error.ConnectionClosed) {
+                                    std.debug.print("HTTP_SERVER: readFullRequest failed: {s}\n", .{@errorName(err)});
                                 }
-                                const page_bytes = block_page.toBytes() catch {
-                                    _ = closeFd(fd);
-                                    return;
-                                };
-                                defer allocator.free(page_bytes);
-                                _ = server.sendToStream(stream, page_bytes) catch {};
-                                _ = closeFd(fd);
-                                return;
-                            }
-                        }
+                                break :keep_alive_loop;
+                            };
+                            defer allocator.free(request_data);
 
-                        // CORS preflight: when CORS is enabled and the
-                        // request is OPTIONS, reply with the configured
-                        // `Access-Control-*` headers and short-circuit
-                        // before the router sees the request. Preflight
-                        // is browser-driven and doesn't carry a route
-                        // match, so handling it globally keeps route
-                        // registration simple.
-                        if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
-                            const preflight = server.buildCORSPreflight(&req, allocator) catch |err| {
-                                std.debug.print("HTTP_SERVER: buildCORSPreflight failed: {s}\n", .{@errorName(err)});
+                            var req = http_parser.parseRequest(request_data, allocator, server.io, fd) catch |err| {
+                                std.debug.print("HTTP_SERVER: parseRequest failed: {s}\n", .{@errorName(err)});
                                 _ = closeFd(fd);
                                 return;
                             };
-                            const preflight_bytes = preflight.toBytes() catch {
-                                std.debug.print("HTTP_SERVER: preflight toBytes failed\n", .{});
-                                _ = closeFd(fd);
-                                return;
-                            };
-                            defer preflight.allocator.free(preflight_bytes);
-                            _ = server.sendToStream(stream, preflight_bytes) catch {
-                                std.debug.print("HTTP_SERVER: preflight send failed\n", .{});
-                            };
-                            return;
-                        }
+                            defer req.headers.deinit();
 
-                        if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
-                            // SSE streams chunked frames and WebSocket hijacks the
-                            // fd: neither can run on an encrypted connection until
-                            // the streaming work lands (see docs/http2-tls.md and
-                            // plan D2 — a browser negotiates h2 for the WHOLE
-                            // origin, so this is exactly the case that must be
-                            // finished before the UI is served over https).
-                            if (stream.isTls() and (result == .sse or result == .websocket)) {
-                                var res = http_parser.HttpResponse
-                                    .init(501, "Not Implemented", allocator)
-                                    .withBody("SSE and WebSocket are not available over TLS yet; use the plaintext listener");
-                                server.applyCORSResponse(&req, &res) catch {};
-                                server.applySecurityHeadersTo(&res);
-                                if (res.toBytes()) |bytes| {
-                                    _ = server.sendToStream(stream, bytes) catch {};
-                                } else |_| {}
-                                _ = closeFd(fd);
-                                return;
-                            }
-                            switch (result) {
-                                .handler => |h| {
-                                    // ─── Route-level body cap (override) ───
-                                    // When the matched route (or its group)
-                                    // declared a body cap, re-check with THAT
-                                    // limit — it may be tighter OR looser than
-                                    // the server default. `0` = no override.
-                                    if (h.max_body_bytes != 0 and h.max_body_bytes != server.max_body_bytes) {
-                                        const route_gate = security.preGateCheck(&h.req, .{ .enabled = false }, h.max_body_bytes) catch .pass;
-                                        if (route_gate != .pass) {
-                                            std.debug.print(
-                                                "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) — route body cap {d} bytes\n",
-                                                .{ h.req.method, h.req.path, @tagName(route_gate), h.max_body_bytes },
-                                            );
-                                            var page = security.buildEngineBlockPage(allocator, route_gate, null, "this route") catch {
-                                                _ = closeFd(fd);
-                                                return;
-                                            };
-                                            defer page.headers.deinit();
-                                            server.applySecurityHeadersTo(&page);
-                                            const page_bytes = page.toBytes() catch {
-                                                _ = closeFd(fd);
-                                                return;
-                                            };
-                                            defer allocator.free(page_bytes);
-                                            _ = server.sendToStream(stream, page_bytes) catch {};
-                                            _ = closeFd(fd);
-                                            return;
+                            const http_ctx = http_parser.HttpContext{
+                                .allocator = allocator,
+                                .io = server.io,
+                                // Handlers read the server's CORS allowlist from
+                                // here — no hardcoded hosts in handler code.
+                                .allowed_origins = server.cors.allowed_origins,
+                            };
+                            // Build the Session right after parsing. `incoming`
+                            // is populated from the Cookie header via
+                            // `contextFromRequest` so handlers can `session.getString`
+                            // without knowing about cookies, ContextStore, or
+                            // contextFromRequest. When the server has no
+                            // `context_store` wired, Session.context_store is
+                            // `null` and `session.set` returns
+                            // `error.NoContextStore` (handlers that need set
+                            // don't register against a no-store server).
+                            const lookup: context.LookupResult = if (server.context_store) |store|
+                                context.contextFromRequest(req, store)
+                            else
+                                .{ .context = null, .id = null };
+                            var session = http_parser.Session.init(
+                                server.context_store,
+                                lookup.context,
+                                lookup.id,
+                            );
+                            defer session.deinit();
+                            // Wire the session into the request so handlers can
+                            // call `req.session.set / getString` directly. The
+                            // pointer outlives the listen loop's handle scope.
+                            req.session = &session;
+
+                            // ─── Engine auto-gate (zero-config) ─────────────
+                            // Two engine-owned protections, both before route
+                            // matching:
+                            //   1. Body-size cap (ALWAYS on; effective cap =
+                            //      route/group override or server.max_body_bytes)
+                            //   2. Origin allowlist (when server.cors.enabled)
+                            // Failure → built-in 403/413 explanation page +
+                            // console log so the developer sees the issue.
+                            {
+                                const gate = security.preGateCheck(&req, server.cors, server.max_body_bytes) catch .pass;
+                                if (gate != .pass) {
+                                    const origin = blk: {
+                                        var oit = req.headers.iterator();
+                                        while (oit.next()) |entry| {
+                                            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "origin")) {
+                                                break :blk entry.value_ptr.*;
+                                            }
                                         }
-                                    }
-
-                                    // ─── Framework pre-handler security gate ───
-                                    // When the route opted in via
-                                    // `on_pre_handler_fail`, run origin +
-                                    // body-size checks from server.cors BEFORE
-                                    // any middleware/handler. On failure return
-                                    // 302 → <fail_base><code> and never invoke
-                                    // the handler. This is THE enforcement
-                                    // point — handlers must not re-check.
-                                    if (h.chain.on_pre_handler_fail) |fail_base| {
-                                        const maybe_fail: ?security.HttpResponse = security.buildPreHandlerFailRedirect(
-                                            allocator,
-                                            &h.req,
-                                            server.cors,
-                                            if (h.max_body_bytes != 0) h.max_body_bytes else security.MAX_BODY_BYTES,
-                                            fail_base,
-                                        ) catch |err| blk: {
-                                            std.debug.print("pre-handler gate failed: {s}\n", .{@errorName(err)});
-                                            break :blk null;
-                                        };
-                                        if (maybe_fail) |fail_resp| {
-                                            var gated = fail_resp;
-                                            server.applyCORSResponse(&h.req, &gated) catch @panic("OOM");
-                                            server.applySecurityHeadersTo(&gated);
-                                            const fail_bytes = gated.toBytes() catch {
-                                                std.debug.print("Failed to build pre-handler fail response\n", .{});
-                                                _ = closeFd(fd);
-                                                return;
-                                            };
-                                            defer gated.allocator.free(fail_bytes);
-                                            _ = server.sendToStream(stream, fail_bytes) catch {
-                                                std.debug.print("Failed to send pre-handler fail response\n", .{});
-                                            };
-                                            _ = closeFd(fd);
-                                            return;
-                                        }
-                                    }
-
-                                    // Run the per-request middleware chain. When the
-                                    // route has no middleware the chain dispatches
-                                    // straight to the final handler — same behavior
-                                    // as before groups/middleware were added. When
-                                    // middlewares exist they run in registration
-                                    // order (outermost group first, innermost last);
-                                    // a middleware that returns without calling
-                                    // `chain.next(...)` short-circuits the chain.
-                                    var final_res = h.chain.run(h.ctx, h.req, h.res) catch http_parser.internalError("Handler error", allocator);
-
-                                    // CORS response headers — only when CORS is
-                                    // enabled and the request carried an Origin
-                                    // that matches `cors.allowed_origins`.
-                                    server.applyCORSResponse(&h.req, &final_res) catch @panic("OOM");
-
-                                    // Server-level security headers (CSP etc.)
-                                    // — the app's config wins over any handler
-                                    // default so policy lives in ONE place.
-                                    server.applySecurityHeadersTo(&final_res);
-
-                                    // Frame the keep-alive decision BEFORE
-                                    // serialising: `toBytes()` stamps
-                                    // `Connection: keep-alive` vs `close`
-                                    // from this flag. Reuse requires an
-                                    // explicit or default keep-alive from the
-                                    // client AND a framed response
-                                    // (Content-Length) so the client can
-                                    // delimit the next message; otherwise the
-                                    // connection must close. Capped at 1000
-                                    // requests per connection (matches the
-                                    // `Keep-Alive: max=1000` hint).
-                                    final_res.keep_alive = server.clientWantsKeepAlive(&h.req) and
-                                        final_res.headers.contains("Content-Length") and
-                                        keep_alive_count < 1000;
-
-                                    const res_bytes = final_res.toBytes() catch {
-                                        std.debug.print("Failed to build response\n", .{});
+                                        break :blk null;
+                                    };
+                                    std.debug.print(
+                                        "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) origin={s} — add it to server.cors.allowed_origins\n",
+                                        .{ req.method, req.path, @tagName(gate), origin orelse "-" },
+                                    );
+                                    const host = if (server.cors.allowed_origins.len > 0) server.cors.allowed_origins[0] else "your-domain";
+                                    var block_page = security.buildEngineBlockPage(allocator, gate, origin, host) catch {
                                         _ = closeFd(fd);
                                         return;
                                     };
-                                    defer final_res.allocator.free(res_bytes);
-                                    _ = server.sendToStream(stream, res_bytes) catch {
-                                        std.debug.print("Failed to send response\n", .{});
-                                        break :keep_alive_loop;
-                                    };
-                                    if (final_res.keep_alive) {
-                                        continue :keep_alive_loop;
-                                    } else {
-                                        break :keep_alive_loop;
+                                    defer block_page.headers.deinit();
+                                    server.applySecurityHeadersTo(&block_page);
+                                    if (origin) |o| {
+                                        security.applyCORSHeaders(
+                                            &block_page.headers,
+                                            o,
+                                            server.cors.allowed_origins,
+                                            server.cors.allowed_methods,
+                                            server.cors.allowed_headers,
+                                            server.cors.allow_credentials,
+                                        ) catch {};
                                     }
-                                },
-                                .websocket => |ws| {
-                                    // WebSocket upgrade path. We must:
-                                    //   1. Validate the request is a valid upgrade (RFC 6455 §4.1).
-                                    //   2. Send the 101 response with the computed Accept.
-                                    //   3. Register the client with the WsManager (so broadcasts
-                                    //      and targeted sends work).
-                                    //   4. Run the handler in the current per-connection worker.
-                                    //   5. Send a close frame and remove from registry on return.
-                                    if (!ws_handshake.isWebSocketRequest(&req)) {
-                                        const bad = http_parser.badRequest("WebSocket upgrade required", allocator);
-                                        const bytes = bad.toBytes() catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        defer bad.allocator.free(bytes);
+                                    const page_bytes = block_page.toBytes() catch {
+                                        _ = closeFd(fd);
+                                        return;
+                                    };
+                                    defer allocator.free(page_bytes);
+                                    _ = server.sendToStream(stream, page_bytes) catch {};
+                                    _ = closeFd(fd);
+                                    return;
+                                }
+                            }
+
+                            // CORS preflight: when CORS is enabled and the
+                            // request is OPTIONS, reply with the configured
+                            // `Access-Control-*` headers and short-circuit
+                            // before the router sees the request. Preflight
+                            // is browser-driven and doesn't carry a route
+                            // match, so handling it globally keeps route
+                            // registration simple.
+                            if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
+                                const preflight = server.buildCORSPreflight(&req, allocator) catch |err| {
+                                    std.debug.print("HTTP_SERVER: buildCORSPreflight failed: {s}\n", .{@errorName(err)});
+                                    _ = closeFd(fd);
+                                    return;
+                                };
+                                const preflight_bytes = preflight.toBytes() catch {
+                                    std.debug.print("HTTP_SERVER: preflight toBytes failed\n", .{});
+                                    _ = closeFd(fd);
+                                    return;
+                                };
+                                defer preflight.allocator.free(preflight_bytes);
+                                _ = server.sendToStream(stream, preflight_bytes) catch {
+                                    std.debug.print("HTTP_SERVER: preflight send failed\n", .{});
+                                };
+                                return;
+                            }
+
+                            if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
+                                // SSE streams chunked frames and WebSocket hijacks the
+                                // fd: neither can run on an encrypted connection until
+                                // the streaming work lands (see docs/http2-tls.md and
+                                // plan D2 — a browser negotiates h2 for the WHOLE
+                                // origin, so this is exactly the case that must be
+                                // finished before the UI is served over https).
+                                if (stream.isTls() and (result == .sse or result == .websocket)) {
+                                    var res = http_parser.HttpResponse
+                                        .init(501, "Not Implemented", allocator)
+                                        .withBody("SSE and WebSocket are not available over TLS yet; use the plaintext listener");
+                                    server.applyCORSResponse(&req, &res) catch {};
+                                    server.applySecurityHeadersTo(&res);
+                                    if (res.toBytes()) |bytes| {
                                         _ = server.sendToStream(stream, bytes) catch {};
-                                        _ = closeFd(fd);
-                                        return;
-                                    }
-
-                                    const key = ws_handshake.extractWebSocketKey(&req) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    const accept_resp = ws_handshake.buildAcceptResponse(allocator, key) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    defer allocator.free(accept_resp);
-
-                                    _ = server.sendToStream(stream, accept_resp) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-
-                                    // Register the client with the WsManager. The write callback bridges
-                                    // the manager's `fn(ctx, fd, data)` API to the server's
-                                    // `sendToClient` method via the ctx pointer.
-                                    const WriteAdapter = struct {
-                                        fn w(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {
-                                            const server_ptr: *GinwaServer = @ptrCast(@alignCast(ctx.?));
-                                            return server_ptr.sendToClient(target_fd, data);
-                                        }
-                                    }.w;
-                                    var client_id = server.ws_manager.registerClient(fd, WriteAdapter, @ptrCast(server)) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-
-                                    // Run the user handler.
-                                    ws.handler(ws.ctx, ws.req, @ptrCast(server), fd, &client_id) catch |err| {
-                                        std.debug.print("WebSocket handler error: {s}\n", .{@errorName(err)});
-                                    };
-
-                                    // Send a close frame and remove from registry. The client
-                                    // arena is freed by removeClient.
-                                    const close_payload = "\x03\xe8"; // status 1000 normal closure
-                                    const close_frame = ws_frames.encodeFrame(allocator, .{
-                                        .opcode = .close,
-                                        .payload = close_payload,
-                                    }) catch null;
-                                    if (close_frame) |cf| {
-                                        defer allocator.free(cf);
-                                        _ = server.sendToStream(stream, cf) catch {};
-                                    }
-                                    server.ws_manager.removeClient(&client_id, .explicit);
-                                    return;
-                                },
-                                .sse => |sse| {
-                                    const headers = "HTTP/1.1 200 OK\r\n" ++
-                                        "Content-Type: text/event-stream\r\n" ++
-                                        "Cache-Control: no-cache\r\n" ++
-                                        // Connection: close (NOT keep-alive). SSE is a single-use,
-                                        // long-lived stream — the connection is never reused for a
-                                        // follow-up request, so advertising keep-alive confuses
-                                        // intermediaries. Vite (Node.js) in dev mode stamps
-                                        // `Keep-Alive: timeout=5` on keep-alive responses, and some
-                                        // browser/webview engines (Chromium, WebKitGTK, WKWebView)
-                                        // enforce that timeout aggressively — closing the upstream
-                                        // socket ~5s after the last heartbeat. Empirically this
-                                        // matches the user's reported pattern of heartbeats
-                                        // stopping after ~30s in the browser DevTools. Telling
-                                        // intermediaries this connection will close on EOF keeps
-                                        // the stream open for as long as the backend keeps
-                                        // sending chunked frames.
-                                        "Connection: close\r\n" ++
-                                        // Required by HTTP/1.1: a response with neither Content-Length
-                                        // nor Transfer-Encoding is implicitly framed by connection-close.
-                                        // For SSE we never close the connection voluntarily, so we MUST
-                                        // declare chunked encoding. Otherwise Vite / proxies / browsers
-                                        // will misinterpret the response and surface
-                                        // ERR_INCOMPLETE_CHUNKED_ENCODING on disconnect.
-                                        "Transfer-Encoding: chunked\r\n" ++
-                                        // Tell intermediaries (Vite, nginx, Cloudflare, ALB) not to
-                                        // buffer. X-Accel-Buffering is the de-facto convention.
-                                        "X-Accel-Buffering: no\r\n" ++
-                                        "Access-Control-Allow-Origin: *\r\n" ++
-                                        "\r\n";
-                                    _ = server.sendToStream(stream, headers) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    const client_id = server.sse_manager.registerClient(fd) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    var sse_ctx = sse.ctx;
-                                    sse_ctx.client_id = client_id;
-                                    const res = http_parser.HttpResponse.init(200, "OK", allocator);
-                                    _ = sse.handler(sse_ctx, sse.req, res) catch |err| {
-                                        if (err != error.WouldBlock) {
-                                            std.debug.print("SSE handler error: {s}\n", .{@errorName(err)});
-                                        }
-                                    };
-                                    return;
-                                },
-                            }
-                        } else {
-                            // No API route matched. If a static-dir fallback
-                            // handler is configured, hand the request off to
-                            // it. The handler is responsible for writing a
-                            // complete HTTP response directly to `fd` (it
-                            // owns the wire format from status line through
-                            // body) and for sending it. We only fall through
-                            // to the generic 404 if the handler is absent,
-                            // missing its cfg, or reports an error.
-                            var static_served = false;
-                            if (server.static_dir_handler) |handler| {
-                                if (server.static_dir_cfg) |cfg| {
-                                    // HTTP header names are case-insensitive
-                                    // per RFC 9110 §5.1, but the gserverz
-                                    // preserves the case the client sent.
-                                    // Walk the headers map and match
-                                    // case-insensitively so the static-file
-                                    // handler gets a `Range:` value
-                                    // regardless of whether the client sent
-                                    // "Range", "range", or "RANGE".
-                                    var range_hdr: ?[]const u8 = null;
-                                    var h_it = req.headers.iterator();
-                                    while (h_it.next()) |entry| {
-                                        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "range")) {
-                                            range_hdr = entry.value_ptr.*;
-                                            break;
-                                        }
-                                    }
-                                    handler(cfg, allocator, server.io, req.path, range_hdr, stream) catch {
-                                        static_served = false;
-                                    };
-                                    // If the handler returned without error,
-                                    // trust it to have sent a response
-                                    // (matching the SSE branch's contract).
-                                    static_served = true;
-                                }
-                            }
-                            if (!static_served) {
-                                var not_found = http_parser.notFound(allocator);
-                                // Attach CORS headers to the 404 so cross-origin
-                                // callers see the rejection (with CORS headers
-                                // echoed) instead of an opaque browser-blocked
-                                // response.
-                                server.applyCORSResponse(&req, &not_found) catch @panic("OOM");
-                                // Same keep-alive framing rule as the routed
-                                // path (see above): reuse only when the client
-                                // asked (or defaulted) and the 404 is framed.
-                                not_found.keep_alive = server.clientWantsKeepAlive(&req) and
-                                    not_found.headers.contains("Content-Length") and
-                                    keep_alive_count < 1000;
-                                const res_bytes = not_found.toBytes() catch {
+                                    } else |_| {}
                                     _ = closeFd(fd);
                                     return;
-                                };
-                                defer not_found.allocator.free(res_bytes);
-                                if (server.sendToStream(stream, res_bytes)) |_| {
-                                    if (not_found.keep_alive) {
-                                        continue :keep_alive_loop;
+                                }
+                                switch (result) {
+                                    .handler => |h| {
+                                        // ─── Route-level body cap (override) ───
+                                        // When the matched route (or its group)
+                                        // declared a body cap, re-check with THAT
+                                        // limit — it may be tighter OR looser than
+                                        // the server default. `0` = no override.
+                                        if (h.max_body_bytes != 0 and h.max_body_bytes != server.max_body_bytes) {
+                                            const route_gate = security.preGateCheck(&h.req, .{ .enabled = false }, h.max_body_bytes) catch .pass;
+                                            if (route_gate != .pass) {
+                                                std.debug.print(
+                                                    "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) — route body cap {d} bytes\n",
+                                                    .{ h.req.method, h.req.path, @tagName(route_gate), h.max_body_bytes },
+                                                );
+                                                var page = security.buildEngineBlockPage(allocator, route_gate, null, "this route") catch {
+                                                    _ = closeFd(fd);
+                                                    return;
+                                                };
+                                                defer page.headers.deinit();
+                                                server.applySecurityHeadersTo(&page);
+                                                const page_bytes = page.toBytes() catch {
+                                                    _ = closeFd(fd);
+                                                    return;
+                                                };
+                                                defer allocator.free(page_bytes);
+                                                _ = server.sendToStream(stream, page_bytes) catch {};
+                                                _ = closeFd(fd);
+                                                return;
+                                            }
+                                        }
+
+                                        // ─── Framework pre-handler security gate ───
+                                        // When the route opted in via
+                                        // `on_pre_handler_fail`, run origin +
+                                        // body-size checks from server.cors BEFORE
+                                        // any middleware/handler. On failure return
+                                        // 302 → <fail_base><code> and never invoke
+                                        // the handler. This is THE enforcement
+                                        // point — handlers must not re-check.
+                                        if (h.chain.on_pre_handler_fail) |fail_base| {
+                                            const maybe_fail: ?security.HttpResponse = security.buildPreHandlerFailRedirect(
+                                                allocator,
+                                                &h.req,
+                                                server.cors,
+                                                if (h.max_body_bytes != 0) h.max_body_bytes else security.MAX_BODY_BYTES,
+                                                fail_base,
+                                            ) catch |err| blk: {
+                                                std.debug.print("pre-handler gate failed: {s}\n", .{@errorName(err)});
+                                                break :blk null;
+                                            };
+                                            if (maybe_fail) |fail_resp| {
+                                                var gated = fail_resp;
+                                                server.applyCORSResponse(&h.req, &gated) catch @panic("OOM");
+                                                server.applySecurityHeadersTo(&gated);
+                                                const fail_bytes = gated.toBytes() catch {
+                                                    std.debug.print("Failed to build pre-handler fail response\n", .{});
+                                                    _ = closeFd(fd);
+                                                    return;
+                                                };
+                                                defer gated.allocator.free(fail_bytes);
+                                                _ = server.sendToStream(stream, fail_bytes) catch {
+                                                    std.debug.print("Failed to send pre-handler fail response\n", .{});
+                                                };
+                                                _ = closeFd(fd);
+                                                return;
+                                            }
+                                        }
+
+                                        // Run the per-request middleware chain. When the
+                                        // route has no middleware the chain dispatches
+                                        // straight to the final handler — same behavior
+                                        // as before groups/middleware were added. When
+                                        // middlewares exist they run in registration
+                                        // order (outermost group first, innermost last);
+                                        // a middleware that returns without calling
+                                        // `chain.next(...)` short-circuits the chain.
+                                        var final_res = h.chain.run(h.ctx, h.req, h.res) catch http_parser.internalError("Handler error", allocator);
+
+                                        // CORS response headers — only when CORS is
+                                        // enabled and the request carried an Origin
+                                        // that matches `cors.allowed_origins`.
+                                        server.applyCORSResponse(&h.req, &final_res) catch @panic("OOM");
+
+                                        // Server-level security headers (CSP etc.)
+                                        // — the app's config wins over any handler
+                                        // default so policy lives in ONE place.
+                                        server.applySecurityHeadersTo(&final_res);
+
+                                        // Frame the keep-alive decision BEFORE
+                                        // serialising: `toBytes()`/`writeTo()`
+                                        // stamp `Connection: keep-alive` vs
+                                        // `close` from this flag. Framing is
+                                        // guaranteed (auto Content-Length, or
+                                        // self-delimiting 1xx/204/304), so reuse
+                                        // needs only an explicit or default
+                                        // keep-alive from the client. Capped at
+                                        // 1000 requests per connection (matches
+                                        // the `Keep-Alive: max=1000` hint).
+                                        final_res.keep_alive = server.clientWantsKeepAlive(&h.req) and
+                                            keep_alive_count < 1000;
+
+                                        // Zero-alloc fast path for small responses
+                                        // (stack buffer); large ones fall back to
+                                        // the heap inside writeTo. Wire bytes are
+                                        // identical to toBytes.
+                                        final_res.writeTo(stream) catch {
+                                            std.debug.print("Failed to send response\n", .{});
+                                            break :keep_alive_loop;
+                                        };
+                                        if (final_res.keep_alive) {
+                                            continue :keep_alive_loop;
+                                        } else {
+                                            break :keep_alive_loop;
+                                        }
+                                    },
+                                    .websocket => |ws| {
+                                        // WebSocket upgrade path. We must:
+                                        //   1. Validate the request is a valid upgrade (RFC 6455 §4.1).
+                                        //   2. Send the 101 response with the computed Accept.
+                                        //   3. Register the client with the WsManager (so broadcasts
+                                        //      and targeted sends work).
+                                        //   4. Run the handler in the current per-connection worker.
+                                        //   5. Send a close frame and remove from registry on return.
+                                        if (!ws_handshake.isWebSocketRequest(&req)) {
+                                            const bad = http_parser.badRequest("WebSocket upgrade required", allocator);
+                                            const bytes = bad.toBytes() catch {
+                                                _ = closeFd(fd);
+                                                return;
+                                            };
+                                            defer bad.allocator.free(bytes);
+                                            _ = server.sendToStream(stream, bytes) catch {};
+                                            _ = closeFd(fd);
+                                            return;
+                                        }
+
+                                        const key = ws_handshake.extractWebSocketKey(&req) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+                                        const accept_resp = ws_handshake.buildAcceptResponse(allocator, key) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+                                        defer allocator.free(accept_resp);
+
+                                        _ = server.sendToStream(stream, accept_resp) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+
+                                        // Register the client with the WsManager. The write callback bridges
+                                        // the manager's `fn(ctx, fd, data)` API to the server's
+                                        // `sendToClient` method via the ctx pointer.
+                                        const WriteAdapter = struct {
+                                            fn w(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {
+                                                const server_ptr: *GinwaServer = @ptrCast(@alignCast(ctx.?));
+                                                return server_ptr.sendToClient(target_fd, data);
+                                            }
+                                        }.w;
+                                        var client_id = server.ws_manager.registerClient(fd, WriteAdapter, @ptrCast(server)) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+
+                                        // Run the user handler.
+                                        ws.handler(ws.ctx, ws.req, @ptrCast(server), fd, &client_id) catch |err| {
+                                            std.debug.print("WebSocket handler error: {s}\n", .{@errorName(err)});
+                                        };
+
+                                        // Send a close frame and remove from registry. The client
+                                        // arena is freed by removeClient.
+                                        const close_payload = "\x03\xe8"; // status 1000 normal closure
+                                        const close_frame = ws_frames.encodeFrame(allocator, .{
+                                            .opcode = .close,
+                                            .payload = close_payload,
+                                        }) catch null;
+                                        if (close_frame) |cf| {
+                                            defer allocator.free(cf);
+                                            _ = server.sendToStream(stream, cf) catch {};
+                                        }
+                                        server.ws_manager.removeClient(&client_id, .explicit);
+                                        return;
+                                    },
+                                    .sse => |sse| {
+                                        const headers = "HTTP/1.1 200 OK\r\n" ++
+                                            "Content-Type: text/event-stream\r\n" ++
+                                            "Cache-Control: no-cache\r\n" ++
+                                            // Connection: close (NOT keep-alive). SSE is a single-use,
+                                            // long-lived stream — the connection is never reused for a
+                                            // follow-up request, so advertising keep-alive confuses
+                                            // intermediaries. Vite (Node.js) in dev mode stamps
+                                            // `Keep-Alive: timeout=5` on keep-alive responses, and some
+                                            // browser/webview engines (Chromium, WebKitGTK, WKWebView)
+                                            // enforce that timeout aggressively — closing the upstream
+                                            // socket ~5s after the last heartbeat. Empirically this
+                                            // matches the user's reported pattern of heartbeats
+                                            // stopping after ~30s in the browser DevTools. Telling
+                                            // intermediaries this connection will close on EOF keeps
+                                            // the stream open for as long as the backend keeps
+                                            // sending chunked frames.
+                                            "Connection: close\r\n" ++
+                                            // Required by HTTP/1.1: a response with neither Content-Length
+                                            // nor Transfer-Encoding is implicitly framed by connection-close.
+                                            // For SSE we never close the connection voluntarily, so we MUST
+                                            // declare chunked encoding. Otherwise Vite / proxies / browsers
+                                            // will misinterpret the response and surface
+                                            // ERR_INCOMPLETE_CHUNKED_ENCODING on disconnect.
+                                            "Transfer-Encoding: chunked\r\n" ++
+                                            // Tell intermediaries (Vite, nginx, Cloudflare, ALB) not to
+                                            // buffer. X-Accel-Buffering is the de-facto convention.
+                                            "X-Accel-Buffering: no\r\n" ++
+                                            "Access-Control-Allow-Origin: *\r\n" ++
+                                            "\r\n";
+                                        _ = server.sendToStream(stream, headers) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+                                        const client_id = server.sse_manager.registerClient(fd) catch {
+                                            _ = closeFd(fd);
+                                            return;
+                                        };
+                                        var sse_ctx = sse.ctx;
+                                        sse_ctx.client_id = client_id;
+                                        const res = http_parser.HttpResponse.init(200, "OK", allocator);
+                                        _ = sse.handler(sse_ctx, sse.req, res) catch |err| {
+                                            if (err != error.WouldBlock) {
+                                                std.debug.print("SSE handler error: {s}\n", .{@errorName(err)});
+                                            }
+                                        };
+                                        return;
+                                    },
+                                }
+                            } else {
+                                // No API route matched. If a static-dir fallback
+                                // handler is configured, hand the request off to
+                                // it. The handler is responsible for writing a
+                                // complete HTTP response directly to `fd` (it
+                                // owns the wire format from status line through
+                                // body) and for sending it. We only fall through
+                                // to the generic 404 if the handler is absent,
+                                // missing its cfg, or reports an error.
+                                var static_served = false;
+                                if (server.static_dir_handler) |handler| {
+                                    if (server.static_dir_cfg) |cfg| {
+                                        // HTTP header names are case-insensitive
+                                        // per RFC 9110 §5.1, but the gserverz
+                                        // preserves the case the client sent.
+                                        // Walk the headers map and match
+                                        // case-insensitively so the static-file
+                                        // handler gets a `Range:` value
+                                        // regardless of whether the client sent
+                                        // "Range", "range", or "RANGE".
+                                        var range_hdr: ?[]const u8 = null;
+                                        var h_it = req.headers.iterator();
+                                        while (h_it.next()) |entry| {
+                                            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "range")) {
+                                                range_hdr = entry.value_ptr.*;
+                                                break;
+                                            }
+                                        }
+                                        handler(cfg, allocator, server.io, req.path, range_hdr, stream) catch {
+                                            static_served = false;
+                                        };
+                                        // If the handler returned without error,
+                                        // trust it to have sent a response
+                                        // (matching the SSE branch's contract).
+                                        static_served = true;
                                     }
-                                } else |_| {}
+                                }
+                                if (!static_served) {
+                                    var not_found = http_parser.notFound(allocator);
+                                    // Attach CORS headers to the 404 so cross-origin
+                                    // callers see the rejection (with CORS headers
+                                    // echoed) instead of an opaque browser-blocked
+                                    // response.
+                                    server.applyCORSResponse(&req, &not_found) catch @panic("OOM");
+                                    // Same keep-alive framing rule as the routed
+                                    // path (see above): framing is guaranteed by
+                                    // toBytes (auto Content-Length), so reuse
+                                    // needs only the client's keep-alive.
+                                    not_found.keep_alive = server.clientWantsKeepAlive(&req) and
+                                        keep_alive_count < 1000;
+                                    const res_bytes = not_found.toBytes() catch {
+                                        _ = closeFd(fd);
+                                        return;
+                                    };
+                                    defer not_found.allocator.free(res_bytes);
+                                    if (server.sendToStream(stream, res_bytes)) |_| {
+                                        if (not_found.keep_alive) {
+                                            continue :keep_alive_loop;
+                                        }
+                                    } else |_| {}
+                                    break :keep_alive_loop;
+                                }
+                                // Static-dir fallback wrote its own (unframed)
+                                // response — the connection cannot be reused.
                                 break :keep_alive_loop;
                             }
-                            // Static-dir fallback wrote its own (unframed)
-                            // response — the connection cannot be reused.
-                            break :keep_alive_loop;
-                        }
 
                             // Safety net: every arm above exits explicitly
                             // (continue / break / return). Reaching here
@@ -1169,7 +1187,6 @@ pub const GinwaServer = struct {
 
         try group.await(self.io);
     }
-
     pub fn getContentLength(data: []const u8) ?usize {
         const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
         const headers = data[0..header_end];
@@ -1201,6 +1218,8 @@ pub const GinwaServer = struct {
         return data.len >= body_start + content_length;
     }
 
+    /// Accept one client connection (raw `accept(2)`) and apply the
+    /// per-connection tuning (TCP keepalive, NODELAY).
     fn acceptClient(self: *GinwaServer) !SocketFd {
         const fd: SocketFd = blk: {
             if (builtin.os.tag == .windows) {
@@ -1467,8 +1486,8 @@ pub const RequestBuffer = struct {
         var actual_start = cl_start;
         while (actual_start < headers.len and
             (headers[actual_start] == ':' or
-            headers[actual_start] == ' ' or
-            headers[actual_start] == '\t'))
+                headers[actual_start] == ' ' or
+                headers[actual_start] == '\t'))
         {
             actual_start += 1;
         }
@@ -1493,6 +1512,18 @@ pub const RequestBuffer = struct {
         return self.readFullRequestStream(.{ .plain = fd });
     }
 
+    /// Hand over the buffered bytes WITHOUT copying: the caller takes
+    /// ownership (frees exactly once) and the buffer is forgotten, so a
+    /// later `deinit` is a no-op. Replaces `toOwnedSlice` on the hot path
+    /// — saves one full-request-size alloc + memcpy per request. Safe for
+    /// both arena and testing allocators: exactly one owner either way
+    /// (toOwnedSlice also emptied the buffer).
+    fn takeBytes(self: *RequestBuffer) []u8 {
+        const out = self.buf.items;
+        self.buf = .empty;
+        return out;
+    }
+
     /// Read one complete request from a `Stream` (plain socket OR TLS).
     ///
     /// The HTTP/1.1 path MUST read through the transport: on an encrypted
@@ -1509,7 +1540,7 @@ pub const RequestBuffer = struct {
 
         const header_end_idx = std.mem.indexOf(u8, self.buf.items, "\r\n\r\n") orelse {
             if (self.buf.items.len == 0) return error.ConnectionClosed;
-            return self.buf.toOwnedSlice(self.allocator);
+            return self.takeBytes();
         };
 
         // Phase 2: parse Content-Length by scanning header lines
@@ -1529,7 +1560,7 @@ pub const RequestBuffer = struct {
                 }
             }
             // No Content-Length header found (e.g. GET request)
-            return self.buf.toOwnedSlice(self.allocator);
+            return self.takeBytes();
         };
 
         // Phase 3: read body
@@ -1543,7 +1574,7 @@ pub const RequestBuffer = struct {
             try self.buf.appendSlice(self.allocator, self.tmp[0..n]);
         }
 
-        return self.buf.toOwnedSlice(self.allocator);
+        return self.takeBytes();
     }
 };
 

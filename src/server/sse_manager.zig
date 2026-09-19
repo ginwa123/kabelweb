@@ -803,6 +803,9 @@ pub const SseManager = struct {
         var client_ptrs: std.ArrayListUnmanaged(*SseClient) = .empty;
         defer client_ptrs.deinit(self.allocator);
 
+        // Pre-size snapshot to client count: avoids regrowth when
+        // broadcasting to many clients (1 alloc instead of log N).
+        try client_ptrs.ensureTotalCapacity(self.allocator, self.clients.count());
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             client_ptrs.append(self.allocator, entry.value_ptr.*) catch break;
@@ -832,6 +835,8 @@ pub const SseManager = struct {
         var client_ptrs: std.ArrayListUnmanaged(*SseClient) = .empty;
         defer client_ptrs.deinit(self.allocator);
 
+        // Pre-size snapshot (see broadcast).
+        try client_ptrs.ensureTotalCapacity(self.allocator, self.clients.count());
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             client_ptrs.append(self.allocator, entry.value_ptr.*) catch break;

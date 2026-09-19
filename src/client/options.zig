@@ -27,4 +27,19 @@ pub const Options = struct {
 
     /// Verify the server's TLS certificate (default `true`).
     verify_ssl: bool = true,
+
+    /// Max buffered response body in `Client.perform` (bytes).
+    /// Prevents OOM on large downloads — use `openStream` for those.
+    /// Default 10 MiB. `null` = unbounded (legacy).
+    max_body_bytes: ?usize = 10 * 1024 * 1024,
+
+    /// Max response headers in `Client.perform`. Default 100.
+    max_headers: usize = 100,
+
+    /// Max total header bytes (name+value) in `Client.perform`.
+    /// Default 32 KiB.
+    max_header_bytes: usize = 32 * 1024,
+
+    /// Max URL length (bytes). Default 8 KiB.
+    max_url_bytes: usize = 8 * 1024,
 };

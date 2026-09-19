@@ -2342,6 +2342,10 @@ fn isTruthy(v: Value) bool {
 ///   " → &quot;    ' → &#x27;
 /// Both attributes and text content are protected.
 fn escapeHtml(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) (Error || std.mem.Allocator.Error)!void {
+    // Reserve the common case (no escaping, 1:1) up front so the
+    // per-char append loop doesn't regrow logarithmically. Worst case
+    // (all '&' → 5x) still regrows, but only for hostile input.
+    try out.ensureTotalCapacity(allocator, out.items.len + s.len);
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
@@ -2368,9 +2372,9 @@ fn appendValue(
         .null => {},
         .bool => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
         .int => |i| {
-            const buf = try std.fmt.allocPrint(allocator, "{d}", .{i});
-            defer allocator.free(buf);
-            try out.appendSlice(allocator, buf);
+            var int_buf: [32]u8 = undefined;
+            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{i}) catch return error.OutOfMemory;
+            try out.appendSlice(allocator, int_str);
         },
         .string => |s| try escapeHtml(allocator, out, s),
         .array => |a| {
@@ -2493,6 +2497,9 @@ pub fn render(
 ) (Error || std.mem.Allocator.Error)![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(out_alloc);
+    // Seed with 1 KiB so tiny templates render with a single allocation
+    // instead of 3-4 logarithmic regrowths.
+    try out.ensureTotalCapacity(out_alloc, 1024);
     try renderNodes(out_alloc, &out, nodes, ctx, options);
     return out.toOwnedSlice(out_alloc);
 }
