@@ -1189,17 +1189,48 @@ fn runSseServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: So
         closeFd(fd);
         return;
     };
-    defer server.sse_manager.removeClient(client_id, .explicit_shutdown);
 
     var sse_ctx = sse.ctx;
     sse_ctx.client_id = client_id;
     sse_ctx.allocator = a;
     const res = http_parser.HttpResponse.init(200, "OK", a);
+    var manager_owns_conn = false;
     _ = sse.handler(sse_ctx, sse.req, res) catch |err| {
-        if (err != error.WouldBlock) {
+        if (err == error.WouldBlock) {
+            // The handler's documented "connection stays open, the
+            // SseManager owns it now" signal — both the bundled demo and
+            // the desktop app's /api/events handler send their handshake
+            // frame and then return this.
+            manager_owns_conn = true;
+        } else {
             std.debug.print("SSE handler error: {s}\n", .{@errorName(err)});
         }
     };
+
+    if (manager_owns_conn) {
+        // Hand the connection over COMPLETELY: do NOT unregister the client,
+        // do NOT close the fd.
+        //
+        // Unregistering here (the previous behaviour — an unconditional
+        // `defer removeClient`) made the client invisible to every emit path
+        // the instant the handler returned: `sendHeartbeat` no longer saw it,
+        // no `broadcast` reached it, and the fd sat open but unused. Clients
+        // received exactly one frame (`event: connected`) and then silence,
+        // so stall-detecting consumers (the desktop app force-reconnects after
+        // 7s of quiet) reconnected forever. Closing the fd here would be
+        // worse — the stream would end outright.
+        //
+        // The manager owns the fd from here: its poll loops reap the client on
+        // peer HUP/EOF (or a heartbeat/broadcast write failure, or the stale
+        // sweep) and `removeClientByFd` closes the fd and flushes the chunked
+        // terminator. Nothing else may close it.
+        return;
+    }
+
+    // Handler finished with the connection on its own (normal return or a
+    // real error): unregister it. `removeClient` closes the fd, so no
+    // closeFd here.
+    server.sse_manager.removeClient(client_id, .explicit_shutdown);
 }
 
 /// WebSocket hijack runner (dedicated thread per session). Mirrors the old

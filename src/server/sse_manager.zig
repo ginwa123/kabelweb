@@ -155,13 +155,22 @@ pub const SseManager = struct {
     allocator: std.mem.Allocator,
     server_allocator: std.mem.Allocator,
     running: bool,
-    /// Event-loop threads currently inside `runEventLoop`. `deinit`
-    /// spin-waits for zero before freeing clients/maps: the loops are
-    /// spawned via Io.Group without join handles, so without this a loop
-    /// can touch freed map memory after teardown (use-after-free panic
-    /// in `fetchRemove`). Loops exit within one poll/heartbeat wait once
-    /// `running` is false, so the wait is bounded.
-    active_loops: std.atomic.Value(u32) = .init(0),
+    /// Joinable handles for the `runEventLoop` threads started by
+    /// `startEventLoop`. `stop()` / `deinit()` join them, which is the
+    /// teardown barrier that keeps a loop from touching freed clients/maps.
+    ///
+    /// Plain `std.Thread`, deliberately NOT `std.Io.Group` / `io.concurrent`:
+    /// each loop parks in a blocking `poll()` on a raw fd, and a
+    /// runtime-scheduled task that blocks inside a raw syscall is not
+    /// guaranteed to make progress. Observed in production (desktop app +
+    /// example server): the 4 loop tasks reached `poll(fds, 15000)` and never
+    /// woke again — the syscall's timeout never fired — so `sendHeartbeat`
+    /// was never reached, `data: ping` never hit the wire, and every client
+    /// stall-reconnected forever. A dedicated OS thread has no executor
+    /// coupling: its poll timeout always fires, so heartbeats (and the
+    /// `running == false` exit check) always run.
+    loop_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    loop_threads_lock: std.atomic.Mutex = .unlocked,
     on_disconnect: ?*const fn (client_id: [16]u8) void = null,
     notify_pipe: [2]i32,
     /// Set once `drainPipeNonBlocking` has flipped the notify pipe's
@@ -188,20 +197,12 @@ pub const SseManager = struct {
     }
 
     pub fn deinit(self: *SseManager) void {
-        self.running = false;
-        if (!is_windows and self.notify_pipe[1] >= 0) {
-            var byte_buf: [1]u8 = .{'q'};
-            _ = socket.write(self.notify_pipe[1], &byte_buf, 1);
-        }
-        // Wait for event-loop threads to actually exit BEFORE freeing
-        // clients/maps below. They observe `running == false` within one
-        // poll/heartbeat wait and then decrement `active_loops`; freeing
-        // earlier lets a late `removeClientByFd` hit freed map memory
-        // (misalignment panic in `fetchRemove`). Bounded: loops never
-        // block indefinitely (poll timeouts + send timeouts).
-        while (self.active_loops.load(.acquire) != 0) {
-            std.Io.sleep(self.io, .{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
-        }
+        // Stop AND JOIN the heartbeat loops before touching anything they
+        // use. The join is the teardown barrier: a loop can otherwise be
+        // mid-`removeClientByFd` against these maps while we free them
+        // (misalignment panic in `fetchRemove`). Bounded — each loop wakes
+        // from its poll within one slice and re-checks `running`.
+        self.stop();
         self.lock.lock(self.io) catch unreachable;
         defer self.lock.unlock(self.io);
 
@@ -393,34 +394,64 @@ pub const SseManager = struct {
         _ = socket.read(read_fd, &one_byte, 1);
     }
 
-    /// Start LOOP_COUNT concurrent event loops using std.Io.Group.
+    /// Start LOOP_COUNT event loops as dedicated OS threads.
     ///
-    /// Spawns the loops and RETURNS immediately. startEventLoop is
-    /// itself invoked via group.concurrent from main.zig; blocking on
-    /// the child group inside that closure made shutdown fragile (the
-    /// outer group.cancel propagated into the inner wait while child
-    /// loops were blocked in raw syscalls). The loops exit cleanly on
-    /// `running=false` (set by stop()/deinit()); the caller's group
-    /// tracks the spawned children for the process lifetime.
+    /// Returns once the threads are spawned (each loop then runs for the
+    /// manager's lifetime). Why plain `std.Thread` and not
+    /// `io.concurrent`/`Io.Group`: see the `loop_threads` field contract —
+    /// a runtime-scheduled task that blocks in the raw `poll()` used by
+    /// `runEventLoop` was observed to never wake, which silently killed
+    /// every heartbeat. `stop()` joins exactly these handles.
     pub fn startEventLoop(self: *SseManager, heartbeat_secs: u32) !void {
         self.running = true;
-        var group: std.Io.Group = .init;
-
         for (0..LOOP_COUNT) |loop_id| {
-            try group.concurrent(
-                self.io,
+            const t = std.Thread.spawn(
+                .{},
                 struct {
                     fn run(mgr: *SseManager, secs: u32, id: usize) void {
                         mgr.runEventLoop(secs, id);
                     }
                 }.run,
                 .{ self, heartbeat_secs, loop_id },
-            );
+            ) catch |err| {
+                // Roll back the loops already started so a retry doesn't
+                // leave two sets heartbeating the same clients.
+                self.stop();
+                return err;
+            };
+            while (!self.loop_threads_lock.tryLock()) std.atomic.spinLoopHint();
+            self.loop_threads.append(self.allocator, t) catch {
+                self.loop_threads_lock.unlock();
+                // Tracking failed (OOM) — the thread is already running and
+                // still exits on `running == false`; detach so the handle
+                // doesn't leak, and let `stop()` join the rest.
+                t.detach();
+                continue;
+            };
+            self.loop_threads_lock.unlock();
         }
-        // No join here — see the doc comment above. The local `group`
-        // only aggregates the spawned closures; std.Io.Group's child
-        // handles are owned by the Io runtime and keep running after
-        // this function returns.
+    }
+
+    /// Signal the loops to exit and JOIN them. Idempotent: a second call
+    /// finds no handles and returns immediately.
+    pub fn stop(self: *SseManager) void {
+        self.running = false;
+        self.notifyLoops();
+        self.joinLoops();
+    }
+
+    /// Join (and drop) every handle in `loop_threads`. Bounded: each loop
+    /// wakes from its poll within one slice, sees `running == false`, and
+    /// returns.
+    fn joinLoops(self: *SseManager) void {
+        while (!self.loop_threads_lock.tryLock()) std.atomic.spinLoopHint();
+        const threads = self.loop_threads.toOwnedSlice(self.allocator) catch {
+            self.loop_threads_lock.unlock();
+            return;
+        };
+        self.loop_threads_lock.unlock();
+        defer if (threads.len > 0) self.allocator.free(threads);
+        for (threads) |t| t.join();
     }
 
     pub fn gracefulShutdown(self: *SseManager) void {
@@ -446,12 +477,20 @@ pub const SseManager = struct {
         while (self.clients.count() > 0) {
             var it2 = self.clients.iterator();
             if (it2.next()) |entry| {
+                const client = entry.value_ptr.*;
                 const id = entry.key_ptr.*;
-                const fd = entry.value_ptr.*.fd;
+                const fd = client.fd;
                 // Full `deinit()` (not `forceDestroy()`) so the per-client
                 // arena + message_queue are freed — see the comment in
                 // `deinit` above for the rationale.
-                entry.value_ptr.*.deinit();
+                client.deinit();
+                // ...and release the SseClient struct itself, exactly like
+                // `removeClient` / `removeClientByFd` / `deinit` do. Without
+                // this the struct leaks for every client that is still
+                // registered at shutdown — previously invisible because the
+                // SSE runner unregistered clients the moment their handler
+                // returned, so this loop usually had nothing to free.
+                self.server_allocator.destroy(client);
                 _ = self.clients.remove(id);
                 _ = self.fd_to_id.remove(fd);
             }
@@ -460,15 +499,8 @@ pub const SseManager = struct {
         self.fd_to_id.clearRetainingCapacity();
     }
 
-    pub fn stop(self: *SseManager) void {
-        self.running = false;
-        self.notifyLoops();
-    }
-
     /// Each loop handles clients at indices where client_index % LOOP_COUNT == loop_id
     fn runEventLoop(self: *SseManager, heartbeat_secs: u32, loop_id: usize) void {
-        _ = self.active_loops.fetchAdd(1, .acq_rel);
-        defer _ = self.active_loops.fetchSub(1, .acq_rel);
         const heartbeat_ms: i32 = @intCast(heartbeat_secs * 1000);
         var last_hb: i64 = @intCast(timestamp(self.io));
 
@@ -584,7 +616,15 @@ pub const SseManager = struct {
             }
 
             // poll blocks here — lock is FREE, sendToClient/registerClient can proceed
-            _ = posix.poll(poll_fds, heartbeat_ms) catch continue;
+            //
+            // Bounded slice (not the whole heartbeat interval): `stop()` /
+            // `deinit` then join a loop within ~one slice instead of up to
+            // `heartbeat_secs`, and the heartbeat can't be pushed past its
+            // deadline by a single long wait. The
+            // `now - last_hb >= heartbeat_ms` check below still owns the
+            // actual cadence, so slicing changes nothing about it.
+            const poll_slice_ms: i32 = 250;
+            _ = posix.poll(poll_fds, @min(heartbeat_ms, poll_slice_ms)) catch continue;
 
             for (poll_fds[0..total_fds]) |pfd| {
                 const revents = @as(u16, @bitCast(pfd.revents));
