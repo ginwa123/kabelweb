@@ -155,6 +155,13 @@ pub const SseManager = struct {
     allocator: std.mem.Allocator,
     server_allocator: std.mem.Allocator,
     running: bool,
+    /// Event-loop threads currently inside `runEventLoop`. `deinit`
+    /// spin-waits for zero before freeing clients/maps: the loops are
+    /// spawned via Io.Group without join handles, so without this a loop
+    /// can touch freed map memory after teardown (use-after-free panic
+    /// in `fetchRemove`). Loops exit within one poll/heartbeat wait once
+    /// `running` is false, so the wait is bounded.
+    active_loops: std.atomic.Value(u32) = .init(0),
     on_disconnect: ?*const fn (client_id: [16]u8) void = null,
     notify_pipe: [2]i32,
     /// Set once `drainPipeNonBlocking` has flipped the notify pipe's
@@ -185,6 +192,15 @@ pub const SseManager = struct {
         if (!is_windows and self.notify_pipe[1] >= 0) {
             var byte_buf: [1]u8 = .{'q'};
             _ = socket.write(self.notify_pipe[1], &byte_buf, 1);
+        }
+        // Wait for event-loop threads to actually exit BEFORE freeing
+        // clients/maps below. They observe `running == false` within one
+        // poll/heartbeat wait and then decrement `active_loops`; freeing
+        // earlier lets a late `removeClientByFd` hit freed map memory
+        // (misalignment panic in `fetchRemove`). Bounded: loops never
+        // block indefinitely (poll timeouts + send timeouts).
+        while (self.active_loops.load(.acquire) != 0) {
+            std.Io.sleep(self.io, .{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
         }
         self.lock.lock(self.io) catch unreachable;
         defer self.lock.unlock(self.io);
@@ -451,6 +467,8 @@ pub const SseManager = struct {
 
     /// Each loop handles clients at indices where client_index % LOOP_COUNT == loop_id
     fn runEventLoop(self: *SseManager, heartbeat_secs: u32, loop_id: usize) void {
+        _ = self.active_loops.fetchAdd(1, .acq_rel);
+        defer _ = self.active_loops.fetchSub(1, .acq_rel);
         const heartbeat_ms: i32 = @intCast(heartbeat_secs * 1000);
         var last_hb: i64 = @intCast(timestamp(self.io));
 

@@ -610,6 +610,23 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always use the vendored libcurl archive",
     ) orelse false;
 
+    // Test filter (substring match on the test name). Zig 0.16's test
+    // runner no longer parses `--test-filter` on its own command line
+    // (it only accepts `--listen=-` / `--seed=` / `--cache-dir=`), so the
+    // old `zig build test -- --test-filter=...` passthrough below aborts
+    // the runner with "unrecognized command line argument". The build
+    // step applies the filter over the `--listen=-` protocol instead:
+    //   zig build test -Dtest-filter=hijacks
+    const test_filter: []const u8 = b.option(
+        []const u8,
+        "test-filter",
+        "Only run tests whose name contains this substring (localizes a hang)",
+    ) orelse "";
+    const test_filters: []const []const u8 = if (test_filter.len > 0)
+        &.{test_filter}
+    else
+        &.{};
+
     // Debian/Ubuntu multiarch: headers AND libs can live under
     // /usr/include/<triplet>/ + /usr/lib/<triplet>/ instead of the
     // plain dirs. Resolve the triplet present on this host (at most
@@ -943,11 +960,8 @@ pub fn build(b: *std.Build) void {
             }
         }
     }
-    const mod_tests = b.addTest(.{ .root_module = test_mod });
+    const mod_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
     const run_mod_tests = b.addRunArtifact(mod_tests);
-    // Forward `zig build test -- --test-filter=...` to the test binary
-    // (bisecting a hanging suite without editing the runner).
-    if (b.args) |args| run_mod_tests.addArgs(args);
     const test_step = b.step("test", "Run kabelweb package tests (fast suites + 60s SSE soaks)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(b.getInstallStep());
@@ -955,9 +969,8 @@ pub fn build(b: *std.Build) void {
     // Fast suites only (no 60 s soaks) — what CI runs on every
     // platform. The soaks are timing-sensitive; they run in the
     // full `test` step (ubuntu job) instead of blocking mac/Windows.
-    const fast_tests = b.addTest(.{ .root_module = fast_test_mod });
+    const fast_tests = b.addTest(.{ .root_module = fast_test_mod, .filters = test_filters });
     const run_fast_tests = b.addRunArtifact(fast_tests);
-    if (b.args) |args| run_fast_tests.addArgs(args);
     const test_fast_step = b.step("test-fast", "Run kabelweb fast suites (no 60s SSE soaks)");
     test_fast_step.dependOn(&run_fast_tests.step);
     test_fast_step.dependOn(b.getInstallStep());
@@ -965,15 +978,13 @@ pub fn build(b: *std.Build) void {
     // Split halves of the fast set (server-only / client-only) — CI
     // runs these separately so a hanging suite is localized to one
     // half instead of stalling the whole binary with zero output.
-    const server_tests = b.addTest(.{ .root_module = server_test_mod });
+    const server_tests = b.addTest(.{ .root_module = server_test_mod, .filters = test_filters });
     const run_server_tests = b.addRunArtifact(server_tests);
-    if (b.args) |args| run_server_tests.addArgs(args);
     const test_server_step = b.step("test-server", "Run kabelweb server suites only (no soaks, no sse_chunked)");
     test_server_step.dependOn(&run_server_tests.step);
     test_server_step.dependOn(b.getInstallStep());
-    const client_tests = b.addTest(.{ .root_module = client_test_mod });
+    const client_tests = b.addTest(.{ .root_module = client_test_mod, .filters = test_filters });
     const run_client_tests = b.addRunArtifact(client_tests);
-    if (b.args) |args| run_client_tests.addArgs(args);
     const test_client_step = b.step("test-client", "Run kabelweb client suites only");
     test_client_step.dependOn(&run_client_tests.step);
     test_client_step.dependOn(b.getInstallStep());

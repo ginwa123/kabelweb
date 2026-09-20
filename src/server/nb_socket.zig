@@ -67,6 +67,7 @@ const winsock = if (is_windows) struct {
     extern "ws2_32" fn recv(sockfd: c_int, buf: ?*anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
     extern "ws2_32" fn send(sockfd: c_int, buf: ?*const anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
     extern "ws2_32" fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.c) c_int;
+    extern "ws2_32" fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int;
     extern "ws2_32" fn WSAPoll(fdarray: [*]WSAPOLLFD, nfds: c_ulong, timeout: c_int) callconv(.c) c_int;
 
     const WSADATA = [400]u8;
@@ -224,6 +225,31 @@ pub fn closeSocket(fd: i32) void {
         _ = winsock.closesocket(fd);
     } else {
         _ = posix.system.close(fd);
+    }
+}
+
+/// Actively shut a connected socket down in BOTH directions.
+///
+/// Used at teardown to unblock a worker thread parked in a blocking
+/// `read()` on a hijacked connection (SSE/WS/H2/TLS): `shutdown(SHUT_RDWR)`
+/// makes that read return 0 (EOF) immediately on Linux, macOS and Winsock,
+/// so teardown can join the worker instead of waiting for the PEER to
+/// disconnect — which for an idle keep-alive/WS/H2 client may be never.
+///
+/// Deliberately NOT `closeSocket`: the worker still owns the fd and closes
+/// it on its way out. Closing here would free the fd number out from under
+/// the worker (a later `close`/`read` could then hit an unrelated fd), and
+/// per the note on `shutdownListenerFd` in http_server.zig, closing an fd
+/// from another thread does not reliably wake a blocked syscall anyway.
+/// Best-effort: an already-closed fd just returns an error that is ignored.
+pub fn shutdownSocket(fd: i32) void {
+    // SHUT_RDWR = 2 (POSIX) / SD_BOTH = 2 (Winsock) — same literal on both.
+    const SHUT_RDWR: c_int = 2;
+    if (comptime is_windows) {
+        ensureWsa();
+        _ = winsock.shutdown(fd, SHUT_RDWR);
+    } else {
+        _ = posix.system.shutdown(fd, SHUT_RDWR);
     }
 }
 

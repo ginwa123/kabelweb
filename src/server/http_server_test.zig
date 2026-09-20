@@ -8,6 +8,23 @@ const writeTestFd = helpers.writeTestFdAll;
 const closeTestFd = helpers.closeTestFd;
 const builtin = @import("builtin");
 const posix = std.posix;
+const test_tcp = @import("test_tcp.zig");
+
+/// A loopback port that is free *right now*.
+///
+/// The Address tests below used hardcoded literals (45678…45692). Those
+/// numbers are NOT reserved: any process on the box can be handed the same
+/// number as an ephemeral *client* port by `connect()`. A Node process
+/// parked on 45686 (CLOSE_WAIT) made the two tests that used it fail with
+/// `error.BindFailed` — a spurious failure that has nothing to do with the
+/// code under test. Bind :0, read back the kernel's choice, release it, and
+/// hand that back: the window between release and the test's own bind is
+/// microscopic, and nothing else in this binary asks for that number.
+fn freePort() !u16 {
+    const probe = try http_server.Address.init("127.0.0.1", 0);
+    defer _ = closeI32Fd(probe.sock_fd);
+    return test_tcp.boundPort(probe.sock_fd);
+}
 
 /// Pumps headers+body into a test socketpair from a writer thread while
 /// the main thread reads. Serial write-then-read deadlocks on platforms
@@ -136,7 +153,7 @@ test "GinwaServer.security_headers defaults to library baseline" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const addr = try http_server.Address.init("127.0.0.1", 45686);
+    const addr = try http_server.Address.init("127.0.0.1", 0);
     defer _ = closeI32Fd(addr.sock_fd);
 
     var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -245,7 +262,12 @@ test "Address.init fails on invalid port (0 is technically valid, use reserved)"
 // ============================================================================
 
 test "Address port is correctly stored" {
-    const test_port: u16 = 45686;
+    // `freePort()` instead of a literal: the requested port must be
+    // bindable for `init` to succeed, and a hardcoded number can be held
+    // by an unrelated process's ephemeral socket (see `freePort`). The
+    // assertion under test is unchanged — whatever port is requested is
+    // what `Address` stores.
+    const test_port: u16 = try freePort();
     const addr = try http_server.Address.init("127.0.0.1", test_port);
     defer _ = closeI32Fd(addr.sock_fd);
 

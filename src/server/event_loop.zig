@@ -323,6 +323,24 @@ pub const EventLoop = struct {
     /// here, guarded by `static_lock`.
     static_pool: ?worker_pool_mod.WorkerPool = null,
     static_lock: std.atomic.Mutex = .unlocked,
+    /// Hijacked-conn worker threads (SSE/WS/H2/TLS dedicated threads).
+    /// Joined in `deinit` so server teardown never outruns a worker that
+    /// still touches managers (broadcast/removeClient after free). Same
+    /// join-on-shutdown contract the old threaded path had via its
+    /// worker group. Appended under `hijack_lock` (loop + offload threads
+    /// both spawn); if the append itself fails, the thread is detached
+    /// instead (untracked fallback, counted nowhere — spawn already won).
+    hijack_threads: std.ArrayList(std.Thread) = .empty,
+    /// Fds handed off to hijacked-conn workers (same set as the threads
+    /// above, plus static-pool jobs). Recorded by `forgetConn` under
+    /// `hijack_lock`. `deinit` runs `nb.shutdownSocket` over this list
+    /// BEFORE joining: a hijacked worker parks in a blocking read() that
+    /// only returns when its peer goes away, so without the active
+    /// shutdown an idle keep-alive/WS/H2 client would deadlock teardown
+    /// (join waits on the worker, the worker waits on the peer). The loop
+    /// never closes these fds — the worker owns and closes them.
+    hijacked_fds: std.ArrayList(i32) = .empty,
+    hijack_lock: std.atomic.Mutex = .unlocked,
     /// Completed offloads waiting for the loop thread (worker-pushed).
     completions: std.ArrayList(Completion) = .empty,
     compl_lock: std.atomic.Mutex = .unlocked,
@@ -338,6 +356,16 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
+        // Unblock every hijacked-conn worker BEFORE the joins below. Those
+        // workers park in a blocking read() that only returns once the
+        // PEER goes away, so an idle keep-alive / WS / H2 client would
+        // deadlock teardown (join waits on the worker, worker waits on the
+        // peer). `shutdownSocket` is the same trick `shutdown()` uses to
+        // wake a blocked accept(); it does NOT close — the worker still
+        // owns the fd and closes it on its way out. Covers the static pool
+        // too, whose `stop()` joins its in-flight jobs below.
+        for (self.hijacked_fds.items) |fd| nb.shutdownSocket(fd);
+        self.hijacked_fds.deinit(self.alloc);
         if (self.pool) |*p| {
             p.stop();
             p.deinit();
@@ -348,6 +376,11 @@ pub const EventLoop = struct {
             p.deinit();
             self.static_pool = null;
         }
+        // Join hijacked-conn workers BEFORE freeing anything they might
+        // touch (managers live past the loop in server.destroy). Safe from
+        // the deadlock above because their fds were just shut down.
+        for (self.hijack_threads.items) |t| t.join();
+        self.hijack_threads.deinit(self.alloc);
         // Free any completions nobody claimed (conn closed while its job
         // was in flight, or jobs that finished during shutdown).
         self.freeCompletions();
@@ -396,8 +429,14 @@ pub const EventLoop = struct {
 
     /// Forget a hijacked conn WITHOUT closing: a worker thread owns the fd
     /// from here (serves + closes). Loop-thread-only (like `removeAt`).
+    /// The fd is recorded first (under `hijack_lock`) so `deinit` can
+    /// actively shut it down before joining that worker — see the
+    /// `hijacked_fds` field contract.
     fn forgetConn(self: *EventLoop, idx: usize) void {
         var c = self.conns.orderedRemove(idx);
+        while (!self.hijack_lock.tryLock()) std.atomic.spinLoopHint();
+        self.hijacked_fds.append(self.alloc, c.fd) catch {};
+        self.hijack_lock.unlock();
         c.deinit(self.alloc);
         self.stats.hijacked += 1;
     }
@@ -742,10 +781,13 @@ pub const EventLoop = struct {
         args.alloc.destroy(args);
     }
 
-    /// Spawn a detached worker thread for a hijacked conn. Returns true
+    /// Spawn a tracked worker thread for a hijacked conn. Returns true
     /// when spawned (caller must forget the conn WITHOUT closing — the
     /// thread owns the fd now). Returns false on spawn failure (caller
     /// keeps ownership: free the data copy, close via `removeAt`).
+    /// Spawned threads are tracked for joining in `deinit` (see the
+    /// `hijack_threads` field contract); if tracking fails the thread is
+    /// detached instead so nothing leaks the handle.
     fn spawnServeThread(self: *EventLoop, h: Hijack, fd: i32, req_bytes: ?[]u8) bool {
         const args = self.alloc.create(ServeArgs) catch return false;
         args.* = .{
@@ -760,7 +802,13 @@ pub const EventLoop = struct {
             self.alloc.destroy(args);
             return false;
         };
-        t.detach();
+        while (!self.hijack_lock.tryLock()) std.atomic.spinLoopHint();
+        self.hijack_threads.append(self.alloc, t) catch {
+            self.hijack_lock.unlock();
+            t.detach();
+            return true;
+        };
+        self.hijack_lock.unlock();
         return true;
     }
 
@@ -1104,29 +1152,19 @@ pub const EventLoop = struct {
                 pushCompletion(loop, .{ .conn_id = conn_id, .hijacked = true });
             },
             .hijack_sse, .hijack_ws => |h| {
-                // Long-lived: dedicated thread takes fd + request copy.
+                // Long-lived: dedicated thread takes fd + request copy
+                // (tracked for joining in deinit via spawnServeThread).
                 const conn_id = job.conn_id;
-                const args = loop.alloc.create(ServeArgs) catch {
-                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
-                    return;
-                };
-                args.* = .{
-                    .alloc = loop.alloc,
-                    .io = loop.io,
-                    .run = h.run,
-                    .ctx = h.ctx,
-                    .fd = job.client_fd,
-                    .req_bytes = req_opt,
-                };
-                const t = std.Thread.spawn(.{}, serveThreadMain, .{args}) catch {
-                    loop.alloc.destroy(args);
-                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
-                    return;
-                };
-                t.detach();
+                const fd = job.client_fd;
+                const data = req_opt;
                 req_opt = null;
                 loop.alloc.destroy(job);
                 job_opt = null;
+                if (!loop.spawnServeThread(h, fd, data)) {
+                    if (data) |b| loop.alloc.free(b);
+                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
+                    return;
+                }
                 pushCompletion(loop, .{ .conn_id = conn_id, .hijacked = true });
             },
         }
