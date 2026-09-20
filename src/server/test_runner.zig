@@ -78,7 +78,7 @@ test {
     _ = @import("event_loop.zig");
     // Bounded worker pool for offloaded dispatch (Phase 5).
     _ = @import("worker_pool.zig");
-    // Dual-path proof: real GinwaServer + routes served via listenEventLoop.
+    // Single-path proof: real GinwaServer + routes served via listenEventLoop.
     _ = @import("event_loop_server_test.zig");
     // Transport abstraction (plain socket | TLS). Its own tests cover short
     // writes, EOF and the TLS op-table dispatch.

@@ -91,39 +91,41 @@ all stay present across edits — see "Running Tests" below.
 
 ## Architecture
 
-### Serve paths: threaded (default) vs event loop (opt-in)
+### Serve path: the event-loop reactor (single source of truth)
 
-`GinwaServer.listen()` is the default: blocking `accept()` + one thread
-per connection (`std.Io.Group.concurrent`, capped at `cpu_count * 12` by
-`worker_sem`; excess waits in the kernel backlog). Simple, portable
-(Linux/macOS/Windows), correct for SSE/WS/H2/TLS — but one thread per
-idle keep-alive connection.
+`GinwaServer.listenEventLoop(cfg)` is the only serve path (the old
+thread-per-connection `listen()` was deleted). One thread runs `poll(2)`
+over the listener + all connections (`src/server/event_loop.zig`), with
+non-blocking helpers in `src/server/nb_socket.zig`. No per-connection
+threads for plain HTTP; per-conn state is a small `Conn` struct (read
+buffer + write outbox + deadlines). Timers replace threads: idle
+keep-alive timeout (default 60 s), header-read timeout (default 5 s),
+backpressure cap (default 1024 conns, newest dropped past the cap).
+`shutdown()` closes the listener fd(s) — each reactor's `poll` reports
+HUP and exits.
 
-`GinwaServer.listenEventLoop(cfg)` is the opt-in reactor for plain
-HTTP/1.1: one thread runs `poll(2)` over the listener + all connections
-(`src/server/event_loop.zig`), with non-blocking helpers in
-`src/server/nb_socket.zig`. No per-connection threads; per-conn state is
-a small `Conn` struct (read buffer + write outbox + deadlines). Timers
-replace threads: idle keep-alive timeout (default 60 s), header-read
-timeout (default 5 s), backpressure cap (default 1024 conns, newest
-dropped past the cap). `shutdown()` works for both paths (listener close
-surfaces as `POLLHUP` and exits the loop).
+Anything long-lived or blocking hijacks the fd to a worker thread
+(blocking mode restored via `nb.setBlocking`), reusing the existing
+managers verbatim — the loop forgets the fd (no close), the worker
+serves + closes:
+- static-dir fallback → bounded static pool (4 threads, queue 64).
+- SSE streams / WebSocket sessions / H2 connections / TLS handshakes →
+  one dedicated (detached) thread each.
 
-v1 scope (deliberate, non-breaking — `listen()` is untouched):
+Scope:
 - Cross-platform single loop: `poll(2)` on POSIX, `WSAPoll` on Windows.
   `loop_count > 1` (multi) is POSIX-only — Windows has no `SO_REUSEPORT`
   equivalent and fails fast with `error.Unsupported` (use one loop there).
-- No TLS (`error.TlsNotSupported` when `tls_ctx` is set).
-- SSE / WebSocket / H2C upgrades and the static-dir fallback answer
-  `501 Not Implemented` + close (same status the threaded path already
-  uses for SSE+WS-over-TLS).
+- TLS served via accept-time hijack (handshake + ALPN dispatch on the
+  worker; H1 keep-alive reuses the loop's dispatch). SSE/WS-over-TLS
+  stay `501` (same as the old path).
 - Handler signature unchanged (`HandlerFn`); dispatch reuses the same
   pre-gate → CORS preflight → router → 404 pipeline.
 
 ```zig
 var server = try kabelweb.GinwaServer.init(alloc, io, addr);
 try server.router.get("/hello", helloHandler);
-try server.listenEventLoop(.{}); // instead of try server.listen();
+try server.listenEventLoop(.{});
 ```
 
 ### Dispatch modes: direct vs worker pool
@@ -167,17 +169,18 @@ carries the last run's counters — handy for tests and `/health`.
 ### Bench harness
 
 `scripts/bench-event-loop.sh [--quick]` builds the demo, serves it
-three ways (`threaded` / `event-loop` / `loops-4` via the demo's
-`--event-loop` / `--pool` / `--loops N` flags), and loads `/health` +
-`/hello/:name` with a stdlib-only python3 concurrent loader
-(keep-alive reuse per thread). No `wrk` needed.
+three ways (`direct` / `pool` / `loops-4` via the demo's `--pool` /
+`--loops N` flags), and loads `/health` + `/hello/:name` with a
+stdlib-only python3 concurrent loader (keep-alive reuse per thread).
+No `wrk` needed.
 
 Tests: `src/server/event_loop_test.zig` (framing units + live loopback
 keep-alive test), `src/server/event_loop_server_test.zig` (real server
-+ routes through `listenEventLoop`: GET, POST echo, 404 reuse, SSE 501;
-worker-pool mode with ordering + stats asserts; multi-loop with
-aggregate-stats asserts), `src/server/worker_pool_test.zig` (exactly-
-once, queue-full backpressure, stop-drains).
++ routes through `listenEventLoop`: GET, POST echo, 404; static-dir,
+SSE, WebSocket and H2C hijacks; worker-pool mode with ordering + stats
+asserts; multi-loop with aggregate-stats asserts),
+`src/server/worker_pool_test.zig` (exactly-once, queue-full
+backpressure, stop-drains).
 
 ```
 src/
@@ -351,7 +354,7 @@ Supported expression syntax:
 Standard 5 fields: `minute hour dom month dow`. UTC only. Minute
 precision. No persistence — jobs are dropped on server restart.
 
-The manager is automatically started by `GinwaServer.listen()` and
+The manager is automatically started by `GinwaServer.listenEventLoop()` and
 stopped by `GinwaServer.deinit()`. Callers do not need to (and should
 not) call `start` / `stop` themselves.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bench harness: threaded listen() vs event-loop serve paths (Phase 7).
+# Bench harness: event-loop serve shapes against each other.
 #
 #   ./scripts/bench-event-loop.sh [--quick] [--port 29590]
 #
@@ -7,9 +7,9 @@
 # /hello/:name with a stdlib-only python3 concurrent loader (no wrk/oha
 # needed). Prints a comparison table (rps + mean ms/req).
 #
-# Modes: threaded (default listen) | event-loop | loops-4 (REUSEPORT).
-# NOTE: SSE/WS routes are 501 on the loop paths — the loader only hits
-# plain routes, which is exactly what the reactor serves.
+# Modes: direct (single loop) | pool (worker-pool dispatch) | loops-4.
+# NOTE: SSE/WS routes work on all paths now (fd handoff) — the loader
+# only hits plain routes, which is what the reactor serves inline.
 set -u
 PORT=29590
 QUICK=0
@@ -98,7 +98,7 @@ run_mode() { # $1 = label, $2... = demo args
 }
 
 echo "[bench] threads=$THREADS reqs/thread=$REQS port=$PORT"
-run_mode "threaded"
-run_mode "event-loop" --event-loop
+run_mode "direct"
+run_mode "pool" --pool
 run_mode "loops-4" --loops 4
 echo "[bench] done."

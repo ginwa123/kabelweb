@@ -6,7 +6,7 @@
 //!   1. Binds Address.init("127.0.0.1", 0) (OS picks ephemeral port)
 //!   2. Calls getsockname() to retrieve the assigned port
 //!   3. Inits GinwaServer, registers routes, spawns a worker thread
-//!      that calls server.listen() (blocks until shutdown())
+//!      that calls server.listenEventLoop (blocks until shutdown())
 //!   4. Provides url(path) for tests to build request URLs
 //!   5. deinit calls server.shutdown(), joins worker thread, frees.
 
@@ -134,7 +134,7 @@ const TestServer = struct {
 };
 
 fn listenFn(server: *gserverz.GinwaServer) void {
-    server.listen() catch {};
+    server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
 fn streamHandler(ctx: HttpContext, _: HttpRequest, res: HttpResponse) !HttpResponse {

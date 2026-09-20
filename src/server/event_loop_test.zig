@@ -66,9 +66,11 @@ test "framing: pipelined second request detected after drain" {
 fn stubDispatch(
     _: *anyopaque,
     alloc: std.mem.Allocator,
+    req_bytes: []const u8,
     req: *const event_loop.HttpRequest,
     http_ctx: event_loop.HttpContext,
-) anyerror!event_loop.HttpResponse {
+) anyerror!event_loop.DispatchResult {
+    _ = req_bytes;
     _ = http_ctx;
     var res = event_loop.HttpResponse.init(200, "OK", alloc).withBody("loop-ok");
     // Echo keep-alive intent from the request so the test can exercise reuse.
@@ -83,7 +85,7 @@ fn stubDispatch(
         }
     }
     res.keep_alive = !want_close and !std.mem.eql(u8, req.version, "HTTP/1.0");
-    return res;
+    return .{ .respond = res };
 }
 
 fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {

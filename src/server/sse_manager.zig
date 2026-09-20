@@ -204,8 +204,12 @@ pub const SseManager = struct {
             entry.value_ptr.*.deinit();
             self.server_allocator.destroy(entry.value_ptr);
         }
-        self.clients.clearRetainingCapacity();
-        self.fd_to_id.clearRetainingCapacity();
+        // Free the map buckets (not just clearRetainingCapacity): this is
+        // deinit — the manager is being destroyed, so retained capacity
+        // would leak (caught by leak-checking tests on any server that
+        // ever registered an SSE client, loop or threaded path alike).
+        self.clients.deinit(self.server_allocator);
+        self.fd_to_id.deinit(self.server_allocator);
 
         if (!is_windows) {
             if (self.notify_pipe[0] >= 0) _ = socket.close(self.notify_pipe[0]);

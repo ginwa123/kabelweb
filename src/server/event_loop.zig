@@ -33,6 +33,8 @@ const builtin = @import("builtin");
 const nb = @import("nb_socket.zig");
 const http_parser = @import("http_parser.zig");
 const worker_pool_mod = @import("worker_pool.zig");
+const connection_reader = @import("connection_reader.zig");
+const h2_constants = @import("http2/constants.zig");
 
 pub const HttpRequest = http_parser.HttpRequest;
 pub const HttpResponse = http_parser.HttpResponse;
@@ -68,6 +70,14 @@ pub const Config = struct {
     /// loop on the calling thread, `>1` = that many `SO_REUSEPORT` loops
     /// (POSIX-only, clamped to `max_multi_loops`).
     loop_count: usize = 1,
+    /// Transport routing, filled by `listenEventLoop` from server state
+    /// (callers normally leave these alone):
+    /// - `tls_enabled`: every accepted conn hijacks to a TLS worker at
+    ///   accept time (handshake + serve); the loop never reads it.
+    /// - `h2c_enabled`: fresh conns are sniffed for the H2 preface before
+    ///   H1 framing; H2 conns hijack to the H2 driver thread.
+    tls_enabled: bool = false,
+    h2c_enabled: bool = false,
     /// Where dispatch runs (see `DispatchMode`).
     dispatch_mode: DispatchMode = .direct,
     /// Pool threads in `worker_pool` mode. 0 = one per CPU (min 2).
@@ -77,15 +87,49 @@ pub const Config = struct {
     worker_queue_depth: usize = 1024,
 };
 
-/// Dispatch callback supplied by `http_server.zig`. Receives the parsed
-/// request; returns the response to serialize (ownership: arena in `alloc`).
-/// Returning an error makes the reactor send `500` + close.
+/// Dispatch callback supplied by `http_server.zig`. Receives the raw framed
+/// request bytes (borrowed — valid for the call only) plus the parsed
+/// request; returns either a response to serialize or a hijack (fd handoff
+/// to a worker thread — see `Hijack`). Returning an error makes the reactor
+/// send `500` + close.
 pub const OnRequestFn = *const fn (
     ctx: *anyopaque,
     alloc: std.mem.Allocator,
+    req_bytes: []const u8,
     req: *const HttpRequest,
     http_ctx: HttpContext,
-) anyerror!HttpResponse;
+) anyerror!DispatchResult;
+
+/// One hijacked connection: the loop forgets the fd (no close, no further
+/// I/O) and a worker thread owns it from here. `run` restores blocking
+/// mode, serves with the existing blocking managers, closes the fd, and
+/// returns. `data` is the complete framed bytes the loop already read
+/// (an H1 request, or the H2 preface+frames); ownership rules are per
+/// call site — the spawner documents who frees.
+pub const HijackRunFn = *const fn (
+    ctx: *anyopaque,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    fd: i32,
+    data: []const u8,
+) void;
+
+pub const Hijack = struct {
+    ctx: *anyopaque,
+    run: HijackRunFn,
+};
+
+/// What dispatch decided for one complete request.
+pub const DispatchResult = union(enum) {
+    /// Serialize + write through the loop (fast H1 path).
+    respond: HttpResponse,
+    /// Static-dir fallback: short-lived blocking file serve.
+    hijack_static: Hijack,
+    /// SSE stream: long-lived, dedicated thread per conn.
+    hijack_sse: Hijack,
+    /// WebSocket session: long-lived, dedicated thread per conn.
+    hijack_ws: Hijack,
+};
 
 /// Per-connection state.
 pub const ConnState = enum {
@@ -114,6 +158,9 @@ pub const Conn = struct {
     /// clears it. Idle timeout still applies (a stuck worker can't pin
     /// the conn; its late completion is then dropped).
     pending: bool = false,
+    /// H2C sniff done: the conn is confirmed HTTP/1.1. Fresh conns with
+    /// `h2c_enabled` are sniffed for the H2 preface before framing.
+    h1_confirmed: bool = false,
     /// Set when EOF/error seen; reactor closes after flushing (never here —
     /// v1 always closes immediately since responses are small).
     closed: bool = false,
@@ -139,6 +186,11 @@ pub const Stats = struct {
     inline_fallback: u64 = 0,
     /// Completions dropped (conn gone, or push OOM).
     completion_dropped: u64 = 0,
+    /// Conns handed off to worker threads (static/SSE/WS/H2/TLS).
+    /// The loop forgets the fd (no close); the worker serves + closes.
+    hijacked: u64 = 0,
+    /// Static jobs dropped (static pool full at handoff).
+    static_dropped: u64 = 0,
 
     /// Field-wise sum (multi-loop aggregation into `el_stats`).
     pub fn combine(self: Stats, other: Stats) Stats {
@@ -154,16 +206,34 @@ pub const Stats = struct {
             .offloaded = self.offloaded + other.offloaded,
             .inline_fallback = self.inline_fallback + other.inline_fallback,
             .completion_dropped = self.completion_dropped + other.completion_dropped,
+            .hijacked = self.hijacked + other.hijacked,
+            .static_dropped = self.static_dropped + other.static_dropped,
         };
     }
 };
 
 /// A finished offload job, owned by the loop thread from push to consume.
-/// `body` is the fully serialized HTTP response (loop allocator).
+/// Either a serialized response (`body != null`, `hijacked == false`) or
+/// a hijack handoff (`hijacked == true`, `body == null` — the worker owns
+/// the fd now; the loop just forgets the conn without closing).
 pub const Completion = struct {
     conn_id: u64,
-    body: []u8,
-    keep_alive: bool,
+    body: ?[]u8 = null,
+    keep_alive: bool = false,
+    hijacked: bool = false,
+};
+
+/// Heap args for one hijacked connection's worker thread (loop allocator;
+/// freed by the thread itself — see `serveThreadMain`). Covers static
+/// pool jobs, SSE/WS/H2 dedicated threads, and TLS accept threads
+/// (`req_bytes` is null for TLS: nothing was read before the handshake).
+const ServeArgs = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    run: HijackRunFn,
+    ctx: *anyopaque,
+    fd: i32,
+    req_bytes: ?[]u8,
 };
 
 /// Heap ctx for one offloaded request (loop allocator; freed by the worker
@@ -247,6 +317,12 @@ pub const EventLoop = struct {
     /// Pool for `worker_pool` mode. Value-embedded (not pointer): assigned
     /// BEFORE `start()` so worker threads never see a moved struct.
     pool: ?worker_pool_mod.WorkerPool = null,
+    /// Small pool for static-dir hijacks (short-lived blocking file
+    /// serves). Lazy: created on first hijack, loop-thread-only in
+    /// `.direct` mode; in `worker_pool` mode offload workers also submit
+    /// here, guarded by `static_lock`.
+    static_pool: ?worker_pool_mod.WorkerPool = null,
+    static_lock: std.atomic.Mutex = .unlocked,
     /// Completed offloads waiting for the loop thread (worker-pushed).
     completions: std.ArrayList(Completion) = .empty,
     compl_lock: std.atomic.Mutex = .unlocked,
@@ -266,6 +342,11 @@ pub const EventLoop = struct {
             p.stop();
             p.deinit();
             self.pool = null;
+        }
+        if (self.static_pool) |*p| {
+            p.stop();
+            p.deinit();
+            self.static_pool = null;
         }
         // Free any completions nobody claimed (conn closed while its job
         // was in flight, or jobs that finished during shutdown).
@@ -294,7 +375,9 @@ pub const EventLoop = struct {
         // std.atomic.Mutex is a spinlock (tryLock/unlock only).
         while (!self.compl_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.compl_lock.unlock();
-        for (self.completions.items) |cm| self.alloc.free(cm.body);
+        for (self.completions.items) |cm| {
+            if (cm.body) |b| self.alloc.free(b);
+        }
         self.completions.clearRetainingCapacity();
         self.stats.completion_dropped += self.compl_dropped;
         self.compl_dropped = 0;
@@ -309,6 +392,19 @@ pub const EventLoop = struct {
         closeFd(c.fd);
         c.deinit(self.alloc);
         if (reason == .idle) self.stats.closed_idle += 1 else self.stats.closed_error += 1;
+    }
+
+    /// Forget a hijacked conn WITHOUT closing: a worker thread owns the fd
+    /// from here (serves + closes). Loop-thread-only (like `removeAt`).
+    fn forgetConn(self: *EventLoop, idx: usize) void {
+        var c = self.conns.orderedRemove(idx);
+        c.deinit(self.alloc);
+        self.stats.hijacked += 1;
+    }
+
+    /// Free a hijack data copy (loop allocator) on a failed handoff.
+    fn freeHijackData(self: *EventLoop, data: ?[]u8) void {
+        if (data) |b| self.alloc.free(b);
     }
 
     /// Run until `requestShutdown` (or listener closed). Listener must
@@ -352,9 +448,17 @@ pub const EventLoop = struct {
             }
             try self.pool.?.start();
         }
-        // Teardown: stop pool first (drains queued jobs; every accepted
+        // Teardown: stop pools first (drains queued jobs; every accepted
         // job ran exactly once), then free unclaimed completions, then
-        // close the wake channel. Conns close in `deinit`.
+        // close the wake channel. Conns close in `deinit`. Static pool
+        // stops after the dispatch pool so in-flight offloads that submit
+        // static jobs are already joined. (Separate defers: the static
+        // pool exists in `.direct` mode too, where `self.pool` is null.)
+        defer if (self.static_pool) |*sp| {
+            sp.stop();
+            sp.deinit();
+            self.static_pool = null;
+        };
         defer if (self.pool) |*p| {
             p.stop();
             p.deinit();
@@ -394,7 +498,13 @@ pub const EventLoop = struct {
             _ = ready;
 
             // 1. listener first (accept drain, cap 64/tick)
-            if ((pollfds_buf[0].revents & nb.POLL.IN) != 0) self.acceptDrain();
+            if ((pollfds_buf[0].revents & nb.POLL.IN) != 0) {
+                const before = self.conns.items.len;
+                self.acceptDrain();
+                // TLS mode: the loop never reads encrypted bytes — every
+                // fresh conn hijacks to a TLS worker at accept time.
+                if (self.cfg.tls_enabled) self.hijackNewConns(before);
+            }
             if (nb.isErrorHungup(pollfds_buf[0].revents)) {
                 // Listener died — stop the loop; caller owns shutdown.
                 break;
@@ -463,6 +573,9 @@ pub const EventLoop = struct {
                 closeFd(fd);
                 continue;
             };
+            // Same TCP tuning the old threaded accept path applied
+            // (keepalive + NODELAY); best-effort.
+            nb.applyTcpTuning(fd);
             const now = nowMs(self.io);
             const id = self.next_conn_id;
             self.next_conn_id += 1;
@@ -536,6 +649,19 @@ pub const EventLoop = struct {
             var c = &self.conns.items[idx];
             // One in-flight offload at a time: buffer, don't reorder.
             if (c.pending) return;
+            // H2C sniff runs BEFORE H1 framing: the 24-byte preface
+            // contains the CRLFCRLF the H1 reader stops at, so parsing H1
+            // first would eat the preface. Mirrors the threaded path's
+            // ConnectionReader sniff (same classifier).
+            if (self.cfg.h2c_enabled and !c.h1_confirmed) {
+                switch (connection_reader.sniff(c.read_buf.items)) {
+                    .h2 => return self.hijackH2(idx),
+                    .maybe_h2 => return, // proper prefix, need more bytes
+                    .h1 => c.h1_confirmed = true,
+                }
+                if (idx >= self.conns.items.len) return null;
+                c = &self.conns.items[idx];
+            }
             const req_len = extractRequestLen(c.read_buf.items, self.cfg.max_request_bytes) catch |err| {
                 if (err == error.RequestTooLarge) {
                     self.sendErrorAndClose(idx, 413, "Content Too Large");
@@ -559,6 +685,42 @@ pub const EventLoop = struct {
         }
     }
 
+    /// Hand buffered H2 preface+frames to a dedicated H2 driver thread.
+    /// Loop-thread-only (sniff runs pre-dispatch, so no offload involved).
+    /// Returns null always (conn is gone either way).
+    fn hijackH2(self: *EventLoop, idx: usize) ?void {
+        const c = &self.conns.items[idx];
+        const data = self.alloc.dupe(u8, c.read_buf.items) catch {
+            return self.sendErrorAndClose(idx, 500, "Internal Server Error");
+        };
+        // H2 runner ctx is the server (same pointer dispatch gets).
+        const h = Hijack{ .ctx = self.on_request_ctx.?, .run = h2HijackRun };
+        if (!self.spawnServeThread(h, c.fd, data)) {
+            self.alloc.free(data);
+            return self.removeAt(idx, .err);
+        }
+        self.forgetConn(idx);
+        return null;
+    }
+
+    /// Placeholder H2 runner — replaced by http_server's real runner via
+    /// `setH2HijackRun` when `h2c_enabled` can trigger. (The loop must not
+    /// import the H2 driver: cycle.)
+    var h2_hijack_run: ?HijackRunFn = null;
+
+    /// Called by `listenEventLoop` when H2C sniffing is enabled.
+    pub fn setH2HijackRun(hook: HijackRunFn) void {
+        h2_hijack_run = hook;
+    }
+
+    fn h2HijackRun(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: i32, data: []const u8) void {
+        if (h2_hijack_run) |hook| {
+            hook(ctx, alloc, io, fd, data);
+        } else {
+            nb.closeSocket(fd);
+        }
+    }
+
     /// Drop the first `len` bytes of the conn's read buffer (a request the
     /// caller has taken ownership of — inline serialize or offload copy).
     fn consumeReadBytes(self: *EventLoop, idx: usize, len: usize) void {
@@ -568,6 +730,156 @@ pub const EventLoop = struct {
             std.mem.copyForwards(u8, c.read_buf.items[0..remaining], c.read_buf.items[len..]);
         }
         c.read_buf.shrinkRetainingCapacity(remaining);
+    }
+
+    /// Dedicated-thread entry point for one hijacked conn (SSE/WS/H2/TLS).
+    /// Runs `run` (blocking serve + close), then frees the data copy and
+    /// the args. Runners must NOT free `req_bytes` themselves.
+    fn serveThreadMain(raw: *anyopaque) void {
+        const args: *ServeArgs = @ptrCast(@alignCast(raw));
+        args.run(args.ctx, args.alloc, args.io, args.fd, args.req_bytes orelse &[_]u8{});
+        if (args.req_bytes) |b| args.alloc.free(b);
+        args.alloc.destroy(args);
+    }
+
+    /// Spawn a detached worker thread for a hijacked conn. Returns true
+    /// when spawned (caller must forget the conn WITHOUT closing — the
+    /// thread owns the fd now). Returns false on spawn failure (caller
+    /// keeps ownership: free the data copy, close via `removeAt`).
+    fn spawnServeThread(self: *EventLoop, h: Hijack, fd: i32, req_bytes: ?[]u8) bool {
+        const args = self.alloc.create(ServeArgs) catch return false;
+        args.* = .{
+            .alloc = self.alloc,
+            .io = self.io,
+            .run = h.run,
+            .ctx = h.ctx,
+            .fd = fd,
+            .req_bytes = req_bytes,
+        };
+        const t = std.Thread.spawn(.{}, serveThreadMain, .{args}) catch {
+            self.alloc.destroy(args);
+            return false;
+        };
+        t.detach();
+        return true;
+    }
+
+    /// Static pool, created on first hijack. `hijackToStaticPool` runs on
+    /// the loop thread; offload workers take `static_lock` around
+    /// get-or-create + submit (see `offloadRun`).
+    fn getStaticPool(self: *EventLoop) !*worker_pool_mod.WorkerPool {
+        if (self.static_pool == null) {
+            self.static_pool = try worker_pool_mod.WorkerPool.init(self.alloc, self.io, .{
+                .thread_count = 4,
+                .queue_depth = 64,
+            });
+            errdefer {
+                self.static_pool.?.deinit();
+                self.static_pool = null;
+            }
+            try self.static_pool.?.start();
+        }
+        return &self.static_pool.?;
+    }
+
+    /// Static pool entry point (pool-job wrapper around the hijack runner).
+    /// Frees the data copy + job here — runners must NOT free `data`.
+    fn staticPoolRun(raw: *anyopaque) void {
+        const args: *ServeArgs = @ptrCast(@alignCast(raw));
+        args.run(args.ctx, args.alloc, args.io, args.fd, args.req_bytes orelse &[_]u8{});
+        if (args.req_bytes) |b| args.alloc.free(b);
+        args.alloc.destroy(args);
+    }
+
+    /// Hand a static-dir request to the static pool (short-lived blocking
+    /// file serve). Loop-thread-only. The pool owns fd + data after a
+    /// successful submit (conn forgotten, no close); every failure path
+    /// frees explicitly and closes via `sendErrorAndClose`/`removeAt`
+    /// (these return null, not errors, so no errdefer — it would never fire).
+    /// Returns null when conn is gone.
+    fn hijackToStaticPool(self: *EventLoop, idx: usize, len: usize, h: Hijack) ?void {
+        const c = &self.conns.items[idx];
+        const data = self.alloc.dupe(u8, c.read_buf.items[0..len]) catch {
+            return self.sendErrorAndClose(idx, 500, "Internal Server Error");
+        };
+        const args = self.alloc.create(ServeArgs) catch {
+            self.alloc.free(data);
+            return self.sendErrorAndClose(idx, 500, "Internal Server Error");
+        };
+        args.* = .{
+            .alloc = self.alloc,
+            .io = self.io,
+            .run = h.run,
+            .ctx = h.ctx,
+            .fd = c.fd,
+            .req_bytes = data,
+        };
+        const pool = self.getStaticPool() catch {
+            self.alloc.destroy(args);
+            self.alloc.free(data);
+            return self.sendErrorAndClose(idx, 500, "Internal Server Error");
+        };
+        pool.submit(.{ .run = staticPoolRun, .ctx = @ptrCast(args) }) catch {
+            self.alloc.destroy(args);
+            self.alloc.free(data);
+            self.stats.static_dropped += 1;
+            return self.sendErrorAndClose(idx, 503, "Service Unavailable");
+        };
+        // Submitted: the pool owns fd + data; forget without closing.
+        // (No consume needed — the whole conn leaves with the worker.)
+        self.forgetConn(idx);
+    }
+
+    /// Hand an H1 request to a dedicated thread (SSE/WS: long-lived).
+    /// Dupes read_buf[0..len]; on spawn failure closes via `removeAt`.
+    /// Returns null when conn is gone.
+    fn hijackToThread(self: *EventLoop, idx: usize, len: usize, h: Hijack) ?void {
+        const c = &self.conns.items[idx];
+        const data = self.alloc.dupe(u8, c.read_buf.items[0..len]) catch {
+            return self.sendErrorAndClose(idx, 500, "Internal Server Error");
+        };
+        if (!self.spawnServeThread(h, c.fd, data)) {
+            self.alloc.free(data);
+            return self.removeAt(idx, .err);
+        }
+        self.forgetConn(idx);
+    }
+
+    /// Hijack freshly-accepted conns to TLS workers (TLS mode: the loop
+    /// never reads encrypted bytes). Indices [from..len) are the new ones;
+    /// iterate backwards so `forgetConn`/`removeAt` stay index-safe.
+    fn hijackNewConns(self: *EventLoop, from: usize) void {
+        var i: usize = self.conns.items.len;
+        while (i > from) {
+            i -= 1;
+            const c = &self.conns.items[i];
+            // TLS runner ctx is the server (same pointer dispatch gets).
+            const h = Hijack{ .ctx = self.on_request_ctx.?, .run = tlsHijackRun };
+            if (!self.spawnServeThread(h, c.fd, null)) {
+                self.removeAt(i, .err);
+                continue;
+            }
+            self.forgetConn(i);
+        }
+    }
+
+    /// Placeholder runner for TLS hijacks — replaced by http_server's
+    /// real runner via `setTlsHijackRun` before `run()` in TLS mode.
+    /// (The loop must not import the TLS module: cycle.)
+    var tls_hijack_run: ?HijackRunFn = null;
+
+    /// Called by `listenEventLoop` when `tls_ctx` is set.
+    pub fn setTlsHijackRun(hook: HijackRunFn) void {
+        tls_hijack_run = hook;
+    }
+
+    fn tlsHijackRun(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: i32, data: []const u8) void {
+        _ = data;
+        if (tls_hijack_run) |hook| {
+            hook(ctx, alloc, io, fd, &[_]u8{});
+        } else {
+            nb.closeSocket(fd);
+        }
     }
 
     /// Hand one complete request to the pool. Bytes are consumed from the
@@ -635,46 +947,53 @@ pub const EventLoop = struct {
             self.sendErrorAndClose(idx, 500, "No Handler");
             return null;
         };
-        var resp = on_req(self.on_request_ctx.?, arena_alloc, &req, http_ctx) catch {
+        const result = on_req(self.on_request_ctx.?, arena_alloc, req_bytes, &req, http_ctx) catch {
             self.sendErrorAndClose(idx, 500, "Internal Server Error");
             self.stats.err_500 += 1;
             return null;
         };
-        // Keep-alive decision mirrors threaded path: response flag AND count.
-        const want_keep = resp.keep_alive and
-            (c.keep_alive_count + 1 < self.cfg.max_requests_per_conn);
-        resp.keep_alive = want_keep;
+        switch (result) {
+            .respond => |r| {
+                var rr = r;
+                // Keep-alive decision mirrors threaded path: response flag AND count.
+                const want_keep = rr.keep_alive and
+                    (c.keep_alive_count + 1 < self.cfg.max_requests_per_conn);
+                rr.keep_alive = want_keep;
 
-        const bytes = resp.toBytes() catch {
-            self.sendErrorAndClose(idx, 500, "Internal Server Error");
-            self.stats.err_500 += 1;
-            return null;
-        };
-        defer arena_alloc.free(bytes);
+                const bytes = rr.toBytes() catch {
+                    self.sendErrorAndClose(idx, 500, "Internal Server Error");
+                    self.stats.err_500 += 1;
+                    return null;
+                };
+                defer arena_alloc.free(bytes);
 
-        // Consume request bytes BEFORE append (realloc may move buffer).
-        // Copy response into outbox first, then drain read_buf.
-        c.write_buf.clearRetainingCapacity();
-        c.write_buf.appendSlice(self.alloc, bytes) catch {
-            self.removeAt(idx, .err);
-            return null;
-        };
-        c.write_off = 0;
-        // Drain consumed request bytes.
-        const remaining = c.read_buf.items.len - len;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, c.read_buf.items[0..remaining], c.read_buf.items[len..]);
+                // Consume request bytes BEFORE append (realloc may move buffer).
+                // Copy response into outbox first, then drain read_buf.
+                c.write_buf.clearRetainingCapacity();
+                c.write_buf.appendSlice(self.alloc, bytes) catch {
+                    self.removeAt(idx, .err);
+                    return null;
+                };
+                c.write_off = 0;
+                // Drain consumed request bytes.
+                const remaining = c.read_buf.items.len - len;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, c.read_buf.items[0..remaining], c.read_buf.items[len..]);
+                }
+                c.read_buf.shrinkRetainingCapacity(remaining);
+                c.keep_alive_count += 1;
+                c.req_start_ms = 0;
+                c.last_active_ms = nowMs(self.io);
+                c.state = .writing;
+                c.keep_alive_next = want_keep;
+                self.stats.served += 1;
+
+                // Optimistic flush: small responses usually fit in one send.
+                self.flushWrites(idx) orelse return null;
+            },
+            .hijack_static => |h| return self.hijackToStaticPool(idx, len, h),
+            .hijack_sse, .hijack_ws => |h| return self.hijackToThread(idx, len, h),
         }
-        c.read_buf.shrinkRetainingCapacity(remaining);
-        c.keep_alive_count += 1;
-        c.req_start_ms = 0;
-        c.last_active_ms = nowMs(self.io);
-        c.state = .writing;
-        c.keep_alive_next = want_keep;
-        self.stats.served += 1;
-
-        // Optimistic flush: small responses usually fit in one send.
-        self.flushWrites(idx) orelse return null;
     }
 
     /// Pool-worker entry point: parse + dispatch + serialize off the loop
@@ -688,8 +1007,12 @@ pub const EventLoop = struct {
     fn offloadRun(raw: *anyopaque) void {
         const job: *OffloadJob = @ptrCast(@alignCast(raw));
         const loop = job.loop;
-        defer loop.alloc.destroy(job);
-        defer loop.alloc.free(job.req_bytes);
+        // Ownership-transferable: hijack arms null these out when the
+        // request bytes move to a static job / serve thread.
+        var job_opt: ?*OffloadJob = job;
+        defer if (job_opt) |j| loop.alloc.destroy(j);
+        var req_opt: ?[]u8 = job.req_bytes;
+        defer if (req_opt) |b| loop.alloc.free(b);
 
         var arena = std.heap.ArenaAllocator.init(loop.alloc);
         defer arena.deinit();
@@ -705,29 +1028,108 @@ pub const EventLoop = struct {
             pushErrorCompletion(loop, job.conn_id, 500, "No Handler");
             return;
         };
-        var resp = on_req(loop.on_request_ctx.?, aa, &req, hctx) catch {
+        const result = on_req(loop.on_request_ctx.?, aa, job.req_bytes, &req, hctx) catch {
             pushErrorCompletion(loop, job.conn_id, 500, "Internal Server Error");
             return;
         };
-        const want_keep = resp.keep_alive and
-            (job.ka_count + 1 < loop.cfg.max_requests_per_conn);
-        resp.keep_alive = want_keep;
-        const bytes = resp.toBytes() catch {
-            pushErrorCompletion(loop, job.conn_id, 500, "Internal Server Error");
-            return;
-        };
-        defer aa.free(bytes);
-        const owned = loop.alloc.dupe(u8, bytes) catch {
-            // Serialized fine but the handoff copy failed: send a 500.
-            // (The arena copy dies with us; the conn gets a clean close.)
-            pushErrorCompletion(loop, job.conn_id, 500, "Internal Server Error");
-            return;
-        };
-        pushCompletion(loop, .{
-            .conn_id = job.conn_id,
-            .body = owned,
-            .keep_alive = want_keep,
-        });
+        switch (result) {
+            .respond => |r| {
+                var rr = r;
+                const want_keep = rr.keep_alive and
+                    (job.ka_count + 1 < loop.cfg.max_requests_per_conn);
+                rr.keep_alive = want_keep;
+                const bytes = rr.toBytes() catch {
+                    pushErrorCompletion(loop, job.conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                defer aa.free(bytes);
+                const owned = loop.alloc.dupe(u8, bytes) catch {
+                    // Serialized fine but the handoff copy failed: send a 500.
+                    // (The arena copy dies with us; the conn gets a clean close.)
+                    pushErrorCompletion(loop, job.conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                pushCompletion(loop, .{
+                    .conn_id = job.conn_id,
+                    .body = owned,
+                    .keep_alive = want_keep,
+                });
+            },
+            .hijack_static => |h| {
+                // Short-lived: transfer the request copy to a static-pool
+                // job (pool shared with the loop thread — take the lock
+                // for get-or-create + submit). Then push a forget
+                // completion so the loop drops the conn WITHOUT closing
+                // (the static job owns the fd now).
+                //
+                // Race note: if the loop already closed this conn (idle
+                // timeout), the completion drops as stale but the static
+                // job still runs against a possibly-reused fd number. The
+                // window needs a >idle-timeout stall between submit and
+                // run (default 60s vs ms in practice); the runner treats
+                // any write error as drop. Same class as the threaded
+                // path's shutdown races.
+                const conn_id = job.conn_id;
+                const args = loop.alloc.create(ServeArgs) catch {
+                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                args.* = .{
+                    .alloc = loop.alloc,
+                    .io = loop.io,
+                    .run = h.run,
+                    .ctx = h.ctx,
+                    .fd = job.client_fd,
+                    .req_bytes = req_opt,
+                };
+                while (!loop.static_lock.tryLock()) std.atomic.spinLoopHint();
+                const pool = loop.getStaticPool() catch {
+                    loop.static_lock.unlock();
+                    loop.alloc.destroy(args);
+                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                pool.submit(.{ .run = staticPoolRun, .ctx = @ptrCast(args) }) catch {
+                    loop.static_lock.unlock();
+                    loop.alloc.destroy(args);
+                    pushErrorCompletion(loop, conn_id, 503, "Service Unavailable");
+                    return;
+                };
+                loop.static_lock.unlock();
+                // Transferred: static job owns args + req bytes; destroy
+                // the offload job explicitly (job_opt nulled to skip it).
+                req_opt = null;
+                job_opt = null;
+                loop.alloc.destroy(job);
+                pushCompletion(loop, .{ .conn_id = conn_id, .hijacked = true });
+            },
+            .hijack_sse, .hijack_ws => |h| {
+                // Long-lived: dedicated thread takes fd + request copy.
+                const conn_id = job.conn_id;
+                const args = loop.alloc.create(ServeArgs) catch {
+                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                args.* = .{
+                    .alloc = loop.alloc,
+                    .io = loop.io,
+                    .run = h.run,
+                    .ctx = h.ctx,
+                    .fd = job.client_fd,
+                    .req_bytes = req_opt,
+                };
+                const t = std.Thread.spawn(.{}, serveThreadMain, .{args}) catch {
+                    loop.alloc.destroy(args);
+                    pushErrorCompletion(loop, conn_id, 500, "Internal Server Error");
+                    return;
+                };
+                t.detach();
+                req_opt = null;
+                loop.alloc.destroy(job);
+                job_opt = null;
+                pushCompletion(loop, .{ .conn_id = conn_id, .hijacked = true });
+            },
+        }
     }
 
     /// Worker → loop handoff. Appends under spinlock, then wakes the loop
@@ -745,7 +1147,7 @@ pub const EventLoop = struct {
         };
         loop.compl_lock.unlock();
         if (!ok) {
-            loop.alloc.free(cm.body);
+            if (cm.body) |b| loop.alloc.free(b);
             return;
         }
         // Best-effort wake: a full socketpair buffer still leaves earlier
@@ -802,7 +1204,7 @@ pub const EventLoop = struct {
 
         for (ready.items) |cm| {
             const idx = self.findConn(cm.conn_id) orelse {
-                self.alloc.free(cm.body);
+                if (cm.body) |b| self.alloc.free(b);
                 self.stats.completion_dropped += 1;
                 continue;
             };
@@ -811,17 +1213,28 @@ pub const EventLoop = struct {
                 // Stale (conn reused the slot? No — ids are unique per
                 // accept, so this means the conn already got another
                 // completion... impossible with one-in-flight. Defensive.)
-                self.alloc.free(cm.body);
+                if (cm.body) |b| self.alloc.free(b);
                 self.stats.completion_dropped += 1;
                 continue;
             }
-            c.write_buf.clearRetainingCapacity();
-            c.write_buf.appendSlice(self.alloc, cm.body) catch {
-                self.alloc.free(cm.body);
+            if (cm.hijacked) {
+                // Worker owns the fd now (static/SSE/WS handoff): forget
+                // WITHOUT closing. (Stale-guard above already handled a
+                // conn that timed out first.)
+                self.forgetConn(idx);
+                continue;
+            }
+            const body = cm.body orelse {
                 self.removeAt(idx, .err);
                 continue;
             };
-            self.alloc.free(cm.body);
+            c.write_buf.clearRetainingCapacity();
+            c.write_buf.appendSlice(self.alloc, body) catch {
+                self.alloc.free(body);
+                self.removeAt(idx, .err);
+                continue;
+            };
+            self.alloc.free(body);
             c.write_off = 0;
             c.keep_alive_next = cm.keep_alive;
             c.keep_alive_count += 1;

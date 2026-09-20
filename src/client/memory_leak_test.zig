@@ -103,7 +103,7 @@ const StreamLeakServer = struct {
 };
 
 fn listenFn(server: *gserverz.GinwaServer) void {
-    server.listen() catch {};
+    server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
 /// Emit 20 NDJSON lines (each `"id":<n>\n`). StreamScanner-friendly.

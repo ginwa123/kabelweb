@@ -84,7 +84,7 @@ const TestServer = struct {
 };
 
 fn listenFn(server: *gserverz.GinwaServer) void {
-    server.listen() catch {};
+    server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
 // ----- Route handlers -----

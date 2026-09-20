@@ -66,6 +66,7 @@ const winsock = if (is_windows) struct {
     extern "ws2_32" fn getsockname(sockfd: c_int, addr: [*]u8, addrlen: [*]c_int) callconv(.c) c_int;
     extern "ws2_32" fn recv(sockfd: c_int, buf: ?*anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
     extern "ws2_32" fn send(sockfd: c_int, buf: ?*const anyopaque, len: c_int, flags: c_int) callconv(.c) c_int;
+    extern "ws2_32" fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.c) c_int;
     extern "ws2_32" fn WSAPoll(fdarray: [*]WSAPOLLFD, nfds: c_ulong, timeout: c_int) callconv(.c) c_int;
 
     const WSADATA = [400]u8;
@@ -147,6 +148,72 @@ pub fn setNonBlocking(fd: i32) !void {
     const flags = c.fcntl(fd, F_GETFL);
     if (flags < 0) return error.FcntlFailed;
     if (c.fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlFailed;
+}
+
+/// Restore blocking mode (clear O_NONBLOCK).
+///
+/// Used by hijack runners: the loop hands them a non-blocking fd, but the
+/// blocking managers (SSE/WS/H2/static/TLS serving) need blocking I/O.
+/// Best-effort errors: callers close the fd and drop on failure.
+pub fn setBlocking(fd: i32) !void {
+    if (comptime is_windows) {
+        ensureWsa();
+        var mode: c_ulong = 0;
+        if (winsock.ioctlsocket(fd, winsock.FIONBIO, &mode) != 0)
+            return error.FcntlFailed;
+        return;
+    }
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    // Inverse of setNonBlocking: keep every flag except O_NONBLOCK.
+    // O_NONBLOCK is 0o4000 on Linux, 0x0004 on macOS/BSD (see above).
+    if (comptime builtin.os.tag == .linux) {
+        const O_NONBLOCK: usize = 0o4000;
+        const getfl_rc = std.os.linux.fcntl(fd, F_GETFL, 0);
+        if (std.os.linux.errno(getfl_rc) != .SUCCESS) return error.FcntlFailed;
+        const flags: usize = @intCast(getfl_rc);
+        const setfl_rc = std.os.linux.fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        if (std.os.linux.errno(setfl_rc) != .SUCCESS) return error.FcntlFailed;
+        return;
+    }
+    const O_NONBLOCK: i32 = 0x0004;
+    const c = std.c;
+    const flags = c.fcntl(fd, F_GETFL);
+    if (flags < 0) return error.FcntlFailed;
+    if (c.fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) return error.FcntlFailed;
+}
+
+/// TCP tuning for freshly-accepted client sockets: keepalive (10s idle,
+/// 5s interval, 3 probes → ~25s dead-conn detection) + TCP_NODELAY.
+///
+/// Moved here from `GinwaServer.acceptClient` when the threaded `listen()`
+/// was deleted — the loop's `acceptDrain` is now the only accept path.
+/// Best-effort: failures are ignored (application heartbeats still work).
+pub fn applyTcpTuning(fd: i32) void {
+    const on: c_int = 1;
+    const keepidle: c_int = 10;
+    const keepintvl: c_int = 5;
+    const keepcnt: c_int = 3;
+    if (comptime is_windows) {
+        ensureWsa();
+        _ = winsock.setsockopt(fd, 0xffff, 8, &on, @sizeOf(c_int));
+        _ = winsock.setsockopt(fd, 6, 3, &keepidle, @sizeOf(c_int));
+        _ = winsock.setsockopt(fd, 6, 17, &keepintvl, @sizeOf(c_int));
+        _ = winsock.setsockopt(fd, 6, 16, &keepcnt, @sizeOf(c_int));
+        return;
+    }
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
+    // `TCP.KEEPIDLE` is Linux-only; on macOS the KEEPALIVE option doubles
+    // as the idle timer. Gate on the DECL (not os.tag): the cross-compile
+    // build graph compiles this file for several targets at once.
+    if (@hasDecl(std.c.TCP, "KEEPIDLE")) {
+        posix.setsockopt(fd, posix.IPPROTO.TCP, std.c.TCP.KEEPIDLE, std.mem.asBytes(&keepidle)) catch {};
+    }
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&keepintvl)) catch {};
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&keepcnt)) catch {};
+    // Disable Nagle: small JSON responses would otherwise wait ~40ms for
+    // ACK coalescing on keep-alive connections.
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
 }
 
 /// Close a socket fd. `closesocket` on Windows, `close(2)` elsewhere

@@ -607,7 +607,7 @@ fn wsEchoHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, server_pt
 //   - The callback itself is trivial (a log line) so the demo is easy to
 //     read end-to-end without domain-specific noise.
 //
-// The cronjob manager is started automatically by `gs.listen()` — see the
+// The cronjob manager is started automatically by `gs.listenEventLoop()` — see the
 // "Cronjob manager running (1s tick)" log line below.
 // ============================================================================
 
@@ -878,13 +878,11 @@ pub fn run(init: std.process.Init) !void {
     std.debug.print("WebSocket listening on ws://127.0.0.1:29590/ws\n", .{});
 
     // Serve-path flags (bench harness `scripts/bench-event-loop.sh` uses
-    // these; default = threaded `listen()`):
-    //   --event-loop   plain HTTP/1.1 via the single poll reactor
-    //   --pool         dispatch via worker pool (implies --event-loop)
-    //   --loops N      N REUSEPORT loops (implies --event-loop)
-    // NOTE: SSE/WS routes answer 501 on the event-loop paths (documented
-    // v1 scope) — bench against /health and /hello/:name.
-    var use_event_loop = false;
+    // these). The reactor is the only serve path now; --event-loop is
+    // accepted for compatibility and implies the default single loop.
+    //   --event-loop   (default single poll reactor; no-op flag)
+    //   --pool         dispatch via worker pool
+    //   --loops N      N REUSEPORT loops
     var use_pool = false;
     var loop_count: usize = 0;
     // `initAllocator` (not `init`): the plain iterator is a compileError
@@ -894,22 +892,18 @@ pub fn run(init: std.process.Init) !void {
     _ = arg_it.skip(); // argv[0]
     while (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--event-loop")) {
-            use_event_loop = true;
+            // No-op: the event loop is the only serve path.
         } else if (std.mem.eql(u8, arg, "--pool")) {
-            use_event_loop = true;
             use_pool = true;
         } else if (std.mem.eql(u8, arg, "--loops")) {
-            use_event_loop = true;
             const n_str = arg_it.next() orelse continue;
             loop_count = std.fmt.parseInt(usize, n_str, 10) catch 0;
         }
     }
     const dispatch_mode = if (use_pool) gserverz.EventLoopConfig{ .dispatch_mode = .worker_pool } else gserverz.EventLoopConfig{};
-    if (!use_event_loop) {
-        try gs.listen();
-        return;
-    }
-    // One entry point: loop_count 0/1 = single loop, N = N REUSEPORT loops.
+    // One serve path: the event-loop reactor. loop_count 0/1 = single
+    // loop, N = N REUSEPORT loops. (The old threaded listen() was deleted;
+    // SSE/WS/static/H2/TLS all work on the loop via fd handoff.)
     var lcfg = dispatch_mode;
     lcfg.loop_count = loop_count;
     if (loop_count > 1) {

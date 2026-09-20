@@ -449,9 +449,6 @@ pub const GinwaServer = struct {
     /// with the handler via `setStaticDirHandler`.
     static_dir_cfg: ?*const anyopaque = null,
 
-    max_worker_threads: usize,
-    worker_sem: std.Io.Semaphore,
-
     /// Last event-loop run's counters. Written by `listenEventLoop` on exit
     /// (summed across loops when `loop_count > 1`); untouched by the
     /// threaded `listen()`. Read after `shutdown`+join.
@@ -481,9 +478,6 @@ pub const GinwaServer = struct {
         const store = try gserverz_context.ContextStore.create(allocator);
         errdefer store.deinit();
 
-        const cpu_count = std.Thread.getCpuCount() catch 4;
-        const max_workers = cpu_count * 12; // starting point — tune against benchmark
-        //
         gs.* = .{
             .allocator = allocator,
             .io = io,
@@ -495,8 +489,6 @@ pub const GinwaServer = struct {
             .ctx = null,
             .environment = null,
             .context_store = store,
-            .max_worker_threads = max_workers,
-            .worker_sem = std.Io.Semaphore{ .permits = max_workers },
         };
         return gs;
     }
@@ -574,716 +566,33 @@ pub const GinwaServer = struct {
         allocator.destroy(self);
     }
 
-    pub fn listen(self: *GinwaServer) !void {
-        if (builtin.os.tag == .windows) {
-            const rc = winsock.listen(self.address.sock_fd, 1024);
-            if (rc != 0) return error.ListenFailed;
-        } else {
-            const rc = socket.listen(self.address.sock_fd, 1024);
-            if (rc < 0) return error.ListenFailed;
-        }
 
-        // Start the cronjob tick thread BEFORE accepting connections so
-        // scheduled jobs can begin firing immediately. A start failure
-        // is logged but does not abort listening — the manager is
-        // best-effort (callers can still drive jobs manually via `tick`).
-        if (self.cronjob_manager.start()) |_| {
-            std.debug.print("Cronjob manager running (1s tick)\n", .{});
-        } else |err| {
-            std.debug.print("HTTP_SERVER: cronjob manager start failed: {s}\n", .{@errorName(err)});
-        }
-
-        var group: std.Io.Group = .init;
-        errdefer group.cancel(self.io);
-
-        self.is_running = true;
-        while (self.is_running) {
-            _ = try self.worker_sem.wait(self.io);
-
-            const client_fd = self.acceptClient() catch {
-                self.worker_sem.post(self.io);
-                break;
-            };
-
-            // Blocks the accept loop (not already-served connections) once
-            // `max_concurrent_connections` are in flight. This is the
-            // backpressure point — excess connections queue in the kernel
-            // accept backlog instead of spawning unbounded threads.
-
-            const arena = self.allocator.create(std.heap.ArenaAllocator) catch {
-                self.worker_sem.post(self.io);
-                _ = closeFd(client_fd);
-                continue;
-            };
-            arena.* = std.heap.ArenaAllocator.init(self.allocator);
-
-            // Thread-per-connection task via `Group.concurrent` — NOT
-            // `Group.async`. Under `Io.Threaded`, `.async` carries no
-            // concurrency guarantee and may run the handler inline on the
-            // calling thread — which is the accept loop itself. That blocks
-            // the loop from returning to acceptClient() until the current
-            // connection's keep-alive loop finishes, which is what produced
-            // a stall when this was tried (verified live: /health never
-            // answered). `.concurrent` is the only primitive that
-            // guarantees dedicated execution, which is why the accept loop
-            // needs it despite the thread-growth cost — the semaphore above
-            // is what actually bounds that cost, not the choice of `.async`
-            // vs `.concurrent` itself.
-            group.concurrent(
-                self.io,
-                struct {
-                    fn handle(server: *GinwaServer, arena_allocator: *std.heap.ArenaAllocator, fd: SocketFd) void {
-                        defer {
-                            arena_allocator.deinit();
-                            server.allocator.destroy(arena_allocator);
-                            server.worker_sem.post(server.io); // release on every exit path
-                        }
-
-                        // FIX (arena growth on keep-alive connections):
-                        // `arena_allocator` (the connection arena) is now used
-                        // ONLY for state that must live for the whole
-                        // connection — currently just `cr` below. Anything
-                        // scoped to a single request/response is allocated
-                        // from `request_arena`, which is reset every
-                        // keep-alive iteration so a long-lived connection
-                        // doesn't accumulate hundreds of requests' worth of
-                        // headers/bodies/responses before it finally closes.
-                        const conn_allocator = arena_allocator.allocator();
-
-                        // ─── TLS handshake (when configured) ───────────────
-                        // Done inside the per-connection task so a slow or
-                        // malicious handshake cannot stall the accept loop.
-                        // `alpn_is_h2` is authoritative for the codec choice on
-                        // an encrypted connection: the client already told us
-                        // which protocol it will speak.
-                        var tls_conn: ?*tls_mod.Conn = null;
-                        defer if (tls_conn) |tc| tc.deinit();
-                        var stream: stream_mod.Stream = .{ .plain = fd };
-                        var alpn_is_h2 = false;
-                        if (server.tls_ctx) |ctx| {
-                            tls_conn = tls_mod.Conn.accept(ctx, fd) catch |err| {
-                                std.debug.print("HTTP_SERVER: TLS handshake failed: {s}\n", .{@errorName(err)});
-                                _ = closeFd(fd);
-                                return;
-                            };
-                            stream = .{ .tls = @ptrCast(tls_conn.?) };
-                            const negotiated = tls_conn.?.selectedAlpn();
-                            // Logged because ALPN is the whole dispatch decision on
-                            // an encrypted connection: an empty value here means the
-                            // client offered no ALPN and must be served HTTP/1.1.
-                            std.debug.print("HTTP_SERVER: TLS ok (alpn='{s}' len={d})\n", .{ negotiated, negotiated.len });
-                            alpn_is_h2 = std.mem.eql(u8, negotiated, tls_mod.alpn_h2);
-                        }
-                        // ─── TLS + ALPN "h2": go straight to the HTTP/2 driver ─
-                        if (alpn_is_h2) {
-                            // The preface is still on the wire; the driver consumes
-                            // it from the Stream itself (empty initial buffer).
-                            http2_server.serveConnection(server, stream, conn_allocator, "", .{}) catch |err| {
-                                std.debug.print("HTTP_SERVER: h2 (TLS) connection ended: {s}\n", .{@errorName(err)});
-                            };
-                            _ = closeFd(fd);
-                            return;
-                        }
-
-                        // ─── HTTP/2 (h2c) sniff ───────────────────────
-                        // Must run BEFORE the HTTP/1.1 reader: the 24-byte h2
-                        // preface contains the CRLFCRLF the h1 reader stops at
-                        // (byte 14), so parsing h1 first would consume the
-                        // preface AND the frames that arrived with it.
-                        //
-                        // NOTE: `cr` is intentionally allocated from
-                        // `conn_allocator` (connection-lifetime), not the
-                        // per-request arena below — `cr.deinit()` runs after
-                        // the keep-alive loop exits, so its internal state
-                        // must not be reset out from under it mid-loop.
-                        var cr = connection_reader.ConnectionReader.init(conn_allocator, stream);
-                        defer cr.deinit();
-                        if (server.enable_h2c) {
-                            _ = cr.fillOnce() catch |err| {
-                                std.debug.print("HTTP_SERVER: h2 sniff read failed: {s}\n", .{@errorName(err)});
-                                _ = closeFd(fd);
-                                return;
-                            };
-                            switch (connection_reader.sniff(cr.buffered())) {
-                                .h2 => {
-                                    const initial = cr.takeBuffered() catch |err| {
-                                        std.debug.print("HTTP_SERVER: h2 preface handoff failed: {s}\n", .{@errorName(err)});
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    http2_server.serveConnection(server, stream, conn_allocator, initial, .{}) catch |err| {
-                                        std.debug.print("HTTP_SERVER: h2 connection ended: {s}\n", .{@errorName(err)});
-                                    };
-                                    _ = closeFd(fd);
-                                    return;
-                                },
-                                .maybe_h2 => {
-                                    cr.fillAtLeast(constants_preface.preface_len, 8) catch {};
-                                    if (connection_reader.sniff(cr.buffered()) == .h2) {
-                                        const initial = cr.takeBuffered() catch |err| {
-                                            std.debug.print("HTTP_SERVER: h2 preface handoff failed: {s}\n", .{@errorName(err)});
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        http2_server.serveConnection(server, stream, conn_allocator, initial, .{}) catch |err| {
-                                            std.debug.print("HTTP_SERVER: h2 connection ended: {s}\n", .{@errorName(err)});
-                                        };
-                                        _ = closeFd(fd);
-                                        return;
-                                    }
-                                },
-                                .h1 => {},
-                            }
-                        }
-
-                        // FIX (arena growth on keep-alive connections):
-                        // Per-request arena, child of the connection's
-                        // allocator. Reset (not destroyed) at the top of
-                        // every keep-alive iteration so memory from request N
-                        // is released before request N+1 starts, instead of
-                        // accumulating for the life of the connection (up to
-                        // 1000 requests per the keep-alive cap below).
-                        // `.retain_capacity` keeps the backing pages mapped
-                        // across resets so we're not paying repeated
-                        // malloc/munmap cost per request.
-                        var request_arena = std.heap.ArenaAllocator.init(server.allocator);
-                        defer request_arena.deinit();
-
-                        // ─── HTTP/1.1 keep-alive loop ───────────────────
-                        var keep_alive_count: u32 = 0;
-                        keep_alive_loop: while (true) {
-                            keep_alive_count += 1;
-
-                            // FIX: release last request's allocations before
-                            // this one starts.
-                            _ = request_arena.reset(.retain_capacity);
-                            const allocator = request_arena.allocator();
-
-                            var rb = RequestBuffer.init(allocator);
-                            defer rb.deinit();
-
-                            // Hand the sniffed bytes to the HTTP/1.1 reader so the
-                            // pre-read is not lost (it is a no-op when the sniff is
-                            // disabled: `cr` then holds nothing). Only the first
-                            // iteration can hold buffered bytes (the h2-preface
-                            // sniff runs once per connection, before the loop).
-                            if (keep_alive_count == 1 and cr.buffered().len > 0) {
-                                rb.buf.appendSlice(allocator, cr.buffered()) catch {
-                                    _ = closeFd(fd);
-                                    return;
-                                };
-                                _ = cr.takeBuffered() catch {};
-                            }
-
-                            const request_data = rb.readFullRequestStream(stream) catch |err| {
-                                // Normal keep-alive teardown (client closed an
-                                // idle persistent connection) is silent; anything
-                                // else is logged. Either way the loop exits and
-                                // the fd is closed once, below.
-                                if (err != error.ConnectionClosed) {
-                                    std.debug.print("HTTP_SERVER: readFullRequest failed: {s}\n", .{@errorName(err)});
-                                }
-                                break :keep_alive_loop;
-                            };
-                            defer allocator.free(request_data);
-
-                            var req = http_parser.parseRequest(request_data, allocator, server.io, fd) catch |err| {
-                                std.debug.print("HTTP_SERVER: parseRequest failed: {s}\n", .{@errorName(err)});
-                                _ = closeFd(fd);
-                                return;
-                            };
-                            defer req.headers.deinit();
-
-                            const http_ctx = http_parser.HttpContext{
-                                .allocator = allocator,
-                                .io = server.io,
-                                // Handlers read the server's CORS allowlist from
-                                // here — no hardcoded hosts in handler code.
-                                .allowed_origins = server.cors.allowed_origins,
-                            };
-                            // Build the Session right after parsing. `incoming`
-                            // is populated from the Cookie header via
-                            // `contextFromRequest` so handlers can `session.getString`
-                            // without knowing about cookies, ContextStore, or
-                            // contextFromRequest. When the server has no
-                            // `context_store` wired, Session.context_store is
-                            // `null` and `session.set` returns
-                            // `error.NoContextStore` (handlers that need set
-                            // don't register against a no-store server).
-                            const lookup: context.LookupResult = if (server.context_store) |store|
-                                context.contextFromRequest(req, store)
-                            else
-                                .{ .context = null, .id = null };
-                            var session = http_parser.Session.init(
-                                server.context_store,
-                                lookup.context,
-                                lookup.id,
-                            );
-                            defer session.deinit();
-                            // Wire the session into the request so handlers can
-                            // call `req.session.set / getString` directly. The
-                            // pointer outlives the listen loop's handle scope.
-                            req.session = &session;
-
-                            // ─── Engine auto-gate (zero-config) ─────────────
-                            // Two engine-owned protections, both before route
-                            // matching:
-                            //   1. Body-size cap (ALWAYS on; effective cap =
-                            //      route/group override or server.max_body_bytes)
-                            //   2. Origin allowlist (when server.cors.enabled)
-                            // Failure → built-in 403/413 explanation page +
-                            // console log so the developer sees the issue.
-                            {
-                                const gate = security.preGateCheck(&req, server.cors, server.max_body_bytes) catch .pass;
-                                if (gate != .pass) {
-                                    const origin = blk: {
-                                        var oit = req.headers.iterator();
-                                        while (oit.next()) |entry| {
-                                            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "origin")) {
-                                                break :blk entry.value_ptr.*;
-                                            }
-                                        }
-                                        break :blk null;
-                                    };
-                                    std.debug.print(
-                                        "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) origin={s} — add it to server.cors.allowed_origins\n",
-                                        .{ req.method, req.path, @tagName(gate), origin orelse "-" },
-                                    );
-                                    const host = if (server.cors.allowed_origins.len > 0) server.cors.allowed_origins[0] else "your-domain";
-                                    var block_page = security.buildEngineBlockPage(allocator, gate, origin, host) catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    defer block_page.headers.deinit();
-                                    server.applySecurityHeadersTo(&block_page);
-                                    if (origin) |o| {
-                                        security.applyCORSHeaders(
-                                            &block_page.headers,
-                                            o,
-                                            server.cors.allowed_origins,
-                                            server.cors.allowed_methods,
-                                            server.cors.allowed_headers,
-                                            server.cors.allow_credentials,
-                                        ) catch {};
-                                    }
-                                    const page_bytes = block_page.toBytes() catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    defer allocator.free(page_bytes);
-                                    _ = server.sendToStream(stream, page_bytes) catch {};
-                                    _ = closeFd(fd);
-                                    return;
-                                }
-                            }
-
-                            // CORS preflight: when CORS is enabled and the
-                            // request is OPTIONS, reply with the configured
-                            // `Access-Control-*` headers and short-circuit
-                            // before the router sees the request. Preflight
-                            // is browser-driven and doesn't carry a route
-                            // match, so handling it globally keeps route
-                            // registration simple.
-                            if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
-                                const preflight = server.buildCORSPreflight(&req, allocator) catch |err| {
-                                    std.debug.print("HTTP_SERVER: buildCORSPreflight failed: {s}\n", .{@errorName(err)});
-                                    _ = closeFd(fd);
-                                    return;
-                                };
-                                const preflight_bytes = preflight.toBytes() catch {
-                                    std.debug.print("HTTP_SERVER: preflight toBytes failed\n", .{});
-                                    _ = closeFd(fd);
-                                    return;
-                                };
-                                defer preflight.allocator.free(preflight_bytes);
-                                _ = server.sendToStream(stream, preflight_bytes) catch {
-                                    std.debug.print("HTTP_SERVER: preflight send failed\n", .{});
-                                };
-                                // FIX: this path used to `return` without
-                                // closing `fd` — leaked one fd per preflight
-                                // request. Every other exit from this handler
-                                // closes fd; this one now does too.
-                                _ = closeFd(fd);
-                                return;
-                            }
-
-                            if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
-                                // SSE streams chunked frames and WebSocket hijacks the
-                                // fd: neither can run on an encrypted connection until
-                                // the streaming work lands (see docs/http2-tls.md and
-                                // plan D2 — a browser negotiates h2 for the WHOLE
-                                // origin, so this is exactly the case that must be
-                                // finished before the UI is served over https).
-                                if (stream.isTls() and (result == .sse or result == .websocket)) {
-                                    var res = http_parser.HttpResponse
-                                        .init(501, "Not Implemented", allocator)
-                                        .withBody("SSE and WebSocket are not available over TLS yet; use the plaintext listener");
-                                    server.applyCORSResponse(&req, &res) catch {};
-                                    server.applySecurityHeadersTo(&res);
-                                    if (res.toBytes()) |bytes| {
-                                        _ = server.sendToStream(stream, bytes) catch {};
-                                    } else |_| {}
-                                    _ = closeFd(fd);
-                                    return;
-                                }
-                                switch (result) {
-                                    .handler => |h| {
-                                        // ─── Route-level body cap (override) ───
-                                        // When the matched route (or its group)
-                                        // declared a body cap, re-check with THAT
-                                        // limit — it may be tighter OR looser than
-                                        // the server default. `0` = no override.
-                                        if (h.max_body_bytes != 0 and h.max_body_bytes != server.max_body_bytes) {
-                                            const route_gate = security.preGateCheck(&h.req, .{ .enabled = false }, h.max_body_bytes) catch .pass;
-                                            if (route_gate != .pass) {
-                                                std.debug.print(
-                                                    "HTTP_SERVER [pre-gate]: {s} {s} blocked ({s}) — route body cap {d} bytes\n",
-                                                    .{ h.req.method, h.req.path, @tagName(route_gate), h.max_body_bytes },
-                                                );
-                                                var page = security.buildEngineBlockPage(allocator, route_gate, null, "this route") catch {
-                                                    _ = closeFd(fd);
-                                                    return;
-                                                };
-                                                defer page.headers.deinit();
-                                                server.applySecurityHeadersTo(&page);
-                                                const page_bytes = page.toBytes() catch {
-                                                    _ = closeFd(fd);
-                                                    return;
-                                                };
-                                                defer allocator.free(page_bytes);
-                                                _ = server.sendToStream(stream, page_bytes) catch {};
-                                                _ = closeFd(fd);
-                                                return;
-                                            }
-                                        }
-
-                                        // ─── Framework pre-handler security gate ───
-                                        // When the route opted in via
-                                        // `on_pre_handler_fail`, run origin +
-                                        // body-size checks from server.cors BEFORE
-                                        // any middleware/handler. On failure return
-                                        // 302 → <fail_base><code> and never invoke
-                                        // the handler. This is THE enforcement
-                                        // point — handlers must not re-check.
-                                        if (h.chain.on_pre_handler_fail) |fail_base| {
-                                            const maybe_fail: ?security.HttpResponse = security.buildPreHandlerFailRedirect(
-                                                allocator,
-                                                &h.req,
-                                                server.cors,
-                                                if (h.max_body_bytes != 0) h.max_body_bytes else security.MAX_BODY_BYTES,
-                                                fail_base,
-                                            ) catch |err| blk: {
-                                                std.debug.print("pre-handler gate failed: {s}\n", .{@errorName(err)});
-                                                break :blk null;
-                                            };
-                                            if (maybe_fail) |fail_resp| {
-                                                var gated = fail_resp;
-                                                server.applyCORSResponse(&h.req, &gated) catch @panic("OOM");
-                                                server.applySecurityHeadersTo(&gated);
-                                                const fail_bytes = gated.toBytes() catch {
-                                                    std.debug.print("Failed to build pre-handler fail response\n", .{});
-                                                    _ = closeFd(fd);
-                                                    return;
-                                                };
-                                                defer gated.allocator.free(fail_bytes);
-                                                _ = server.sendToStream(stream, fail_bytes) catch {
-                                                    std.debug.print("Failed to send pre-handler fail response\n", .{});
-                                                };
-                                                _ = closeFd(fd);
-                                                return;
-                                            }
-                                        }
-
-                                        // Run the per-request middleware chain. When the
-                                        // route has no middleware the chain dispatches
-                                        // straight to the final handler — same behavior
-                                        // as before groups/middleware were added. When
-                                        // middlewares exist they run in registration
-                                        // order (outermost group first, innermost last);
-                                        // a middleware that returns without calling
-                                        // `chain.next(...)` short-circuits the chain.
-                                        var final_res = h.chain.run(h.ctx, h.req, h.res) catch http_parser.internalError("Handler error", allocator);
-
-                                        // CORS response headers — only when CORS is
-                                        // enabled and the request carried an Origin
-                                        // that matches `cors.allowed_origins`.
-                                        server.applyCORSResponse(&h.req, &final_res) catch @panic("OOM");
-
-                                        // Server-level security headers (CSP etc.)
-                                        // — the app's config wins over any handler
-                                        // default so policy lives in ONE place.
-                                        server.applySecurityHeadersTo(&final_res);
-
-                                        // Frame the keep-alive decision BEFORE
-                                        // serialising: `toBytes()`/`writeTo()`
-                                        // stamp `Connection: keep-alive` vs
-                                        // `close` from this flag. Framing is
-                                        // guaranteed (auto Content-Length, or
-                                        // self-delimiting 1xx/204/304), so reuse
-                                        // needs only an explicit or default
-                                        // keep-alive from the client. Capped at
-                                        // 1000 requests per connection (matches
-                                        // the `Keep-Alive: max=1000` hint).
-                                        final_res.keep_alive = server.clientWantsKeepAlive(&h.req) and
-                                            keep_alive_count < 1000;
-
-                                        // Zero-alloc fast path for small responses
-                                        // (stack buffer); large ones fall back to
-                                        // the heap inside writeTo. Wire bytes are
-                                        // identical to toBytes.
-                                        final_res.writeTo(stream) catch {
-                                            std.debug.print("Failed to send response\n", .{});
-                                            break :keep_alive_loop;
-                                        };
-                                        if (final_res.keep_alive) {
-                                            continue :keep_alive_loop;
-                                        } else {
-                                            break :keep_alive_loop;
-                                        }
-                                    },
-                                    .websocket => |ws| {
-                                        // WebSocket upgrade path. We must:
-                                        //   1. Validate the request is a valid upgrade (RFC 6455 §4.1).
-                                        //   2. Send the 101 response with the computed Accept.
-                                        //   3. Register the client with the WsManager (so broadcasts
-                                        //      and targeted sends work).
-                                        //   4. Run the handler in the current per-connection worker.
-                                        //   5. Send a close frame and remove from registry on return.
-                                        if (!ws_handshake.isWebSocketRequest(&req)) {
-                                            const bad = http_parser.badRequest("WebSocket upgrade required", allocator);
-                                            const bytes = bad.toBytes() catch {
-                                                _ = closeFd(fd);
-                                                return;
-                                            };
-                                            defer bad.allocator.free(bytes);
-                                            _ = server.sendToStream(stream, bytes) catch {};
-                                            _ = closeFd(fd);
-                                            return;
-                                        }
-
-                                        const key = ws_handshake.extractWebSocketKey(&req) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        const accept_resp = ws_handshake.buildAcceptResponse(allocator, key) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        defer allocator.free(accept_resp);
-
-                                        _ = server.sendToStream(stream, accept_resp) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-
-                                        // Register the client with the WsManager. The write callback bridges
-                                        // the manager's `fn(ctx, fd, data)` API to the server's
-                                        // `sendToClient` method via the ctx pointer.
-                                        const WriteAdapter = struct {
-                                            fn w(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {
-                                                const server_ptr: *GinwaServer = @ptrCast(@alignCast(ctx.?));
-                                                return server_ptr.sendToClient(target_fd, data);
-                                            }
-                                        }.w;
-                                        var client_id = server.ws_manager.registerClient(fd, WriteAdapter, @ptrCast(server)) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-
-                                        // Run the user handler.
-                                        ws.handler(ws.ctx, ws.req, @ptrCast(server), fd, &client_id) catch |err| {
-                                            std.debug.print("WebSocket handler error: {s}\n", .{@errorName(err)});
-                                        };
-
-                                        // Send a close frame and remove from registry. The client
-                                        // arena is freed by removeClient.
-                                        const close_payload = "\x03\xe8"; // status 1000 normal closure
-                                        const close_frame = ws_frames.encodeFrame(allocator, .{
-                                            .opcode = .close,
-                                            .payload = close_payload,
-                                        }) catch null;
-                                        if (close_frame) |cf| {
-                                            defer allocator.free(cf);
-                                            _ = server.sendToStream(stream, cf) catch {};
-                                        }
-                                        server.ws_manager.removeClient(&client_id, .explicit);
-                                        return;
-                                    },
-                                    .sse => |sse| {
-                                        const headers = "HTTP/1.1 200 OK\r\n" ++
-                                            "Content-Type: text/event-stream\r\n" ++
-                                            "Cache-Control: no-cache\r\n" ++
-                                            // Connection: close (NOT keep-alive). SSE is a single-use,
-                                            // long-lived stream — the connection is never reused for a
-                                            // follow-up request, so advertising keep-alive confuses
-                                            // intermediaries. Vite (Node.js) in dev mode stamps
-                                            // `Keep-Alive: timeout=5` on keep-alive responses, and some
-                                            // browser/webview engines (Chromium, WebKitGTK, WKWebView)
-                                            // enforce that timeout aggressively — closing the upstream
-                                            // socket ~5s after the last heartbeat. Empirically this
-                                            // matches the user's reported pattern of heartbeats
-                                            // stopping after ~30s in the browser DevTools. Telling
-                                            // intermediaries this connection will close on EOF keeps
-                                            // the stream open for as long as the backend keeps
-                                            // sending chunked frames.
-                                            "Connection: close\r\n" ++
-                                            // Required by HTTP/1.1: a response with neither Content-Length
-                                            // nor Transfer-Encoding is implicitly framed by connection-close.
-                                            // For SSE we never close the connection voluntarily, so we MUST
-                                            // declare chunked encoding. Otherwise Vite / proxies / browsers
-                                            // will misinterpret the response and surface
-                                            // ERR_INCOMPLETE_CHUNKED_ENCODING on disconnect.
-                                            "Transfer-Encoding: chunked\r\n" ++
-                                            // Tell intermediaries (Vite, nginx, Cloudflare, ALB) not to
-                                            // buffer. X-Accel-Buffering is the de-facto convention.
-                                            "X-Accel-Buffering: no\r\n" ++
-                                            "Access-Control-Allow-Origin: *\r\n" ++
-                                            "\r\n";
-                                        _ = server.sendToStream(stream, headers) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        const client_id = server.sse_manager.registerClient(fd) catch {
-                                            _ = closeFd(fd);
-                                            return;
-                                        };
-                                        // FIX: nothing previously removed this
-                                        // client from sse_manager once the
-                                        // handler returned — every SSE
-                                        // connection left a permanent entry
-                                        // behind, an unbounded leak for any
-                                        // server that serves SSE traffic.
-                                        // `defer` (rather than a single call
-                                        // right before `return`) guarantees
-                                        // cleanup runs on every exit path out
-                                        // of this branch, including any added
-                                        // later.
-                                        defer server.sse_manager.removeClient(client_id, .explicit_shutdown);
-
-                                        var sse_ctx = sse.ctx;
-                                        sse_ctx.client_id = client_id;
-                                        const res = http_parser.HttpResponse.init(200, "OK", allocator);
-                                        _ = sse.handler(sse_ctx, sse.req, res) catch |err| {
-                                            if (err != error.WouldBlock) {
-                                                std.debug.print("SSE handler error: {s}\n", .{@errorName(err)});
-                                            }
-                                        };
-                                        return;
-                                    },
-                                }
-                            } else {
-                                // No API route matched. If a static-dir fallback
-                                // handler is configured, hand the request off to
-                                // it. The handler is responsible for writing a
-                                // complete HTTP response directly to `fd` (it
-                                // owns the wire format from status line through
-                                // body) and for sending it. We only fall through
-                                // to the generic 404 if the handler is absent,
-                                // missing its cfg, or reports an error.
-                                var static_served = false;
-                                if (server.static_dir_handler) |handler| {
-                                    if (server.static_dir_cfg) |cfg| {
-                                        // HTTP header names are case-insensitive
-                                        // per RFC 9110 §5.1, but the gserverz
-                                        // preserves the case the client sent.
-                                        // Walk the headers map and match
-                                        // case-insensitively so the static-file
-                                        // handler gets a `Range:` value
-                                        // regardless of whether the client sent
-                                        // "Range", "range", or "RANGE".
-                                        var range_hdr: ?[]const u8 = null;
-                                        var h_it = req.headers.iterator();
-                                        while (h_it.next()) |entry| {
-                                            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "range")) {
-                                                range_hdr = entry.value_ptr.*;
-                                                break;
-                                            }
-                                        }
-                                        handler(cfg, allocator, server.io, req.path, range_hdr, stream) catch {
-                                            static_served = false;
-                                        };
-                                        // If the handler returned without error,
-                                        // trust it to have sent a response
-                                        // (matching the SSE branch's contract).
-                                        static_served = true;
-                                    }
-                                }
-                                if (!static_served) {
-                                    var not_found = http_parser.notFound(allocator);
-                                    // Attach CORS headers to the 404 so cross-origin
-                                    // callers see the rejection (with CORS headers
-                                    // echoed) instead of an opaque browser-blocked
-                                    // response.
-                                    server.applyCORSResponse(&req, &not_found) catch @panic("OOM");
-                                    // Same keep-alive framing rule as the routed
-                                    // path (see above): framing is guaranteed by
-                                    // toBytes (auto Content-Length), so reuse
-                                    // needs only the client's keep-alive.
-                                    not_found.keep_alive = server.clientWantsKeepAlive(&req) and
-                                        keep_alive_count < 1000;
-                                    const res_bytes = not_found.toBytes() catch {
-                                        _ = closeFd(fd);
-                                        return;
-                                    };
-                                    defer not_found.allocator.free(res_bytes);
-                                    if (server.sendToStream(stream, res_bytes)) |_| {
-                                        if (not_found.keep_alive) {
-                                            continue :keep_alive_loop;
-                                        }
-                                    } else |_| {}
-                                    break :keep_alive_loop;
-                                }
-                                // Static-dir fallback wrote its own (unframed)
-                                // response — the connection cannot be reused.
-                                break :keep_alive_loop;
-                            }
-
-                            // Safety net: every arm above exits explicitly
-                            // (continue / break / return). Reaching here
-                            // would re-enter the loop on a served connection,
-                            // so close instead.
-                            break :keep_alive_loop;
-                        }
-                        _ = closeFd(fd);
-                    }
-                }.handle,
-                .{ self, arena, client_fd },
-            ) catch |err| {
-                std.debug.print("Failed to spawn handler: {s}\n", .{@errorName(err)});
-                arena.deinit();
-                self.allocator.destroy(arena);
-                self.worker_sem.post(self.io); // spawn failed — handler's defer never registered
-                _ = closeFd(client_fd);
-                continue;
-            };
-        }
-
-        try group.await(self.io);
-    }
-
-    /// Serve plain HTTP/1.1 through the poll reactor instead of the
-    /// thread-per-connection `listen()` loop. One entry point:
+    /// Serve through the poll reactor — the single serve path (the old
+    /// thread-per-connection `listen()` was deleted). One entry point:
     /// `cfg.loop_count` selects the shape — `0`/`1` runs a single loop
     /// on the calling thread, `>1` runs that many loops sharing the port
     /// via `SO_REUSEPORT` (kernel-balanced accepts, stats summed into
     /// `el_stats`; POSIX-only, clamped to `max_multi_loops`).
     ///
-    /// Non-breaking: `listen()` is untouched; callers opt in by calling
-    /// this. Scope (see `event_loop.zig` header):
-    ///   - No TLS (`error.TlsNotSupported` when `tls_ctx` is set — use
-    ///     `listen()` for https until the non-blocking handshake lands).
-    ///   - No SSE / WebSocket / H2C upgrades: matching routes get
-    ///     `501 Not Implemented` + close. No static-dir fallback either
-    ///     (`501` when `static_dir_handler` is set and no route matches).
-    ///   - `shutdown()` works for every path: it closes the listener
-    ///     fd(s), which makes each reactor's `poll` report HUP and exit.
+    /// The loop accepts + fast-dispatches plain HTTP/1.1 itself; anything
+    /// long-lived or blocking hijacks the fd to a worker thread (blocking
+    /// mode restored): static files → bounded pool, SSE/WS/H2/TLS → a
+    /// dedicated thread each, reusing the existing managers verbatim.
+    /// `shutdown()` closes the listener fd(s), which makes each
+    /// reactor's `poll` report HUP and exit.
     pub fn listenEventLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
-        if (self.tls_ctx != null) return error.TlsNotSupported;
-        if (cfg.loop_count > 1) {
+        // Runner hooks are process-global (idempotent installs for the
+        // loop's indirect calls): TLS accept/serve + H2C driver.
+        event_loop_mod.EventLoop.setTlsHijackRun(runTlsServe);
+        event_loop_mod.EventLoop.setH2HijackRun(runH2Serve);
+        var lc = cfg;
+        lc.tls_enabled = self.tls_ctx != null;
+        lc.h2c_enabled = self.enable_h2c;
+        if (lc.loop_count > 1) {
             if (comptime builtin.os.tag == .windows) return error.Unsupported;
-            return self.serveMultiLoop(cfg);
+            return self.serveMultiLoop(lc);
         }
-        return self.serveSingleLoop(cfg);
+        return self.serveSingleLoop(lc);
     }
 
     /// Single-loop path: `listen()` on the bound socket, one reactor on
@@ -1481,120 +790,6 @@ pub const GinwaServer = struct {
         );
         if (first_err) |e| return e;
     }
-    pub fn getContentLength(data: []const u8) ?usize {
-        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
-        const headers = data[0..header_end];
-        const cl_header = "Content-Length: ";
-        const cl_pos = std.mem.indexOf(u8, headers, cl_header) orelse return null;
-        const cl_start = cl_pos + cl_header.len;
-        // Look for \r\n after the value, or use end of headers if that's the line ending
-        const after_value = headers[cl_start..];
-        const cl_end = std.mem.indexOf(u8, after_value, "\r\n") orelse after_value.len;
-        const cl_str = headers[cl_start .. cl_start + cl_end];
-        return std.fmt.parseInt(usize, cl_str, 10) catch null;
-    }
-
-    fn isHttpRequestComplete(data: []const u8) bool {
-        // Find end of headers
-        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return false;
-        const headers = data[0..header_end];
-
-        // No Content-Length means no body (GET, OPTIONS, etc.)
-        const cl_header = "Content-Length: ";
-        const cl_pos = std.mem.indexOf(u8, headers, cl_header) orelse return true;
-        const cl_start = cl_pos + cl_header.len;
-        const cl_end = std.mem.indexOf(u8, headers[cl_start..], "\r\n") orelse return false;
-        const cl_str = headers[cl_start .. cl_start + cl_end];
-        const content_length = std.fmt.parseInt(usize, cl_str, 10) catch return false;
-
-        // Check body bytes received
-        const body_start = header_end + 4;
-        return data.len >= body_start + content_length;
-    }
-
-    /// Accept one client connection (raw `accept(2)`) and apply the
-    /// per-connection tuning (TCP keepalive, NODELAY).
-    fn acceptClient(self: *GinwaServer) !SocketFd {
-        const fd: SocketFd = blk: {
-            if (builtin.os.tag == .windows) {
-                var client_addr: socket.sockaddr.in = undefined;
-                var addr_len: c_int = @sizeOf(socket.sockaddr.in);
-                const rc = winsock.accept(self.address.sock_fd, @ptrCast(&client_addr), &addr_len);
-                if (rc < 0) return error.AcceptFailed;
-                break :blk rc;
-            } else {
-                var client_addr: posix.sockaddr.in = undefined;
-                var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-                const rc = socket.accept(self.address.sock_fd, @ptrCast(&client_addr), &addr_len);
-                if (rc < 0) return error.AcceptFailed;
-                break :blk @intCast(rc);
-            }
-        };
-
-        // Enable TCP keepalive on the accepted client socket so a
-        // silently-dropped connection (Wi-Fi loss, NAT table expiry,
-        // half-open TCP after a peer crash) is detected by the kernel
-        // within ~25s instead of relying solely on the application-
-        // level heartbeat (every 5s in `SseManager.sendHeartbeat`).
-        //
-        // Without keepalive, the server keeps heartbeating into a dead
-        // socket until the next write fails with EPIPE / ECONNRESET,
-        // which can be hours later (Linux default `tcp_keepalive_time`
-        // is 7200s). On a long-idle page that hits a silent network
-        // drop, the eventual disconnect surfaces in the browser as
-        // `net::ERR_INCOMPLETE_CHUNKED_ENCODING 200 (OK)` because the
-        // chunked terminator is only flushed by `removeClient` once
-        // the kernel finally tells us the peer is gone.
-        //
-        // Settings mirror `Agent.apply_tcp_keepalive`
-        // (`src/modules/agent/Agent.zig:793`) so outbound LLM conns
-        // and inbound browser conns fail at the same rate:
-        //   keepidle  = 10s  (first probe after 10s of idle)
-        //   keepintvl = 5s   (probe interval)
-        //   keepcnt   = 3    (give up after 3 failed probes)
-        //   → dead-conn detection in ~10 + 5*3 = 25s.
-        //
-        // `setsockopt` failures are best-effort: the application-
-        // level heartbeat (5s) still works without OS keepalive, it
-        // just won't catch silent drops as quickly.
-        const on: c_int = 1;
-        const keepidle: c_int = 10;
-        const keepintvl: c_int = 5;
-        const keepcnt: c_int = 3;
-        if (builtin.os.tag == .windows) {
-            _ = winsock.setsockopt(fd, 0xffff, 8, &on, @sizeOf(c_int));
-            _ = winsock.setsockopt(fd, 6, 3, &keepidle, @sizeOf(c_int));
-            _ = winsock.setsockopt(fd, 6, 17, &keepintvl, @sizeOf(c_int));
-            _ = winsock.setsockopt(fd, 6, 16, &keepcnt, @sizeOf(c_int));
-        } else {
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
-            // `TCP.KEEPIDLE` is Linux-only; on macOS the equivalent is
-            // the KEEPALIVE TCP option (which doubles as the idle
-            // timer on Darwin). Skip where it does not exist — the default ~2h
-            // idle combined with 5s probe + 3 probes still detects dead
-            // connections quickly via SO_KEEPALIVE alone.
-            //
-            // The gate tests the DECL on `std.c.TCP` rather than
-            // `builtin.os.tag`: the cross-compile build graph compiles this file
-            // for several targets in one invocation (the app module for the
-            // requested target, sibling modules for the host), so a
-            // `builtin.os.tag` check can disagree with the `c.TCP` the
-            // expression actually resolves against and fail the macOS build with
-            // "struct 'c.darwin.TCP' has no member named 'KEEPIDLE'".
-            if (@hasDecl(std.c.TCP, "KEEPIDLE")) {
-                posix.setsockopt(fd, posix.IPPROTO.TCP, std.c.TCP.KEEPIDLE, std.mem.asBytes(&keepidle)) catch {};
-            }
-            posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&keepintvl)) catch {};
-            posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&keepcnt)) catch {};
-            // Disable Nagle's algorithm: benchmark/small-JSON responses
-            // would otherwise wait up to ~40ms for ACK coalescing on
-            // keep-alive connections. Best-effort like the keepalive
-            // tunables above.
-            posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
-        }
-
-        return fd;
-    }
 
     pub fn recvFromClient(_: *GinwaServer, fd: SocketFd, buf: []u8) !usize {
         if (builtin.os.tag == .windows) {
@@ -1742,17 +937,23 @@ pub const GinwaServer = struct {
 };
 
 /// Reactor dispatch for `GinwaServer.listenEventLoop` (matches
-/// `event_loop_mod.OnRequestFn`). Synchronous, plain HTTP/1.1 only:
-/// pre-gate → CORS preflight → router handler → 404. SSE / WebSocket
-/// upgrades and the static-dir fallback answer `501` + close (v1 scope).
+/// `event_loop_mod.OnRequestFn`). Synchronous fast path: pre-gate → CORS
+/// preflight → router handler → 404. Long-lived or blocking work hijacks
+/// the fd to a worker thread instead of answering here:
+///   - SSE / WebSocket routes → dedicated thread (existing managers).
+///   - static-dir fallback → bounded static pool.
+///   - (TLS connections never reach this: they hijack at accept time.
+///    H2C never reaches this: it hijacks at sniff time.)
 /// `Session.deinit` is a no-op so wiring `req.session` here is safe: the
 /// reactor serializes the returned response from the same arena.
 fn dispatchEventLoopRequest(
     ctx_ptr: *anyopaque,
     alloc: std.mem.Allocator,
+    req_bytes: []const u8,
     req_in: *const HttpRequest,
     http_ctx_in: HttpContext,
-) anyerror!HttpResponse {
+) anyerror!event_loop_mod.DispatchResult {
+    _ = req_bytes;
     const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
     var req = req_in.*;
     var http_ctx = http_ctx_in;
@@ -1793,7 +994,7 @@ fn dispatchEventLoopRequest(
                 ) catch {};
             }
             page.keep_alive = false;
-            return page;
+            return .{ .respond = page };
         }
     }
 
@@ -1801,7 +1002,7 @@ fn dispatchEventLoopRequest(
     if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
         var preflight = try server.buildCORSPreflight(&req, alloc);
         preflight.keep_alive = false;
-        return preflight;
+        return .{ .respond = preflight };
     }
 
     if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
@@ -1812,46 +1013,391 @@ fn dispatchEventLoopRequest(
                     if (gate != .pass) {
                         var page = try security.buildEngineBlockPage(alloc, gate, null, "your-domain");
                         page.keep_alive = false;
-                        return page;
+                        return .{ .respond = page };
                     }
                 }
                 var final = try h.chain.run(h.ctx, h.req, h.res);
                 server.applyCORSResponse(&req, &final) catch {};
                 server.applySecurityHeadersTo(&final);
                 final.keep_alive = server.clientWantsKeepAlive(&req);
-                return final;
+                return .{ .respond = final };
             },
-            .websocket, .sse => {
-                var res = HttpResponse.init(501, "Not Implemented", alloc)
-                    .withBody("SSE and WebSocket are not available on the event-loop path yet; use listen().");
-                res.keep_alive = false;
-                return res;
+            .websocket => {
+                // WebSocket sessions are long-lived blocking read loops —
+                // hijack the fd to a dedicated thread (same manager flow
+                // as the old threaded path). Over TLS there is no loop
+                // upgrade yet: 501 like the old path did.
+                if (server.tls_ctx != null) {
+                    var res = HttpResponse.init(501, "Not Implemented", alloc)
+                        .withBody("WebSocket is not available over TLS yet.");
+                    res.keep_alive = false;
+                    return .{ .respond = res };
+                }
+                return .{ .hijack_ws = .{ .ctx = ctx_ptr, .run = runWsServe } };
+            },
+            .sse => {
+                // SSE streams are long-lived — hijack the fd to a dedicated
+                // thread running the existing SseManager flow. Over TLS:
+                // 501 like the old path did.
+                if (server.tls_ctx != null) {
+                    var res = HttpResponse.init(501, "Not Implemented", alloc)
+                        .withBody("SSE is not available over TLS yet.");
+                    res.keep_alive = false;
+                    return .{ .respond = res };
+                }
+                return .{ .hijack_sse = .{ .ctx = ctx_ptr, .run = runSseServe } };
             },
         }
     }
 
-    // No route: static-dir fallback is a blocking Stream writer, so the
-    // reactor answers 501 when one is configured; otherwise 404 with
-    // keep-alive framing like the threaded path.
-    if (server.static_dir_handler != null) {
-        var res = HttpResponse.init(501, "Not Implemented", alloc)
-            .withBody("Static-dir fallback is not available on the event-loop path yet; use listen().");
-        res.keep_alive = false;
-        return res;
+    // No route: static-dir fallback hijacks to the bounded static pool
+    // (blocking file serve). Without a configured handler, 404 with
+    // keep-alive framing like the old threaded path.
+    if (server.static_dir_handler != null and server.static_dir_cfg != null) {
+        return .{ .hijack_static = .{ .ctx = ctx_ptr, .run = runStaticServe } };
     }
     var not_found = http_parser.notFound(alloc);
     server.applyCORSResponse(&req, &not_found) catch {};
     server.applySecurityHeadersTo(&not_found);
     not_found.keep_alive = server.clientWantsKeepAlive(&req);
-    return not_found;
+    return .{ .respond = not_found };
 }
 
-fn recvFromSock(fd: SocketFd, buf: [*]u8, len: usize) isize {
-    if (builtin.os.tag == .windows) {
-        return winsock.recv(@intCast(fd), buf, @intCast(len), 0);
-    } else {
-        return socket.read(fd, buf, len);
+/// Bridge `WsManager`'s `fn(ctx, fd, data)` write API to the server's
+/// `sendToClient` (blocking raw send — hijacked fds are blocking again).
+fn wsWriteAdapter(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {
+    const server_ptr: *GinwaServer = @ptrCast(@alignCast(ctx.?));
+    return server_ptr.sendToClient(target_fd, data);
+}
+
+/// Static-dir hijack runner (static pool thread or TLS worker).
+/// Contract (see `event_loop.Hijack`): blocking fd, serve, close. Never
+/// frees `req_bytes` (the spawner does). Mirrors the old threaded
+/// no-route arm: re-parse → Range scan → handler → 404 on error → close
+/// (static responses are unframed, so the conn is never reused).
+fn runStaticServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    nb_socket_mod.setBlocking(fd) catch {
+        closeFd(fd);
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = http_parser.parseRequest(req_bytes, a, io, fd) catch {
+        closeFd(fd);
+        return;
+    };
+    const lookup: context.LookupResult = if (server.context_store) |store|
+        context.contextFromRequest(req, store)
+    else
+        .{ .context = null, .id = null };
+    var session = Session.init(server.context_store, lookup.context, lookup.id);
+    req.session = &session;
+
+    const stream: Stream = .{ .plain = fd };
+    const handler = server.static_dir_handler orelse {
+        serveNotFound(server, a, stream);
+        closeFd(fd);
+        return;
+    };
+    const cfg = server.static_dir_cfg orelse {
+        serveNotFound(server, a, stream);
+        closeFd(fd);
+        return;
+    };
+    var range_hdr: ?[]const u8 = null;
+    var h_it = req.headers.iterator();
+    while (h_it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "range")) {
+            range_hdr = entry.value_ptr.*;
+            break;
+        }
     }
+    handler(cfg, a, io, req.path, range_hdr, stream) catch {
+        // Handler error → 404 fallback (same as the old threaded arm;
+        // best-effort: a partially-written body can't be unwound).
+        serveNotFound(server, a, stream);
+    };
+    closeFd(fd);
+}
+
+/// Best-effort 404 write for hijack runners (no keep-alive framing —
+/// hijacked conns always close afterwards).
+fn serveNotFound(server: *GinwaServer, alloc: std.mem.Allocator, stream: Stream) void {
+    var nf = http_parser.notFound(alloc);
+    server.applySecurityHeadersTo(&nf);
+    const bytes = nf.toBytes() catch return;
+    defer alloc.free(bytes);
+    stream.writeAll(bytes) catch {};
+}
+
+/// SSE hijack runner (dedicated thread per stream). Mirrors the old
+/// threaded `.sse` arm verbatim: headers → register → handler →
+/// removeClient (which closes). Never frees `req_bytes` (spawner does).
+fn runSseServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    nb_socket_mod.setBlocking(fd) catch {
+        closeFd(fd);
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = http_parser.parseRequest(req_bytes, a, io, fd) catch {
+        closeFd(fd);
+        return;
+    };
+    const lookup: context.LookupResult = if (server.context_store) |store|
+        context.contextFromRequest(req, store)
+    else
+        .{ .context = null, .id = null };
+    var session = Session.init(server.context_store, lookup.context, lookup.id);
+    req.session = &session;
+
+    const http_ctx = HttpContext{
+        .allocator = a,
+        .io = io,
+        .allowed_origins = server.cors.allowed_origins,
+    };
+    const result = server.router.matchRoute(req.method, req.path, &req, http_ctx) orelse {
+        closeFd(fd);
+        return;
+    };
+    const sse = switch (result) {
+        .sse => |s| s,
+        // Route table changed under us (or TLS raced here): close.
+        else => {
+            closeFd(fd);
+            return;
+        },
+    };
+    const stream: Stream = .{ .plain = fd };
+    const headers = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "X-Accel-Buffering: no\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "\r\n";
+    stream.writeAll(headers) catch {
+        closeFd(fd);
+        return;
+    };
+    const client_id = server.sse_manager.registerClient(fd) catch {
+        closeFd(fd);
+        return;
+    };
+    defer server.sse_manager.removeClient(client_id, .explicit_shutdown);
+
+    var sse_ctx = sse.ctx;
+    sse_ctx.client_id = client_id;
+    sse_ctx.allocator = a;
+    const res = http_parser.HttpResponse.init(200, "OK", a);
+    _ = sse.handler(sse_ctx, sse.req, res) catch |err| {
+        if (err != error.WouldBlock) {
+            std.debug.print("SSE handler error: {s}\n", .{@errorName(err)});
+        }
+    };
+}
+
+/// WebSocket hijack runner (dedicated thread per session). Mirrors the old
+/// threaded `.websocket` arm verbatim. Never frees `req_bytes`.
+fn runWsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    nb_socket_mod.setBlocking(fd) catch {
+        closeFd(fd);
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req = http_parser.parseRequest(req_bytes, a, io, fd) catch {
+        closeFd(fd);
+        return;
+    };
+    const lookup: context.LookupResult = if (server.context_store) |store|
+        context.contextFromRequest(req, store)
+    else
+        .{ .context = null, .id = null };
+    var session = Session.init(server.context_store, lookup.context, lookup.id);
+    req.session = &session;
+
+    const http_ctx = HttpContext{
+        .allocator = a,
+        .io = io,
+        .allowed_origins = server.cors.allowed_origins,
+    };
+    const result = server.router.matchRoute(req.method, req.path, &req, http_ctx) orelse {
+        closeFd(fd);
+        return;
+    };
+    const ws = switch (result) {
+        .websocket => |w| w,
+        else => {
+            closeFd(fd);
+            return;
+        },
+    };
+    const stream: Stream = .{ .plain = fd };
+    if (!ws_handshake.isWebSocketRequest(&req)) {
+        const bad = http_parser.badRequest("WebSocket upgrade required", a);
+        const bytes = bad.toBytes() catch {
+            closeFd(fd);
+            return;
+        };
+        defer a.free(bytes);
+        stream.writeAll(bytes) catch {};
+        closeFd(fd);
+        return;
+    }
+    const key = ws_handshake.extractWebSocketKey(&req) catch {
+        closeFd(fd);
+        return;
+    };
+    const accept_resp = ws_handshake.buildAcceptResponse(a, key) catch {
+        closeFd(fd);
+        return;
+    };
+    defer a.free(accept_resp);
+    stream.writeAll(accept_resp) catch {
+        closeFd(fd);
+        return;
+    };
+
+    var client_id = server.ws_manager.registerClient(fd, wsWriteAdapter, ctx_ptr) catch {
+        closeFd(fd);
+        return;
+    };
+    ws.handler(ws.ctx, ws.req, ctx_ptr, fd, &client_id) catch |err| {
+        std.debug.print("WebSocket handler error: {s}\n", .{@errorName(err)});
+    };
+
+    const close_payload = "\x03\xe8"; // status 1000 normal closure
+    const close_frame = ws_frames.encodeFrame(a, .{
+        .opcode = .close,
+        .payload = close_payload,
+    }) catch null;
+    if (close_frame) |cf| {
+        defer a.free(cf);
+        stream.writeAll(cf) catch {};
+    }
+    server.ws_manager.removeClient(&client_id, .explicit);
+    // WsClient.deinit frees only the arena (unlike SSE, which closes):
+    // the fd close lived in the old handle() tail, so do it here.
+    closeFd(fd);
+}
+
+/// H2C hijack runner (dedicated thread per H2 connection). `data` is the
+/// buffered preface+frames the loop sniffed. Never frees `data`.
+fn runH2Serve(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, data: []const u8) void {
+    _ = io;
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    nb_socket_mod.setBlocking(fd) catch {
+        closeFd(fd);
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const stream: Stream = .{ .plain = fd };
+    http2_server.serveConnection(server, stream, arena.allocator(), data, .{}) catch |err| {
+        std.debug.print("HTTP_SERVER: h2 connection ended: {s}\n", .{@errorName(err)});
+    };
+    closeFd(fd);
+}
+
+/// TLS hijack runner (dedicated thread per encrypted conn). Handshake,
+/// then ALPN dispatch: `h2` → H2 driver over the TLS stream, anything
+/// else → blocking H1 keep-alive loop over the TLS stream (reusing the
+/// loop's dispatch + RequestBuffer; SSE/WS-over-TLS stay 501 via the
+/// dispatch's `tls_ctx` check, static serves with the TLS stream).
+/// Never frees `data` (always empty here).
+fn runTlsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, data: []const u8) void {
+    _ = data;
+    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    installTlsStreamOps();
+    const tls_ctx = server.tls_ctx orelse {
+        closeFd(fd);
+        return;
+    };
+    var tls_conn = tls_mod.Conn.accept(tls_ctx, fd) catch |err| {
+        std.debug.print("HTTP_SERVER: TLS handshake failed: {s}\n", .{@errorName(err)});
+        closeFd(fd);
+        return;
+    };
+    defer tls_conn.deinit();
+    const stream: Stream = .{ .tls = @ptrCast(tls_conn) };
+    const negotiated = tls_conn.selectedAlpn();
+    std.debug.print("HTTP_SERVER: TLS ok (alpn='{s}' len={d})\n", .{ negotiated, negotiated.len });
+    if (std.mem.eql(u8, negotiated, tls_mod.alpn_h2)) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        http2_server.serveConnection(server, stream, arena.allocator(), "", .{}) catch |err| {
+            std.debug.print("HTTP_SERVER: h2 (TLS) connection ended: {s}\n", .{@errorName(err)});
+        };
+        closeFd(fd);
+        return;
+    }
+
+    // Blocking H1 keep-alive loop over the encrypted stream. Per-request
+    // arena discipline mirrors the old threaded path (reset per request,
+    // retain capacity; max 1000 requests per conn).
+    var request_arena = std.heap.ArenaAllocator.init(alloc);
+    defer request_arena.deinit();
+    var keep_alive_count: u32 = 0;
+    while (true) {
+        keep_alive_count += 1;
+        _ = request_arena.reset(.retain_capacity);
+        const a = request_arena.allocator();
+        var rb = RequestBuffer.init(a);
+        const request_data = rb.readFullRequestStream(stream) catch break;
+        var req = http_parser.parseRequest(request_data, a, io, fd) catch break;
+        const http_ctx = HttpContext{
+            .allocator = a,
+            .io = io,
+            .allowed_origins = server.cors.allowed_origins,
+        };
+        const result = dispatchEventLoopRequest(ctx_ptr, a, request_data, &req, http_ctx) catch break;
+        switch (result) {
+            .respond => |r| {
+                var rr = r;
+                rr.keep_alive = rr.keep_alive and keep_alive_count < 1000;
+                const bytes = rr.toBytes() catch break;
+                defer a.free(bytes);
+                stream.writeAll(bytes) catch break;
+                if (!rr.keep_alive) break;
+            },
+            .hijack_static => {
+                // Static over TLS serves inline (same worker owns the
+                // encrypted stream; no fd handoff possible mid-TLS).
+                var sreq = http_parser.parseRequest(request_data, a, io, fd) catch break;
+                const slookup: context.LookupResult = if (server.context_store) |store|
+                    context.contextFromRequest(sreq, store)
+                else
+                    .{ .context = null, .id = null };
+                var ssession = Session.init(server.context_store, slookup.context, slookup.id);
+                sreq.session = &ssession;
+                const shandler = server.static_dir_handler orelse break;
+                const scfg = server.static_dir_cfg orelse break;
+                var range_hdr: ?[]const u8 = null;
+                var h_it = sreq.headers.iterator();
+                while (h_it.next()) |entry| {
+                    if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "range")) {
+                        range_hdr = entry.value_ptr.*;
+                        break;
+                    }
+                }
+                shandler(scfg, a, io, sreq.path, range_hdr, stream) catch {};
+                break; // static responses are unframed: never reuse
+            },
+            // SSE/WS-over-TLS dispatch to 501 responds (tls_ctx check);
+            // H2 never surfaces here (ALPN decided above). Defensive close.
+            .hijack_sse, .hijack_ws => break,
+        }
+        rb.deinit();
+    }
+    closeFd(fd);
 }
 
 /// Request buffer with auto-growing capability for reading HTTP requests

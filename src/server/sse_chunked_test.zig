@@ -228,6 +228,30 @@ const HTTP_SERVER_CANDIDATES = &.{
     "src/server/http_server.zig",
 };
 
+// Accept-path tuning moved to nb_socket.zig when the threaded listen()
+// was deleted (the loop's acceptDrain is the only accept path now).
+const NB_SOCKET_CANDIDATES = &.{
+    "src/modules/kabelweb/src/server/nb_socket.zig",
+    "src/server/nb_socket.zig",
+};
+
+fn readNbSocketSource(allocator: std.mem.Allocator) ![]u8 {
+    var last_err: anyerror = error.FileNotFound;
+    inline for (NB_SOCKET_CANDIDATES) |path| {
+        if (std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            path,
+            allocator,
+            .unlimited,
+        )) |source| {
+            return source;
+        } else |err| {
+            last_err = err;
+        }
+    }
+    return last_err;
+}
+
 fn readHttpServerSource(allocator: std.mem.Allocator) ![]u8 {
     // `.unlimited` so the static source-check tests don't break when
     // http_server.zig grows past the previous 64 KiB cap (currently
@@ -417,10 +441,11 @@ test "SseManager: sendHeartbeat takes the manager lock during the client snapsho
 }
 
 // ============================================================================
-// Task 5 (long-period fix #2): acceptClient must set SO_KEEPALIVE on every
-// accepted SSE socket.
+// Task 5 (long-period fix #2): the accept path must set SO_KEEPALIVE on every
+// accepted SSE socket (now in nb_socket.applyTcpTuning; the loop accept is
+// the only accept path since threaded listen() was deleted).
 //
-// Bug history: the previous acceptClient returned the fd without
+// Bug history: the previous accept path returned the fd without
 // enabling TCP keepalive. On Linux, the default `tcp_keepalive_time`
 // is 7200s (2 hours), so a silently-dropped connection (Wi-Fi loss,
 // NAT table expiry, half-open TCP after a peer crash) was not detected
@@ -437,20 +462,17 @@ test "SseManager: sendHeartbeat takes the manager lock during the client snapsho
 //   → dead-conn detection in ~25s.
 // ============================================================================
 
-test "HTTP server: acceptClient sets SO_KEEPALIVE on accepted sockets" {
-    const source = try readHttpServerSource(std.testing.allocator);
+test "HTTP server: accept path sets SO_KEEPALIVE on accepted sockets" {
+    const source = try readNbSocketSource(std.testing.allocator);
     defer std.testing.allocator.free(source);
 
-    // Find the `fn acceptClient` declaration and check the next ~8 KiB
-    // of body — anything outside that window is irrelevant. The 8 KiB
-    // window comfortably covers any function body in this codebase (the
-    // longest observed is ~2.4 KiB for `acceptClient` itself, with
-    // verbose keepalive comment). We assert that the function body
-    // contains both the SO_KEEPALIVE setup AND the TCP keepalive timer
-    // configuration (KEEPIDLE / KEEPINTVL / KEEPCNT), so a future
-    // refactor that drops any of these is caught.
-    const decl = std.mem.indexOf(u8, source, "fn acceptClient(") orelse {
-        std.debug.print("\n!! http_server.zig missing `fn acceptClient` !!\n", .{});
+    // Find the `fn applyTcpTuning` declaration and check the next ~8 KiB
+    // of body — anything outside that window is irrelevant. We assert that
+    // the function body contains both the SO_KEEPALIVE setup AND the TCP
+    // keepalive timer configuration (KEEPIDLE / KEEPINTVL / KEEPCNT), so a
+    // future refactor that drops any of these is caught.
+    const decl = std.mem.indexOf(u8, source, "fn applyTcpTuning(") orelse {
+        std.debug.print("\n!! nb_socket.zig missing `fn applyTcpTuning` !!\n", .{});
         return error.AcceptClientMissing;
     };
     const window_end = @min(decl + 8192, source.len);
@@ -460,7 +482,7 @@ test "HTTP server: acceptClient sets SO_KEEPALIVE on accepted sockets" {
         std.mem.indexOf(u8, body, "SO.KEEPALIVE") == null)
     {
         std.debug.print(
-            "\n!! http_server.zig: acceptClient does not set SO_KEEPALIVE !!\n" ++
+            "\n!! nb_socket.zig: applyTcpTuning does not set SO_KEEPALIVE !!\n" ++
                 "   Without TCP keepalive, silent network drops (Wi-Fi loss, NAT timeout)\n" ++
                 "   are not detected at the kernel level for up to 2 hours (Linux default).\n" ++
                 "   Add `posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, ...)`\n" ++
@@ -473,7 +495,7 @@ test "HTTP server: acceptClient sets SO_KEEPALIVE on accepted sockets" {
         std.mem.indexOf(u8, body, "TCP.KEEPIDLE") == null)
     {
         std.debug.print(
-            "\n!! http_server.zig: acceptClient missing TCP_KEEPIDLE !!\n" ++
+            "\n!! nb_socket.zig: applyTcpTuning missing TCP_KEEPIDLE !!\n" ++
                 "   SO_KEEPALIVE alone uses the system default (7200s on Linux). For an SSE\n" ++
                 "   server that must detect dead clients within ~25s, override TCP_KEEPIDLE.\n",
             .{},
@@ -484,7 +506,7 @@ test "HTTP server: acceptClient sets SO_KEEPALIVE on accepted sockets" {
         std.mem.indexOf(u8, body, "TCP.KEEPINTVL") == null)
     {
         std.debug.print(
-            "\n!! http_server.zig: acceptClient missing TCP_KEEPINTVL !!\n" ++
+            "\n!! nb_socket.zig: applyTcpTuning missing TCP_KEEPINTVL !!\n" ++
                 "   Without an explicit probe interval, the OS uses the system default.\n",
             .{},
         );
@@ -494,7 +516,7 @@ test "HTTP server: acceptClient sets SO_KEEPALIVE on accepted sockets" {
         std.mem.indexOf(u8, body, "TCP.KEEPCNT") == null)
     {
         std.debug.print(
-            "\n!! http_server.zig: acceptClient missing TCP_KEEPCNT !!\n" ++
+            "\n!! nb_socket.zig: applyTcpTuning missing TCP_KEEPCNT !!\n" ++
                 "   Without an explicit probe count, the OS uses the system default.\n",
             .{},
         );

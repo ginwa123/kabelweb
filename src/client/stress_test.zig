@@ -109,7 +109,7 @@ fn echoPostHandler(_: HttpContext, req: HttpRequest, res: HttpResponse) !HttpRes
 }
 
 fn listenFn(server: *gserverz.GinwaServer) void {
-    server.listen() catch {};
+    server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
 extern "c" fn getsockname(
