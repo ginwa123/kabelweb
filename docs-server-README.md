@@ -130,20 +130,27 @@ try server.listenEventLoop(.{});
 
 ### Dispatch modes: direct vs worker pool
 
-`EventLoopConfig.dispatch_mode` (default `.direct`):
-- `.direct` — dispatch runs on the loop thread. Fastest for fast
-  handlers; one slow handler stalls every connection on that loop.
-- `.worker_pool` — complete requests go to a bounded
+`EventLoopConfig.dispatch_mode` (default `.worker_pool`):
+- `.worker_pool` (default) — complete requests go to a bounded
   `worker_pool.zig:WorkerPool` (`worker_threads`, default ncpu;
   `worker_queue_depth`, default 1024). The loop thread does I/O only;
   completions return via a mutex queue + socketpair wake fd. A full
   queue falls back to direct dispatch (counted in
-  `Stats.inline_fallback`, never dropped). The loop allocator must be
-  thread-safe in this mode. Per-conn ordering holds (one in-flight
-  offload per connection; pipelined bytes wait their turn).
+  `Stats.inline_fallback`, never dropped). Per-conn ordering holds
+  (one in-flight offload per connection; pipelined bytes wait their
+  turn). A slow handler stalls only its own connection. The loop
+  allocator must be thread-safe in this mode (Zig 0.16's default
+  `DebugAllocator` config is; so are `page_allocator` and
+  `smp_allocator`).
+- `.direct` — dispatch runs on the loop thread. Lowest overhead for
+  provably-fast handlers; one slow handler stalls every connection
+  on that loop.
 
 ```zig
-try server.listenEventLoop(.{ .dispatch_mode = .worker_pool });
+// default: worker-pool dispatch
+try server.listenEventLoop(.{});
+// opt-out for provably-fast handlers / benchmarks:
+try server.listenEventLoop(.{ .dispatch_mode = .direct });
 ```
 
 ### Loops: one entry point, `loop_count` selects the shape

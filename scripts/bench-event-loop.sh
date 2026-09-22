@@ -98,7 +98,10 @@ run_mode() { # $1 = label, $2... = demo args
 }
 
 echo "[bench] threads=$THREADS reqs/thread=$REQS port=$PORT"
-run_mode "direct"
+# Explicit flags: worker-pool dispatch is now the default, so the direct
+# baseline passes --direct (and loops-4 keeps direct dispatch to preserve
+# the original three-way comparison).
+run_mode "direct" --direct
 run_mode "pool" --pool
-run_mode "loops-4" --loops 4
+run_mode "loops-4" --loops 4 --direct
 echo "[bench] done."

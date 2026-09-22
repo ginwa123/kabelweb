@@ -323,6 +323,9 @@ test "listenEventLoop serves static-dir fallback via hijack (direct)" {
             .max_conns = 32,
             .idle_timeout_ms = 10_000,
             .header_timeout_ms = 2_000,
+            // Explicit: the config default is now `.worker_pool` — this
+            // test covers the `.direct` opt-out path.
+            .dispatch_mode = .direct,
         },
     };
     const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});

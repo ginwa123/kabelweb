@@ -19,13 +19,15 @@
 //!   needed.
 //!
 //! Dispatch modes (`Config.dispatch_mode`):
-//!   - `.direct` (default): dispatch runs on the loop thread. Fastest for
-//!     fast handlers; a slow handler stalls every conn on this loop.
-//!   - `.worker_pool`: complete requests are handed to a bounded
-//!     `worker_pool.zig:WorkerPool`; the loop thread only does I/O.
-//!     Completions return via a mutex queue + socketpair wake fd. Queue-full
-//!     falls back to direct (counted in `Stats.inline_fallback`).
-//!     The loop allocator must be thread-safe in this mode.
+//!   - `.worker_pool` (default): complete requests are handed to a bounded
+//!     `worker_pool.zig:WorkerPool`; the loop thread only does I/O, so a
+//!     slow handler stalls only its own connection. Completions return via
+//!     a mutex queue + socketpair wake fd. Queue-full falls back to direct
+//!     (counted in `Stats.inline_fallback`). The loop allocator must be
+//!     thread-safe in this mode (Zig 0.16's default `DebugAllocator`
+//!     config is; so are `page_allocator` / `smp_allocator`).
+//!   - `.direct`: dispatch runs on the loop thread. Lowest overhead for
+//!     provably-fast handlers; a slow handler stalls every conn on this loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -45,6 +47,7 @@ pub const DispatchMode = enum {
     /// On the loop thread (fast handlers; slow ones stall the loop).
     direct,
     /// On `worker_pool.zig` threads (loop thread does I/O only).
+    /// Default: a slow handler can't stall the reactor.
     worker_pool,
 };
 
@@ -78,8 +81,10 @@ pub const Config = struct {
     ///   H1 framing; H2 conns hijack to the H2 driver thread.
     tls_enabled: bool = false,
     h2c_enabled: bool = false,
-    /// Where dispatch runs (see `DispatchMode`).
-    dispatch_mode: DispatchMode = .direct,
+    /// Where dispatch runs (see `DispatchMode`). Default `.worker_pool`:
+    /// a slow handler stalls only its own connection, not the loop.
+    /// `.direct` is the low-overhead opt-out for fast handlers.
+    dispatch_mode: DispatchMode = .worker_pool,
     /// Pool threads in `worker_pool` mode. 0 = one per CPU (min 2).
     worker_threads: usize = 0,
     /// Max queued (undispatched) offload jobs. Past this, dispatch falls

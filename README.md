@@ -108,10 +108,9 @@ Key files and roles:
 
 Threading model:
 
-- `listen()` — thread-per-connection, blocking I/O. Serves H1 + H2c + TLS + SSE/WS/static directly.
-- `listenEventLoop()` — 1 loop = 1 thread, non-blocking I/O only.
-  - `.direct` — dispatch on loop thread (fast handlers).
-  - `.worker_pool` — complete requests → `WorkerPool` threads; queue-full → inline fallback (counted).
+- `listenEventLoop()` — the only serve path (the old thread-per-connection `listen()` was deleted): 1 loop = 1 thread, non-blocking I/O only.
+  - `.worker_pool` (default) — complete requests → `WorkerPool` threads; queue-full → inline fallback (counted). A slow handler stalls only its connection (loop allocator must be thread-safe).
+  - `.direct` — dispatch on loop thread (low overhead, but a slow handler stalls every conn on the loop).
   - Long-lived/upgrades never block the loop: `hijack_static` → small static pool, `hijack_sse/ws` → dedicated thread/conn, H2-preface/TLS → hijack to H2/TLS worker. Reactor v1 returns `501` for SSE/WS/H2/TLS if unsupported.
   - Multi-loop ready: `loop_id/loop_count + SO_REUSEPORT`, `Stats.combine`.
 
@@ -657,7 +656,7 @@ Flags: `zig build run -- --pool N --loops N` (worker pool size / REUSEPORT loop 
 
 Event loop (`event_loop.zig` `Config`): `max_conns`, `idle_timeout`, `header_timeout`,
 `max_request_bytes` (default 8 MB), `max_requests_per_conn` (default 1000),
-`loop_id/loop_count`, `tls/h2c`, `dispatch_mode (.direct / .worker_pool)`.
+`loop_id/loop_count`, `tls/h2c`, `dispatch_mode (.worker_pool default / .direct)`.
 
 Worker pool (`worker_pool.zig` `Config`): `thread_count` (`0` = ncpu, min 2),
 `queue_depth`, `stack 8MB`. `submit` is non-blocking (`QueueFull` → inline fallback).

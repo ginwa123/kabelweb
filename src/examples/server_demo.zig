@@ -881,9 +881,10 @@ pub fn run(init: std.process.Init) !void {
     // these). The reactor is the only serve path now; --event-loop is
     // accepted for compatibility and implies the default single loop.
     //   --event-loop   (default single poll reactor; no-op flag)
-    //   --pool         dispatch via worker pool
+    //   --direct       dispatch on the loop thread (bench baseline)
+    //   --pool         worker-pool dispatch (the DEFAULT — no-op flag)
     //   --loops N      N REUSEPORT loops
-    var use_pool = false;
+    var use_direct = false;
     var loop_count: usize = 0;
     // `initAllocator` (not `init`): the plain iterator is a compileError
     // on Windows — the allocator variant works on all three CI targets.
@@ -893,14 +894,18 @@ pub fn run(init: std.process.Init) !void {
     while (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--event-loop")) {
             // No-op: the event loop is the only serve path.
+        } else if (std.mem.eql(u8, arg, "--direct")) {
+            use_direct = true;
         } else if (std.mem.eql(u8, arg, "--pool")) {
-            use_pool = true;
+            // Default dispatch mode — kept as a no-op for bench compat.
         } else if (std.mem.eql(u8, arg, "--loops")) {
             const n_str = arg_it.next() orelse continue;
             loop_count = std.fmt.parseInt(usize, n_str, 10) catch 0;
         }
     }
-    const dispatch_mode = if (use_pool) gserverz.EventLoopConfig{ .dispatch_mode = .worker_pool } else gserverz.EventLoopConfig{};
+    const dispatch_mode = gserverz.EventLoopConfig{
+        .dispatch_mode = if (use_direct) .direct else .worker_pool,
+    };
     // One serve path: the event-loop reactor. loop_count 0/1 = single
     // loop, N = N REUSEPORT loops. (The old threaded listen() was deleted;
     // SSE/WS/static/H2/TLS all work on the loop via fd handoff.)
