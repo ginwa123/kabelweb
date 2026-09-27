@@ -136,7 +136,8 @@ src/
     client.zig        # buffered Client.perform()
     stream.zig        # streaming ResponseStream/StreamScanner/openStream
     curl.zig / request.zig / response.zig / methods.zig / options.zig
-    *_test.zig        # suites spin an in-process server (relative import, no network)
+    # NOTE: tests live colocated — every *.zig above carries its own
+    # `test { … }` blocks (there are no separate *_test.zig files)
   examples/
     server_demo.zig   # demo server: landing page, /health, SSE /stream, WS /ws, /template
     client_smoke.zig  # `kabelweb-client-smoke <METHOD> <URL>` manual smoke CLI
@@ -186,8 +187,9 @@ Run from the package root (`/home/ginwa/kabelweb`):
 cd /home/ginwa/kabelweb
 zig build test            # full: fast suites + 60s SSE soaks
 zig build test-fast       # fast only, no soaks — what CI runs per-platform
-zig build test-server     # server half only
-zig build test-client     # client half only
+zig build test-server     # server half only (test-name filter `server.`)
+zig build test-client     # client half only (test-name filter `client.`)
+zig build test-demo       # example (server demo) static-contract tests only
 zig build test -Dtest-filter=<substr>   # filter (Zig 0.16: no `-- --test-filter`)
 zig build                 # build both example exes only
 zig build run             # server demo → zig-out/bin/kabelweb-server-demo (port 29590)
@@ -202,6 +204,17 @@ curl http://127.0.0.1:29590/health       # -> OK
 curl "http://127.0.0.1:29590/hello?name=World"
 curl -N http://127.0.0.1:29590/stream    # SSE
 ```
+
+Tests are **colocated with the implementation**: every file under `src/` owns
+its own `test { … }` blocks — there are no `*_test.zig` files. `src/root.zig`
+imports each test-owning file in its `test {}` block so the runner can reach
+them, and each moved suite lives in its own `const <suite>_tests = struct { … };`
+namespace inside that file. The 2×60 s SSE soaks sit in `server/sse_manager.zig`
+and self-skip unless `KABELWEB_SOAK=1` (only `zig build test` sets it), which is
+what keeps `test-fast` / `test-server` / `test-client` fast. The example exe root
+(`src/examples/server_demo.zig`) is not reachable from the lib test root, so its
+tests run through the dedicated `test-demo` step (also wired into `test` and
+`test-fast`).
 
 Link model (`build.zig`): system probe first — when the host has
 libcurl + libssl + libcrypto, link system libs; else embed the

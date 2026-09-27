@@ -656,21 +656,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Test module: the full entry (src/full_test.zig) — fast suites via
-    // src/root.zig PLUS the 60 s SSE soaks. The repo-root gate runs the
-    // fast set only (via the kabelweb lib module); run this package's
-    // own `zig build test` to exercise everything including soaks.
+    // Tests are colocated with the implementation: every `src/**/*.zig`
+    // file carries its own `test { ... }` blocks (the former `*_test.zig`
+    // files were merged into them and deleted), and `src/root.zig` imports
+    // each test-owning file in its `test {}` block so the runner can reach
+    // them.
+    //
+    // All four test steps compile that same root and differ only in the
+    // test-name filter + environment (see the step wiring below):
+    //   test        → everything, incl. the 2×60 s SSE soaks (KABELWEB_SOAK=1)
+    //   test-fast   → everything except the soaks (they self-skip)
+    //   test-server → `server.` prefixed test names only
+    //   test-client → `client.` prefixed test names only
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/full_test.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_mod.linkSystemLibrary("c", .{});
     test_mod.link_libc = true;
 
-    // Fast test module: the lib root (src/root.zig) — every suite
-    // EXCEPT the 60 s SSE soaks. CI runs this on all platforms; the
-    // full `test` step (with soaks) runs where timing is stable.
     const fast_test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -679,23 +684,36 @@ pub fn build(b: *std.Build) void {
     fast_test_mod.linkSystemLibrary("c", .{});
     fast_test_mod.link_libc = true;
 
-    // Split test modules (server-only / client-only) — same fast set,
-    // used by CI to localize a hanging suite to one half. Permanent
-    // steps: useful for consumers working on one half too.
     const server_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/server/test_runner.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     server_test_mod.linkSystemLibrary("c", .{});
     server_test_mod.link_libc = true;
     const client_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/client_suite_test.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     client_test_mod.linkSystemLibrary("c", .{});
     client_test_mod.link_libc = true;
+
+    // The server demo is an executable root that consumes the lib through
+    // `@import("kabelweb")`, so the lib test root cannot pull its tests in
+    // (a named self-import would be a module cycle) — it gets its own test
+    // module + `test-demo` wiring below. Its tests are the static-contract
+    // checks on the landing page HTML.
+    const demo_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/examples/server_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "kabelweb", .module = mod },
+        },
+    });
+    demo_test_mod.linkSystemLibrary("c", .{});
+    demo_test_mod.link_libc = true;
 
     // Example binaries (living docs — see src/examples/). The server
     // demo serves the landing page + SSE/WS/template routes; the client
@@ -759,7 +777,7 @@ pub fn build(b: *std.Build) void {
     // the exes need it too.
     // Second iteration skips the Windows stub generation via the
     // fileExists check (first iteration already wrote the archive).
-    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_test_mod, client_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_test_mod, client_test_mod, demo_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
         if (sys.use_system) {
             // System libs path. `linkSystemLibrary("curl")` does NOT auto-
             // pull libssl/libcrypto (no pkg-config Requires honour), so we
@@ -949,7 +967,7 @@ pub fn build(b: *std.Build) void {
     // resolve cleanly. On
     // Linux the system libssl/libcrypto live in /usr/lib, which Zig does
     // not add by default for some Compile steps.
-    for ([_]*std.Build.Module{ test_mod, fast_test_mod, server_test_mod, client_test_mod }) |tm| {
+    for ([_]*std.Build.Module{ test_mod, fast_test_mod, server_test_mod, client_test_mod, demo_test_mod }) |tm| {
         if (target.result.os.tag == .linux and sys.use_system) {
             tm.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
             if (multiarch_lib_dir) |dir| {
@@ -962,6 +980,11 @@ pub fn build(b: *std.Build) void {
     }
     const mod_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    // The 2×60 s SSE soaks live in `server/sse_manager.zig` and self-skip
+    // (`error.SkipZigTest`) unless KABELWEB_SOAK is set — this is what makes
+    // `test` the slow, complete step and `test-fast`/`test-server`/
+    // `test-client` the fast ones.
+    run_mod_tests.setEnvironmentVariable("KABELWEB_SOAK", "1");
     const test_step = b.step("test", "Run kabelweb package tests (fast suites + 60s SSE soaks)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(b.getInstallStep());
@@ -975,17 +998,33 @@ pub fn build(b: *std.Build) void {
     test_fast_step.dependOn(&run_fast_tests.step);
     test_fast_step.dependOn(b.getInstallStep());
 
-    // Split halves of the fast set (server-only / client-only) — CI
-    // runs these separately so a hanging suite is localized to one
-    // half instead of stalling the whole binary with zero output.
-    const server_tests = b.addTest(.{ .root_module = server_test_mod, .filters = test_filters });
+    // Split halves of the fast set (server-only / client-only) — CI runs
+    // these separately so a hanging suite is localized to one half instead of
+    // stalling the whole binary with zero output. The halves are selected by
+    // test-name prefix: with the root module rooted at `src/root.zig`, a test
+    // name starts with the module-relative file path (`server.…` /
+    // `client.…`). An explicit `-Dtest-filter=…` still wins.
+    const server_filters: []const []const u8 = if (test_filter.len > 0) test_filters else &.{"server."};
+    const server_tests = b.addTest(.{ .root_module = server_test_mod, .filters = server_filters });
     const run_server_tests = b.addRunArtifact(server_tests);
-    const test_server_step = b.step("test-server", "Run kabelweb server suites only (no soaks, no sse_chunked)");
+    const test_server_step = b.step("test-server", "Run kabelweb server suites only (no soaks)");
     test_server_step.dependOn(&run_server_tests.step);
     test_server_step.dependOn(b.getInstallStep());
-    const client_tests = b.addTest(.{ .root_module = client_test_mod, .filters = test_filters });
+    const client_filters: []const []const u8 = if (test_filter.len > 0) test_filters else &.{"client."};
+    const client_tests = b.addTest(.{ .root_module = client_test_mod, .filters = client_filters });
     const run_client_tests = b.addRunArtifact(client_tests);
     const test_client_step = b.step("test-client", "Run kabelweb client suites only");
     test_client_step.dependOn(&run_client_tests.step);
     test_client_step.dependOn(b.getInstallStep());
+
+    // Demo (executable root) tests — the landing-page static-contract checks
+    // that live in `src/examples/server_demo.zig`. They are fast file-grep
+    // assertions, so they join both the full and the fast gates.
+    const demo_tests = b.addTest(.{ .root_module = demo_test_mod, .filters = test_filters });
+    const run_demo_tests = b.addRunArtifact(demo_tests);
+    const test_demo_step = b.step("test-demo", "Run the server-demo (example) tests only");
+    test_demo_step.dependOn(&run_demo_tests.step);
+    test_demo_step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_demo_tests.step);
+    test_fast_step.dependOn(&run_demo_tests.step);
 }

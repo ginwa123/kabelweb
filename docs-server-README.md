@@ -84,10 +84,11 @@ To add the same pattern to your own server, copy the
    browsers render it as HTML (without this header some browsers
    sniff and fall back to plain text).
 
-Static-contract regression tests in
-`src/main_static_html_test.zig` assert the constant, function, route
-registration, doctype, charset, endpoint table, and EventSource demo
-all stay present across edits — see "Running Tests" below.
+Static-contract regression tests colocated in
+`src/examples/server_demo.zig` (the `main_static_html_tests` namespace)
+assert the constant, function, route registration, doctype, charset,
+endpoint table, and EventSource demo all stay present across edits —
+see "Running Tests" below.
 
 ## Architecture
 
@@ -181,13 +182,15 @@ three ways (`direct` / `pool` / `loops-4` via the demo's `--pool` /
 stdlib-only python3 concurrent loader (keep-alive reuse per thread).
 No `wrk` needed.
 
-Tests: `src/server/event_loop_test.zig` (framing units + live loopback
-keep-alive test), `src/server/event_loop_server_test.zig` (real server
-+ routes through `listenEventLoop`: GET, POST echo, 404; static-dir,
-SSE, WebSocket and H2C hijacks; worker-pool mode with ordering + stats
-asserts; multi-loop with aggregate-stats asserts),
-`src/server/worker_pool_test.zig` (exactly-once, queue-full
-backpressure, stop-drains).
+Tests are colocated with the implementation. For the loop we have the
+`event_loop_tests` namespace in `src/server/event_loop.zig` (framing
+units + live loopback keep-alive test), the `event_loop_server_tests`
+namespace in `src/server/http_server.zig` (real server + routes through
+`listenEventLoop`: GET, POST echo, 404; static-dir, SSE, WebSocket and
+H2C hijacks; worker-pool mode with ordering + stats asserts; multi-loop
+with aggregate-stats asserts), and the `worker_pool_tests` namespace in
+`src/server/worker_pool.zig` (exactly-once, queue-full backpressure,
+stop-drains).
 
 ```
 src/
@@ -199,8 +202,10 @@ src/
 ├── websocket_frames.zig      # RFC 6455 frame parser/encoder (text, binary, ping, pong, close)
 ├── websocket_handshake.zig   # RFC 6455 §4 HTTP upgrade handshake + SHA-1 + base64
 ├── websocket_manager.zig     # WebSocket client registry: register, broadcast, remove
-├── main_static_html_test.zig # Static-contract tests for LANDING_PAGE_HTML
 └── build.zig                 # Build configuration
+
+# Every file above owns its own tests in colocated `test { … }` blocks
+# (the former `*_test.zig` files were merged into them).
 ```
 
 ### Core Components
