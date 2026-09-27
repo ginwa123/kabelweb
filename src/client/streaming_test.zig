@@ -1,11 +1,11 @@
 //! Streaming tests — exercise ResponseStream + StreamScanner against
-//! an in-process custom_http_server (GinwaServer), not httpbin.org.
+//! an in-process custom_http_server (KabelServer), not httpbin.org.
 //! Eliminates network flakiness and rate-limited-throttling during CI.
 //!
 //! The TestServer fixture:
 //!   1. Binds Address.init("127.0.0.1", 0) (OS picks ephemeral port)
 //!   2. Calls getsockname() to retrieve the assigned port
-//!   3. Inits GinwaServer, registers routes, spawns a worker thread
+//!   3. Inits KabelServer, registers routes, spawns a worker thread
 //!      that calls server.listenEventLoop (blocks until shutdown())
 //!   4. Provides url(path) for tests to build request URLs
 //!   5. deinit calls server.shutdown(), joins worker thread, frees.
@@ -53,7 +53,7 @@ fn getBoundPort(sock_fd: c_int) !u16 {
 
 /// Local HTTP test server. Returns a URL for tests to hit.
 const TestServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -65,15 +65,15 @@ const TestServer = struct {
         // Bind on ephemeral port (0 = OS picks).
         const addr = try gserverz.Address.init("127.0.0.1", 0);
         // NOTE: addr.sock_fd is intentionally NOT closed on errdefer —
-        // GinwaServer.init() takes ownership of it. The errdefer is
+        // KabelServer.init() takes ownership of it. The errdefer is
         // a no-op marker; the socket is bound by bind() but not yet
         // listening, so we let it leak to the test process exit
-        // (kernel reclaims) if GinwaServer.init() fails after this.
+        // (kernel reclaims) if KabelServer.init() fails after this.
 
         // Query the OS-assigned port via cross-platform getsockname.
         const port: u16 = try getBoundPort(addr.sock_fd);
 
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
 
         ts.* = .{
             .server = gs,
@@ -133,7 +133,7 @@ const TestServer = struct {
     }
 };
 
-fn listenFn(server: *gserverz.GinwaServer) void {
+fn listenFn(server: *gserverz.KabelServer) void {
     server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 

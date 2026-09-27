@@ -26,7 +26,7 @@ const HttpResponse = gserverz.HttpResponse;
 // independent.
 
 const TestServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -39,7 +39,7 @@ const TestServer = struct {
 
         const port: u16 = try getBoundPort(addr.sock_fd);
 
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
 
         ts.* = .{
             .server = gs,
@@ -120,7 +120,7 @@ fn getBoundPort(sock_fd: c_int) !u16 {
     return @byteSwap(@as(u16, @intCast(raw.port)));
 }
 
-fn listenFn(server: *gserverz.GinwaServer) void {
+fn listenFn(server: *gserverz.KabelServer) void {
     server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
@@ -152,7 +152,7 @@ fn deleteHandler(_: HttpContext, _: HttpRequest, res: HttpResponse) !HttpRespons
 fn statusHandler(ctx: HttpContext, req: HttpRequest, _: HttpResponse) !HttpResponse {
     const n_str = req.params.get("n") orelse "400";
     const code = std.fmt.parseInt(u16, n_str, 10) catch 400;
-    // 204 (and 304) responses MUST have an empty body — GinwaServer's
+    // 204 (and 304) responses MUST have an empty body — KabelServer's
     // `HttpResponse.init` may include a default Content-Length; we
     // explicitly skip the body when the status forbids it.
     if (code == 204 or code == 304) {
@@ -264,7 +264,7 @@ test "edge: 1 MiB request body round-trips intact" {
 }
 
 test "edge: very long header value (256 B) is preserved exactly" {
-    // SKIPPED: GinwaServer's `req.headers` StringHashMap allocates per
+    // SKIPPED: KabelServer's `req.headers` StringHashMap allocates per
     // header key but doesn't trim trailing whitespace from values, so
     // a 256 B value of all 'x's trips a different code path than the
     // httpbin.org equivalent (which uses libcurl's own parser on the
@@ -343,7 +343,7 @@ test "edge: very long URL (8 KiB query string) works without truncation" {
 }
 
 test "edge: Set-Cookie header is preserved on a 302 response" {
-    // The local GinwaServer stores response headers in a HashMap which
+    // The local KabelServer stores response headers in a HashMap which
     // collapses duplicate keys, so we can't reliably test multiple
     // Set-Cookie headers. We DO test that ONE Set-Cookie header round-
     // trips through libcurl's response parsing (this is the part that
@@ -395,7 +395,7 @@ test "edge: URL with userinfo (http://user:pass@host/) parses — no InvalidUrl"
 // coverage is missing:
 //
 //   - "edge: Transfer-Encoding: chunked response is reassembled" —
-//     httpbin.org/stream/N. The local GinwaServer doesn't yet support
+//     httpbin.org/stream/N. The local KabelServer doesn't yet support
 //     chunked-response generation. When custom_http_server adds it,
 //     re-add this test against a local /stream/N route.
 //

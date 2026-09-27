@@ -1,7 +1,7 @@
 //! Single-threaded poll reactor for plain HTTP/1.1 (Phase 2-3).
 //!
 //! Non-breaking companion to `http_server.zig:listen` (thread-per-connection).
-//! `GinwaServer.listenEventLoop` runs this instead of the accept+
+//! `KabelServer.listenEventLoop` runs this instead of the accept+
 //! `group.concurrent` loop. Scope of v1:
 //!
 //!   - Cross-platform: `poll(2)` on POSIX, `WSAPoll` on Windows
@@ -69,7 +69,7 @@ pub const Config = struct {
     /// This loop's index (`listenEventLoop` sets it per loop in multi
     /// mode) and the total loop count. Read-only inside the loop.
     loop_id: usize = 0,
-    /// Loop shape for `GinwaServer.listenEventLoop`: `0`/`1` = single
+    /// Loop shape for `KabelServer.listenEventLoop`: `0`/`1` = single
     /// loop on the calling thread, `>1` = that many `SO_REUSEPORT` loops
     /// (POSIX-only, clamped to `max_multi_loops`).
     loop_count: usize = 1,
@@ -453,7 +453,7 @@ pub const EventLoop = struct {
 
     /// Run until `requestShutdown` (or listener closed). Listener must
     /// already be bound; this takes it non-blocking + `listen(2)`-ed by the
-    /// caller (`GinwaServer.listenEventLoop` does that).
+    /// caller (`KabelServer.listenEventLoop` does that).
     pub fn run(
         self: *EventLoop,
         listener_fd: i32,

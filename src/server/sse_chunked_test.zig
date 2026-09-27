@@ -216,7 +216,7 @@ test "SseManager: removeClient sends the terminating chunk (0\\r\\n\\r\\n) befor
 // We test this via static source-check (the pattern used by 12+ other
 // tests in this codebase, e.g.
 // `src/http_handlers/git_pr_create_test.zig`). A
-// behavioural GinwaServer-level test would require spinning up a real
+// behavioural KabelServer-level test would require spinning up a real
 // Io runtime + concurrent group + accepting socket, which is brittle for
 // a unit test and out of scope for this task. The source-check is the
 // canonical regression guard for "header X is present on response Y".
@@ -283,7 +283,7 @@ fn readHttpServerSource(allocator: std.mem.Allocator) ![]u8 {
 
 test "HTTP server: SSE response declares Transfer-Encoding: chunked" {
     // Regression for `net::ERR_INCOMPLETE_CHUNKED_ENCODING`. The SSE
-    // response headers in the `.sse =>` arm of `GinwaServer.handle` must
+    // response headers in the `.sse =>` arm of `KabelServer.handle` must
     // include `Transfer-Encoding: chunked` so HTTP/1.1 intermediaries
     // forward the body using chunked-decoding semantics.
     const source = try readHttpServerSource(std.testing.allocator);

@@ -37,7 +37,7 @@ const read_chunk = 16 * 1024;
 /// the connection-preface sniff) or a TLS connection whose ALPN negotiated `h2`
 /// (chosen after the handshake, which is how browsers get HTTP/2 at all).
 pub fn serveConnection(
-    server: *http_server.GinwaServer,
+    server: *http_server.KabelServer,
     conn: stream_mod.Stream,
     alloc: std.mem.Allocator,
     initial: []const u8,
@@ -71,7 +71,7 @@ pub fn serveConnection(
 }
 
 /// Run every request the driver has fully received, in arrival order.
-fn serveReady(server: *http_server.GinwaServer, alloc: std.mem.Allocator, conn: *connection.Connection) !void {
+fn serveReady(server: *http_server.KabelServer, alloc: std.mem.Allocator, conn: *connection.Connection) !void {
     while (conn.nextRequest()) |req| {
         var pairs: std.ArrayList(hpack.Pair) = .empty;
         defer pairs.deinit(alloc);
@@ -92,7 +92,7 @@ fn serveReady(server: *http_server.GinwaServer, alloc: std.mem.Allocator, conn: 
 
 /// Route a decoded h2 request and produce (status, headers, body).
 fn dispatch(
-    server: *http_server.GinwaServer,
+    server: *http_server.KabelServer,
     alloc: std.mem.Allocator,
     req: *const connection.Request,
     pairs: *std.ArrayList(hpack.Pair),
@@ -208,9 +208,9 @@ fn notFound(alloc: std.mem.Allocator, status: *u16, body: *[]const u8) !void {
     body.* = res.body;
 }
 
-/// CORS response headers, mirroring `GinwaServer.applyCORSResponse` (which is not
+/// CORS response headers, mirroring `KabelServer.applyCORSResponse` (which is not
 /// public) by calling the same `security` helper it wraps.
-fn applyCors(server: *http_server.GinwaServer, req: *const http_parser.HttpRequest, resp: *http_parser.HttpResponse) !void {
+fn applyCors(server: *http_server.KabelServer, req: *const http_parser.HttpRequest, resp: *http_parser.HttpResponse) !void {
     return security.applyCORSResponse(resp, req, server.cors);
 }
 
@@ -237,8 +237,8 @@ fn toResponse(
 }
 
 /// Server-level security headers (CSP etc.). Wraps the same `security` helper the
-/// h1 path uses via `GinwaServer.applySecurityHeadersTo`.
-fn applySecurityHeaders(server: *http_server.GinwaServer, resp: *http_parser.HttpResponse) void {
+/// h1 path uses via `KabelServer.applySecurityHeadersTo`.
+fn applySecurityHeaders(server: *http_server.KabelServer, resp: *http_parser.HttpResponse) void {
     security.applySecurityHeadersWith(resp, server.security_headers);
 }
 

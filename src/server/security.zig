@@ -1,5 +1,5 @@
 // ============================================================================
-// security.zig — security primitives for the ginwasaas HTTP server.
+// security.zig — security primitives for the kabelweb HTTP server.
 //
 // Provides six `pub fn` primitives that handlers opt into:
 //
@@ -59,8 +59,8 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// CORS configuration used by `buildPreflightResponse` and
 /// `buildPreHandlerFailRedirect`. Mirrors the field-by-field shape on
-/// `GinwaServer.cors` so the framework can forward the config by value
-/// to these pure helpers (no GinwaServer pointer needed at the test
+/// `KabelServer.cors` so the framework can forward the config by value
+/// to these pure helpers (no KabelServer pointer needed at the test
 /// site).
 pub const CORSConfig = struct {
     enabled: bool = false,
@@ -73,7 +73,7 @@ pub const CORSConfig = struct {
 
 /// Error codes returned by the framework's pre-handler fail redirect.
 /// String constants match the `?error=<code>` query keys that
-/// `redirectTo*WithError` helpers in the ginwasaas handlers consume.
+/// `redirectTo*WithError` helpers in the kabelweb handlers consume.
 pub const PreHandlerFailCode = enum {
     cross_origin,
     body_too_large,
@@ -89,7 +89,7 @@ pub const PreHandlerFailCode = enum {
 };
 
 /// (Removed in follow-up: `buildPreHandlerFailRedirect` is no longer used
-/// by GinwaServer since the per-route `on_pre_handler_fail` opt-in was
+/// by KabelServer since the per-route `on_pre_handler_fail` opt-in was
 /// dropped. The helpers `preHandlerCheck`, `checkOriginInList`,
 /// `applyCORSHeaders`, `buildPreflightResponse`, `applyCORSResponse`
 /// remain as usable primitives; handlers continue to call `checkOrigin`
@@ -384,7 +384,7 @@ pub fn rateLimitResetForTesting() void {
 /// Security response headers applied to every response. The defaults are
 /// a strict, dependency-free baseline (`'self'` + inline styles/scripts).
 /// Apps that load third-party assets (CDN scripts, analytics beacons)
-/// should override via `GinwaServer.security_headers` — the library
+/// should override via `KabelServer.security_headers` — the library
 /// itself stays agnostic of any specific origin.
 pub const SecurityHeaders = struct {
     content_security_policy: []const u8 = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
@@ -543,7 +543,7 @@ pub fn checkOriginInList(
 ///           error.PayloadTooLarge      => return redirect(...),
 ///       };
 
-/// When the GinwaServer route is configured with
+/// When the KabelServer route is configured with
 /// `Route.on_pre_handler_fail`, this check runs automatically inside
 /// the dispatch loop and handlers don't need to call it at all.
 pub fn preHandlerCheck(
@@ -711,7 +711,7 @@ pub fn buildPreflightResponse(
 /// request's Origin matches `config.allowed_origins`.
 ///
 /// (Currently unused: the per-route `on_pre_handler_fail` mechanism
-/// was dropped, so `GinwaServer.runPreHandlerFailRedirect` no longer
+/// was dropped, so `KabelServer.runPreHandlerFailRedirect` no longer
 /// calls this. Kept as an exportable helper for callers that want to
 /// wire the same redirect logic themselves, plus to keep the
 /// coverage tests passing.)
@@ -892,7 +892,7 @@ pub fn buildEngineBlockPage(
         \\<h1>{s}</h1>
         \\<p>{s}</p>
         \\<p>{s}</p>
-        \\<hr><small>ginwa http server - engine pre-handler gate</small>
+        \\<hr><small>kabel http server - engine pre-handler gate</small>
         \\</body></html>
     , .{ title, title, detail, hint });
 

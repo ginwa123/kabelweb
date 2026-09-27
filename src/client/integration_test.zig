@@ -1,4 +1,4 @@
-//! Behavioural tests against an in-process GinwaServer fixture.
+//! Behavioural tests against an in-process KabelServer fixture.
 //!
 //! These tests were originally written against https://httpbin.org but
 //! were rewritten to hit a local `custom_http_server` so the suite is
@@ -30,7 +30,7 @@ const HttpResponse = gserverz.HttpResponse;
 /// Local HTTP test server. Same shape as the streaming TestServer so
 /// both suites share the fixture semantics.
 const TestServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -43,7 +43,7 @@ const TestServer = struct {
 
         const port: u16 = try getBoundPort(addr.sock_fd);
 
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
 
         ts.* = .{
             .server = gs,
@@ -61,7 +61,7 @@ const TestServer = struct {
         try self.server.router.put("/put", echoPutHandler);
         try self.server.router.patch("/patch", echoPatchHandler);
         try self.server.router.delete("/delete", deleteHandler);
-        // The GinwaServer router uses `:param` placeholders for path
+        // The KabelServer router uses `:param` placeholders for path
         // segments. /status/:n matches /status/404 etc.
         try self.server.router.get("/status/:n", statusHandler);
         try self.server.router.get("/redirect/:n", redirectHandler);
@@ -83,7 +83,7 @@ const TestServer = struct {
     }
 };
 
-fn listenFn(server: *gserverz.GinwaServer) void {
+fn listenFn(server: *gserverz.KabelServer) void {
     server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
@@ -125,7 +125,7 @@ fn getHandler(_: HttpContext, _: HttpRequest, res: HttpResponse) !HttpResponse {
 }
 
 fn echoPostHandler(_: HttpContext, req: HttpRequest, res: HttpResponse) !HttpResponse {
-    // The GinwaServer already buffers the entire request body into
+    // The KabelServer already buffers the entire request body into
     // req.body (a `[]const u8`) before invoking handlers — no streaming
     // read needed. Truncate to Content-Length to handle clients that
     // sent extra framing (libcurl is well-behaved, so this is usually

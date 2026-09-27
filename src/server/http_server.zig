@@ -259,7 +259,7 @@ pub const Address = struct {
             // option) but was `SOL_SOCKET, SO_TYPE` on macOS, which is an
             // invalid direction on a listen socket and triggers an
             // `INVAL` in `posix.setsockopt`'s switch — the `unreachable`
-            // arm crashes the process during GinwaServer.init().
+            // arm crashes the process during KabelServer.init().
             //
             // sys/socket.h SOL_SOCKET = 1 on Linux and 0xffff on macOS;
             // SO_REUSEADDR = 0x0004 on both. Using the standard library's
@@ -337,7 +337,7 @@ fn tlsStreamClose(conn: *anyopaque) void {
     tc.shutdown();
 }
 
-pub const GinwaServer = struct {
+pub const KabelServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     address: Address,
@@ -380,7 +380,7 @@ pub const GinwaServer = struct {
 
     /// HMAC secret used by `security.csrfTokenIssue` / `csrfTokenValidate`.
     /// Defaults to a dev-only constant; production deployments should
-    /// override via `server.csrf_secret = "..."` after `GinwaServer.init`.
+    /// override via `server.csrf_secret = "..."` after `KabelServer.init`.
     csrf_secret: []const u8 = "dev-only-csrf-secret-change-in-prod",
 
     /// Server-wide CORS configuration. Defaults to "CORS off" (same-origin
@@ -465,8 +465,8 @@ pub const GinwaServer = struct {
     /// How many of the above slots are registered.
     el_multi_count: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, address: Address) !*GinwaServer {
-        const gs = try allocator.create(GinwaServer);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, address: Address) !*KabelServer {
+        const gs = try allocator.create(KabelServer);
         errdefer allocator.destroy(gs);
 
         // Heap-allocate the cross-redirect ContextStore eagerly so
@@ -497,7 +497,7 @@ pub const GinwaServer = struct {
     /// to clear both `static_dir_handler` and `static_dir_cfg`.
     /// See the `static_dir_handler` field doc for the handler contract.
     pub fn setStaticDirHandler(
-        self: *GinwaServer,
+        self: *KabelServer,
         handler: ?*const fn (
             cfg: *const anyopaque,
             allocator: std.mem.Allocator,
@@ -517,7 +517,7 @@ pub const GinwaServer = struct {
     /// ALPN preference is `h2` first, then `http/1.1` — the same shape Go's
     /// `http.Server` gets from `NextProtos`, so one listener serves both
     /// protocols and the client's offer decides.
-    pub fn enableTls(self: *GinwaServer, cert_pem: []const u8, key_pem: []const u8) !void {
+    pub fn enableTls(self: *KabelServer, cert_pem: []const u8, key_pem: []const u8) !void {
         if (self.tls_ctx) |old| old.deinit();
         installTlsStreamOps();
         self.tls_ctx = try tls_mod.Ctx.init(
@@ -531,13 +531,13 @@ pub const GinwaServer = struct {
     /// Adopt a TLS context built by the caller (e.g. so `--tls` can be validated
     /// before any background subsystem starts). Takes ownership: `deinit()` frees
     /// whatever context is installed.
-    pub fn setTlsCtx(self: *GinwaServer, ctx: *tls_mod.Ctx) void {
+    pub fn setTlsCtx(self: *KabelServer, ctx: *tls_mod.Ctx) void {
         if (self.tls_ctx) |old_ctx| old_ctx.deinit();
         installTlsStreamOps();
         self.tls_ctx = ctx;
     }
 
-    pub fn deinit(self: *GinwaServer) void {
+    pub fn deinit(self: *KabelServer) void {
         // Order matters: stop the cronjob thread BEFORE freeing its
         // registry (the tick thread holds a pointer to `self`).
         self.cronjob_manager.stop();
@@ -555,13 +555,13 @@ pub const GinwaServer = struct {
         if (self.context_store) |store| store.deinit();
     }
 
-    /// Free the GinwaServer struct itself. Callers that allocated the
-    /// server with `init(...)` (which calls `allocator.create(GinwaServer)`)
+    /// Free the KabelServer struct itself. Callers that allocated the
+    /// server with `init(...)` (which calls `allocator.create(KabelServer)`)
     /// MUST call this to release the struct memory — `deinit()` only cleans
     /// up the server's internal state. This method calls `deinit()` first
     /// so that `destroy(allocator)` is a complete release (sse_manager +
     /// router + struct memory).
-    pub fn destroy(self: *GinwaServer, allocator: std.mem.Allocator) void {
+    pub fn destroy(self: *KabelServer, allocator: std.mem.Allocator) void {
         self.deinit();
         allocator.destroy(self);
     }
@@ -580,7 +580,7 @@ pub const GinwaServer = struct {
     /// dedicated thread each, reusing the existing managers verbatim.
     /// `shutdown()` closes the listener fd(s), which makes each
     /// reactor's `poll` report HUP and exit.
-    pub fn listenEventLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
+    pub fn listenEventLoop(self: *KabelServer, cfg: event_loop_mod.Config) !void {
         // Runner hooks are process-global (idempotent installs for the
         // loop's indirect calls): TLS accept/serve + H2C driver.
         event_loop_mod.EventLoop.setTlsHijackRun(runTlsServe);
@@ -597,7 +597,7 @@ pub const GinwaServer = struct {
 
     /// Single-loop path: `listen()` on the bound socket, one reactor on
     /// the calling thread. Cross-platform (Windows via `WSAPoll`).
-    fn serveSingleLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
+    fn serveSingleLoop(self: *KabelServer, cfg: event_loop_mod.Config) !void {
         _ = nb_socket_mod.POLL.IN; // keep import live on all POSIX targets
 
         if (builtin.os.tag == .windows) {
@@ -646,7 +646,7 @@ pub const GinwaServer = struct {
     /// accepts; per-loop `EventLoop.stats` are summed into `el_stats`.
     /// `shutdown()` closes every listener (loops exit on HUP) and flags
     /// the loops; this function joins all threads before returning.
-    fn serveMultiLoop(self: *GinwaServer, cfg: event_loop_mod.Config) !void {
+    fn serveMultiLoop(self: *KabelServer, cfg: event_loop_mod.Config) !void {
         var bound: socket.sockaddr.in = undefined;
         var bound_len: posix.socklen_t = @sizeOf(socket.sockaddr.in);
         if (socket.getsockname(self.address.sock_fd, @ptrCast(&bound), &bound_len) != 0)
@@ -711,7 +711,7 @@ pub const GinwaServer = struct {
             .allowed_origins = self.cors.allowed_origins,
         };
         const Slot = struct {
-            server: *GinwaServer,
+            server: *KabelServer,
             fd: i32,
             cfg: event_loop_mod.Config,
             template: HttpContext,
@@ -791,7 +791,7 @@ pub const GinwaServer = struct {
         if (first_err) |e| return e;
     }
 
-    pub fn recvFromClient(_: *GinwaServer, fd: SocketFd, buf: []u8) !usize {
+    pub fn recvFromClient(_: *KabelServer, fd: SocketFd, buf: []u8) !usize {
         if (builtin.os.tag == .windows) {
             const rc = winsock.recv(fd, buf.ptr, @intCast(buf.len), 0);
             if (rc < 0) return error.RecvFailed;
@@ -806,12 +806,12 @@ pub const GinwaServer = struct {
     /// Write a whole buffer to a `Stream` (plain socket or TLS). Used by the
     /// request path; `sendToClient` stays for the fd-only call sites (tests, the
     /// WebSocket registry) so the plaintext bytes are unchanged.
-    pub fn sendToStream(_: *GinwaServer, stream: stream_mod.Stream, data: []const u8) !usize {
+    pub fn sendToStream(_: *KabelServer, stream: stream_mod.Stream, data: []const u8) !usize {
         try stream.writeAll(data);
         return data.len;
     }
 
-    pub fn sendToClient(_: *GinwaServer, fd: SocketFd, data: []const u8) !usize {
+    pub fn sendToClient(_: *KabelServer, fd: SocketFd, data: []const u8) !usize {
         if (builtin.os.tag == .windows) {
             const rc = winsock.send(fd, data.ptr, @intCast(data.len), 0);
             if (rc < 0) return error.SendFailed;
@@ -823,7 +823,7 @@ pub const GinwaServer = struct {
         }
     }
 
-    pub fn getClientPort(_: *GinwaServer, fd: SocketFd) u16 {
+    pub fn getClientPort(_: *KabelServer, fd: SocketFd) u16 {
         if (builtin.os.tag == .windows) {
             var addr: socket.sockaddr.in = undefined;
             var addr_len: c_int = @sizeOf(socket.sockaddr.in);
@@ -852,7 +852,7 @@ pub const GinwaServer = struct {
         }
     }
 
-    pub fn shutdown(self: *GinwaServer) void {
+    pub fn shutdown(self: *KabelServer) void {
         self.is_running = false;
         // Unblock the listen loop's blocking accept() call so the
         // loop notices the is_running flag flip and breaks out.
@@ -897,7 +897,7 @@ pub const GinwaServer = struct {
     /// Apply CORS response headers to a response built elsewhere (a
     /// handler return, a 404 fallback). Thin shim that forwards to
     /// `security.applyCORSResponse`.
-    fn applyCORSResponse(self: *GinwaServer, request: *const HttpRequest, resp: *HttpResponse) !void {
+    fn applyCORSResponse(self: *KabelServer, request: *const HttpRequest, resp: *HttpResponse) !void {
         return security.applyCORSResponse(resp, request, self.cors);
     }
 
@@ -911,7 +911,7 @@ pub const GinwaServer = struct {
     /// by default; HTTP/1.0 closes unless the client sends
     /// `Connection: keep-alive`. An explicit `Connection: close` always
     /// wins (also covers `Connection: keep-alive, close`).
-    fn clientWantsKeepAlive(_: *GinwaServer, req: *const HttpRequest) bool {
+    fn clientWantsKeepAlive(_: *KabelServer, req: *const HttpRequest) bool {
         var it = req.headers.iterator();
         while (it.next()) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "connection")) {
@@ -924,19 +924,26 @@ pub const GinwaServer = struct {
         return !std.mem.eql(u8, req.version, "HTTP/1.0");
     }
 
-    pub fn applySecurityHeadersTo(self: *GinwaServer, resp: *HttpResponse) void {
+    pub fn applySecurityHeadersTo(self: *KabelServer, resp: *HttpResponse) void {
         if (!self.enable_security_headers) return;
         security.applySecurityHeadersWith(resp, self.security_headers);
     }
 
     /// Build a `204 No Content` CORS preflight response. Thin shim
     /// that forwards to `security.buildPreflightResponse`.
-    fn buildCORSPreflight(self: *GinwaServer, request: *const HttpRequest, allocator: std.mem.Allocator) !HttpResponse {
+    fn buildCORSPreflight(self: *KabelServer, request: *const HttpRequest, allocator: std.mem.Allocator) !HttpResponse {
         return security.buildPreflightResponse(allocator, request, self.cors);
     }
 };
 
-/// Reactor dispatch for `GinwaServer.listenEventLoop` (matches
+/// DEPRECATED source-compat alias for `KabelServer` — the type was
+/// renamed when the project was rebranded from `ginwa` to `kabel`.
+/// Kept so downstream consumers that still spell the old name keep
+/// compiling; it is a plain alias (same type, no wrapper), so it will
+/// be dropped once consumers migrate. Use `KabelServer`.
+pub const GinwaServer = KabelServer;
+
+/// Reactor dispatch for `KabelServer.listenEventLoop` (matches
 /// `event_loop_mod.OnRequestFn`). Synchronous fast path: pre-gate → CORS
 /// preflight → router handler → 404. Long-lived or blocking work hijacks
 /// the fd to a worker thread instead of answering here:
@@ -954,7 +961,7 @@ fn dispatchEventLoopRequest(
     http_ctx_in: HttpContext,
 ) anyerror!event_loop_mod.DispatchResult {
     _ = req_bytes;
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     var req = req_in.*;
     var http_ctx = http_ctx_in;
     http_ctx.allocator = alloc;
@@ -1066,7 +1073,7 @@ fn dispatchEventLoopRequest(
 /// Bridge `WsManager`'s `fn(ctx, fd, data)` write API to the server's
 /// `sendToClient` (blocking raw send — hijacked fds are blocking again).
 fn wsWriteAdapter(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {
-    const server_ptr: *GinwaServer = @ptrCast(@alignCast(ctx.?));
+    const server_ptr: *KabelServer = @ptrCast(@alignCast(ctx.?));
     return server_ptr.sendToClient(target_fd, data);
 }
 
@@ -1076,7 +1083,7 @@ fn wsWriteAdapter(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!u
 /// no-route arm: re-parse → Range scan → handler → 404 on error → close
 /// (static responses are unframed, so the conn is never reused).
 fn runStaticServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     nb_socket_mod.setBlocking(fd) catch {
         closeFd(fd);
         return;
@@ -1124,7 +1131,7 @@ fn runStaticServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd:
 
 /// Best-effort 404 write for hijack runners (no keep-alive framing —
 /// hijacked conns always close afterwards).
-fn serveNotFound(server: *GinwaServer, alloc: std.mem.Allocator, stream: Stream) void {
+fn serveNotFound(server: *KabelServer, alloc: std.mem.Allocator, stream: Stream) void {
     var nf = http_parser.notFound(alloc);
     server.applySecurityHeadersTo(&nf);
     const bytes = nf.toBytes() catch return;
@@ -1136,7 +1143,7 @@ fn serveNotFound(server: *GinwaServer, alloc: std.mem.Allocator, stream: Stream)
 /// threaded `.sse` arm verbatim: headers → register → handler →
 /// removeClient (which closes). Never frees `req_bytes` (spawner does).
 fn runSseServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     nb_socket_mod.setBlocking(fd) catch {
         closeFd(fd);
         return;
@@ -1236,7 +1243,7 @@ fn runSseServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: So
 /// WebSocket hijack runner (dedicated thread per session). Mirrors the old
 /// threaded `.websocket` arm verbatim. Never frees `req_bytes`.
 fn runWsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, req_bytes: []const u8) void {
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     nb_socket_mod.setBlocking(fd) catch {
         closeFd(fd);
         return;
@@ -1324,7 +1331,7 @@ fn runWsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: Soc
 /// buffered preface+frames the loop sniffed. Never frees `data`.
 fn runH2Serve(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, data: []const u8) void {
     _ = io;
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     nb_socket_mod.setBlocking(fd) catch {
         closeFd(fd);
         return;
@@ -1346,7 +1353,7 @@ fn runH2Serve(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: Soc
 /// Never frees `data` (always empty here).
 fn runTlsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: SocketFd, data: []const u8) void {
     _ = data;
-    const server: *GinwaServer = @ptrCast(@alignCast(ctx_ptr));
+    const server: *KabelServer = @ptrCast(@alignCast(ctx_ptr));
     installTlsStreamOps();
     const tls_ctx = server.tls_ctx orelse {
         closeFd(fd);
@@ -1579,7 +1586,7 @@ pub const SseEvent = struct {
 /// when `enabled` is true. Defaults to "CORS off" — same-origin only — so
 /// existing routes keep working with no behaviour change.
 ///
-/// Configure after `GinwaServer.init`:
+/// Configure after `KabelServer.init`:
 ///   server.cors = .{
 ///       .enabled = true,
 ///       .allowed_origins = &.{ "localhost:4021", "app.example.com" },
@@ -1597,5 +1604,5 @@ pub const SseEvent = struct {
 /// The pure helper functions live in `security.zig`
 /// (`security.buildPreflightResponse`, `security.buildPreHandlerFailRedirect`,
 /// `security.applyCORSResponse`) — this type is a thin field-mirror so
-/// `GinwaServer.cors` can be forwarded by value into those helpers.
+/// `KabelServer.cors` can be forwarded by value into those helpers.
 pub const CORSConfig = security.CORSConfig;

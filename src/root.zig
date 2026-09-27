@@ -1,7 +1,7 @@
 //! kabelweb — unified Zig web-framework library.
 //!
 //! One package, two halves:
-//!   - `server` — pure-Zig HTTP server (GinwaServer, Router, SSE/WS,
+//!   - `server` — pure-Zig HTTP server (KabelServer, Router, SSE/WS,
 //!     Template, Cron, HTTP/2). No third-party deps; links c + ssl +
 //!     crypto for the OpenSSL server-side TLS.
 //!   - `client` — libcurl-backed HTTP client (Client, Request/Response,
@@ -12,7 +12,7 @@
 //!
 //! ```zig
 //! const kabelweb = @import("kabelweb");
-//! const server = kabelweb.server; // GinwaServer, Router, HttpRequest, …
+//! const server = kabelweb.server; // KabelServer, Router, HttpRequest, …
 //! const client = kabelweb.client; // Client, Request, Response, get/post, …
 //! ```
 
@@ -20,6 +20,9 @@ pub const server = @import("server/http_server.zig");
 pub const client = @import("client/root.zig");
 
 // Flat aliases for the 90% case — the names most call sites reach for.
+pub const KabelServer = server.KabelServer;
+/// DEPRECATED — old pre-rebrand spelling of `KabelServer`. Kept as a
+/// source-compat alias for downstream consumers; use `KabelServer`.
 pub const GinwaServer = server.GinwaServer;
 pub const Router = server.Router;
 pub const Group = server.Group;

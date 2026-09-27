@@ -783,12 +783,12 @@ test "contract: HttpResponse.init produces a valid empty response" {
     try expectEqual(@as(usize, 0), resp.headers.count());
 }
 
-test "contract: GinwaServer.init preserves the address" {
+test "contract: KabelServer.init preserves the address" {
     const a = allocator;
     const addr = try http_server.Address.init("127.0.0.1", 45900);
     defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
 
-    var server = try http_server.GinwaServer.init(a, undefined, addr);
+    var server = try http_server.KabelServer.init(a, undefined, addr);
     defer server.destroy(a);
 
     try expectEqual(addr.sock_fd, server.address.sock_fd);

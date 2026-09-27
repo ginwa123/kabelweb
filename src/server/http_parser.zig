@@ -10,7 +10,7 @@ pub const HttpContext = struct {
     /// Optional client ID for SSE connections (set after registerClient)
     client_id: ?[16]u8 = null,
     /// Server-configured CORS origins, injected by the dispatch loop from
-    /// `GinwaServer.cors.allowed_origins`. Handlers use this for the
+    /// `KabelServer.cors.allowed_origins`. Handlers use this for the
     /// origin/CSRF defence-in-depth gate instead of hardcoding a host —
     /// the server config is the single source of truth.
     allowed_origins: []const []const u8 = &.{},
@@ -145,7 +145,7 @@ pub const HttpRequest = struct {
     session: *Session = undefined,
 
     // NOTE: there is intentionally NO write-SSE-event helper here. The only
-    // correct way to write to a client socket is GinwaServer.sendToClient /
+    // correct way to write to a client socket is KabelServer.sendToClient /
     // SseManager.sendToClient (winsock.send on Windows; raw write()/WriteFile
     // fails on winsock sockets). A previous writeSSEEvent using linux.write
     // was deleted for exactly that reason -- do not re-add one.
@@ -254,7 +254,7 @@ pub const HttpRequest = struct {
 /// req.query and MUST NOT call `req.deinit()` on the copy.** Reading is
 /// fine. The `Session` API is where mutability lives.
 pub const Session = struct {
-    /// Server-side session storage. Wired by `GinwaServer.context_store`
+    /// Server-side session storage. Wired by `KabelServer.context_store`
     /// in main.zig. When `null`, the simple `set`/`get` API is
     /// disabled — handlers will get `error.NoContextStore` on `set` /
     /// `setInt` / `setBool` and `null` on `get` / `getString` / etc.
@@ -1031,7 +1031,7 @@ pub fn jsonResponseHelper(allocator: std.mem.Allocator, jsonStruct: JsonStruct) 
 //  run whenever the file is compiled into a test binary. The gserverz
 //  module's own `zig build test` is pre-existing broken (Zig 0.16 rejects
 //  `@embedFile` of files outside the module path, and the test_runner has
-//  a truncated test), so the ginwasaas project-level `zig build test` is
+//  a truncated test), so the kabelweb project-level `zig build test` is
 //  the canonical run. Both paths compile http_parser.zig and pick these
 //  tests up.
 // ═══════════════════════════════════════════════════════════════════════════

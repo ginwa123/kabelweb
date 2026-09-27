@@ -34,7 +34,7 @@ pub const SseHandlerFn = *const fn (
 /// Unlike SSE handlers, the WebSocket handler is invoked AFTER the
 /// transport handshake has completed (the 101 response has already been
 /// sent). The handler receives the parsed `HttpRequest` (so it can read
-/// headers / query / params / session), the GinwaServer pointer (so
+/// headers / query / params / session), the KabelServer pointer (so
 /// it can read frames and broadcast via the WsManager), the client fd,
 /// and the client's 16-byte id (so it can send targeted messages or
 /// remove the client early).

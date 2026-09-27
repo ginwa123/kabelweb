@@ -16,7 +16,7 @@
 //!     by `streaming_test.zig` for behavior, not leak-tightness.
 //!
 //! Cross-platform fixture: uses an in-process `custom_http_server`
-//! (GinwaServer on an ephemeral port), mirroring the pattern in
+//! (KabelServer on an ephemeral port), mirroring the pattern in
 //! `streaming_test.zig` and `integration_test.zig`. Eliminates the
 //! httpbin.org dependency so the suite runs in air-gapped CI.
 
@@ -57,7 +57,7 @@ fn getBoundPort(sock_fd: c_int) !u16 {
 /// than shared because each test file gets its own copy — Zig 0.16
 /// doesn't allow sharing fixtures across test files).
 const StreamLeakServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -67,7 +67,7 @@ const StreamLeakServer = struct {
         const ts = try allocator.create(StreamLeakServer);
         const addr = try gserverz.Address.init("127.0.0.1", 0);
         const port: u16 = try getBoundPort(addr.sock_fd);
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
         ts.* = .{
             .server = gs,
             .io = io,
@@ -102,7 +102,7 @@ const StreamLeakServer = struct {
     }
 };
 
-fn listenFn(server: *gserverz.GinwaServer) void {
+fn listenFn(server: *gserverz.KabelServer) void {
     server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 

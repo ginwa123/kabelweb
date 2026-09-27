@@ -37,7 +37,7 @@ pub const RemoveReason = enum {
 /// it on every broadcast / sendToClient. The callback is responsible for
 /// actually transmitting the bytes back to the client (over the socket).
 /// The `ctx` pointer is opaque to the manager — pass any user data
-/// (typically a `*GinwaServer` pointer) that the callback needs to
+/// (typically a `*KabelServer` pointer) that the callback needs to
 /// produce the actual write. Returning a smaller count than `data.len`
 /// or an error triggers cleanup.
 pub const WriteFn = *const fn (ctx: ?*anyopaque, fd: i32, data: []const u8) anyerror!usize;
@@ -120,7 +120,7 @@ pub const WsManager = struct {
     /// manager does not close it on success but relies on the
     /// `removeClient` / `destroy` paths to free the per-client arena.
     /// The `write_ctx` is an opaque pointer passed to every write callback
-    /// invocation (typically a `*GinwaServer`).
+    /// invocation (typically a `*KabelServer`).
     pub fn registerClient(self: *WsManager, fd: i32, write: WriteFn, write_ctx: ?*anyopaque) ![16]u8 {
         const id = self.nextId();
 

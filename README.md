@@ -8,7 +8,7 @@ Zig `0.16.0` minimum.
 
 ```zig
 const kabelweb = @import("kabelweb");
-const server = kabelweb.server; // GinwaServer, Router, HttpRequest/Response, SSE/WS, Template, Cron, HTTP/2
+const server = kabelweb.server; // KabelServer, Router, HttpRequest/Response, SSE/WS, Template, Cron, HTTP/2
 const client = kabelweb.client; // Client, Request/Response, get/post/put/patch/delete, ResponseStream
 ```
 
@@ -64,7 +64,7 @@ One package, two halves (`src/root.zig` re-exports both):
                  └─────────────────┼──────────────┼─┘
                                    │              │ libcurl (system|vendor)
   ┌─ SERVER (pure Zig) ────────────┘              └─ CLIENT (curl.zig) ─┐
-  │ GinwaServer (http_server.zig)                   Client.perform()    │
+  │ KabelServer (http_server.zig)                   Client.perform()    │
   │  Address:bind+listen (POSIX/ws2_32)             buffered Response   │
   │  Router/Group → MiddlewareChain → HandlerFn     openStream→worker   │
   │  Context/ContextStore (ctx cookie)              Request/Response/   │
@@ -90,8 +90,8 @@ Key files and roles:
 
 | Area | File | Role |
 |---|---|---|
-| Facade | `src/root.zig` | `@import("kabelweb")` → `server.*` + `client.*` + flat aliases (`GinwaServer`, `Router`, `Client`, `get/post/...`, `openStream`) |
-| Server core | `src/server/http_server.zig` | `Address` (IPv4 bind, `SO_REUSEADDR`, Win `ws2_32`), `GinwaServer` (router/sse/ws/cron/context/csrf/cors/max_body/tls/h2c), `listen()` + `listenEventLoop()` |
+| Facade | `src/root.zig` | `@import("kabelweb")` → `server.*` + `client.*` + flat aliases (`KabelServer`, `Router`, `Client`, `get/post/...`, `openStream`) |
+| Server core | `src/server/http_server.zig` | `Address` (IPv4 bind, `SO_REUSEADDR`, Win `ws2_32`), `KabelServer` (router/sse/ws/cron/context/csrf/cors/max_body/tls/h2c), `listen()` + `listenEventLoop()` |
 | Reactor | `src/server/event_loop.zig` | Single-threaded `poll`/`WSAPoll` reactor, `DispatchResult{respond\|hijack_static\|hijack_sse\|hijack_ws}`, `Stats`, wake-fd |
 | Pool | `src/server/worker_pool.zig` | Generic bounded pool (`thread_count 0=ncpu`, ring queue, `QueueFull`/`PoolStopped`) |
 | Router | `src/server/router.zig` | `Router`/`Group`, `HandlerFn(ctx,req,res)`, `SseHandlerFn`, `WsHandlerFn(ctx,req,server,fd,id)`, `MiddlewareChain` (outer→inner, short-circuit). Registration order = match order. SSE/WS are always `GET`, no middleware |
@@ -122,7 +122,7 @@ Threading model:
 src/
   root.zig        # facade — `server` + `client` namespaces + flat aliases
   server/         # HTTP server
-    http_server.zig   # GinwaServer facade + re-exports
+    http_server.zig   # KabelServer facade + re-exports
     router.zig        # Router/Group, matchRoute (registration order = match order)
     http_parser.zig   # HttpRequest/Response/Context/Session
     event_loop.zig    # poll reactor
@@ -180,10 +180,10 @@ Vendored fallback (hermetic, static):
 
 ## Build & test
 
-Run from the package root (`/home/ginwa/kabelweb`):
+Run from the package root (`/path/to/kabelweb`):
 
 ```sh
-cd /home/ginwa/kabelweb
+cd /path/to/kabelweb
 zig build test            # full: fast suites + 60s SSE soaks
 zig build test-fast       # fast only, no soaks — what CI runs per-platform
 zig build test-server     # server half only
@@ -253,7 +253,7 @@ pub fn main(init: std.process.Init) void {
     const allocator = gpa.allocator();
 
     const addr = try S.Address.init("127.0.0.1", 29590);
-    const gs = try S.GinwaServer.init(allocator, init.io, addr);
+    const gs = try S.KabelServer.init(allocator, init.io, addr);
     defer gs.deinit();
 
     try gs.router.get("/health", healthH);
@@ -414,7 +414,7 @@ const ws_frames = S.ws_frames;
 
 fn wsEchoH(ctx: S.HttpContext, req: S.HttpRequest, srv_p: *anyopaque, fd: i32, id: *[16]u8) !void {
     _ = req; _ = id;
-    const srv: *S.GinwaServer = @ptrCast(@alignCast(srv_p));
+    const srv: *S.KabelServer = @ptrCast(@alignCast(srv_p));
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = srv.recvFromClient(fd, &buf) catch return;
@@ -481,7 +481,7 @@ No filters, no whitespace control, no `set` beyond the above.
 `base.jinja` (layout):
 
 ```jinja
-<title>{% block title %}GinwaServer Demo{% endblock %}</title>
+<title>{% block title %}KabelServer Demo{% endblock %}</title>
 <div class="container">
   {% block content %}{% endblock %}
 </div>

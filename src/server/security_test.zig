@@ -1723,7 +1723,7 @@ test "preGateCheck: evil origin on POST → block_cors" {
     defer arena.deinit();
     var req = gateReq(arena.allocator(), "POST", "http://evil.example.com");
 
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{ "localhost:4021", "ginwa.site" } };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{ "localhost:4021", "kabel.site" } };
     const result = try security.preGateCheck(&req, cfg, 1024);
     try testing.expectEqual(security.PreGateResult.block_cors, result);
 }
@@ -1731,9 +1731,9 @@ test "preGateCheck: evil origin on POST → block_cors" {
 test "preGateCheck: whitelisted origin (scheme-insensitive) → pass" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var req = gateReq(arena.allocator(), "POST", "https://ginwa.site");
+    var req = gateReq(arena.allocator(), "POST", "https://kabel.site");
 
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{ "ginwa.site" } };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{ "kabel.site" } };
     const result = try security.preGateCheck(&req, cfg, 1024);
     try testing.expect(result == .pass);
 }
@@ -1743,7 +1743,7 @@ test "preGateCheck: no Origin header → fail-open (curl, server-to-server)" {
     defer arena.deinit();
     var req = gateReq(arena.allocator(), "POST", null);
 
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"ginwa.site"} };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"kabel.site"} };
     const result = try security.preGateCheck(&req, cfg, 1024);
     try testing.expect(result == .pass);
 }
@@ -1753,7 +1753,7 @@ test "preGateCheck: GET never gated even with evil origin" {
     defer arena.deinit();
     var req = gateReq(arena.allocator(), "GET", "http://evil.example.com");
 
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"ginwa.site"} };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"kabel.site"} };
     const result = try security.preGateCheck(&req, cfg, 1024);
     try testing.expect(result == .pass);
 }
@@ -1761,7 +1761,7 @@ test "preGateCheck: GET never gated even with evil origin" {
 test "preGateCheck: HEAD and OPTIONS never gated" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"ginwa.site"} };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"kabel.site"} };
 
     var head_req = gateReq(arena.allocator(), "HEAD", "http://evil.example.com");
     try testing.expect((try security.preGateCheck(&head_req, cfg, 1024)) == .pass);
@@ -1773,10 +1773,10 @@ test "preGateCheck: HEAD and OPTIONS never gated" {
 test "preGateCheck: oversized body → block_body_too_large" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var req = gateReq(arena.allocator(), "POST", "https://ginwa.site");
+    var req = gateReq(arena.allocator(), "POST", "https://kabel.site");
     req.body = "x" ** 2048;
 
-    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"ginwa.site"} };
+    const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"kabel.site"} };
     const result = try security.preGateCheck(&req, cfg, 1024);
     try testing.expectEqual(security.PreGateResult.block_body_too_large, result);
 }
@@ -1844,7 +1844,7 @@ test "preGateCheck: zero limit blocks any non-empty body" {
     try testing.expectEqual(security.PreGateResult.block_body_too_large, result);
 }
 
-test "GinwaServer.max_body_bytes defaults to UNLIMITED (opt-in cap)" {
+test "KabelServer.max_body_bytes defaults to UNLIMITED (opt-in cap)" {
     // Framework default: no body-size limit. A server that wants a cap
     // sets `server.max_body_bytes` explicitly. Prevents surprise 413s
     // for apps that never asked for a limit.
@@ -1855,7 +1855,7 @@ test "GinwaServer.max_body_bytes defaults to UNLIMITED (opt-in cap)" {
     const addr = try http_server.Address.init("127.0.0.1", 45688);
     defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
 
-    var server = try http_server.GinwaServer.init(arena.allocator(), undefined, addr);
+    var server = try http_server.KabelServer.init(arena.allocator(), undefined, addr);
     defer server.destroy(arena.allocator());
 
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), server.max_body_bytes);
@@ -1872,7 +1872,7 @@ test "GinwaServer.max_body_bytes defaults to UNLIMITED (opt-in cap)" {
 //
 //  Use case: a server capped at 16 KiB with one large /upload route.
 //  Resolution order: RouteOptions.max_body_bytes > Group.maxBodyBytes >
-//  GinwaServer.max_body_bytes. Nested groups inherit at creation time.
+//  KabelServer.max_body_bytes. Nested groups inherit at creation time.
 // ───────────────────────────────────────────────────────────────────────────
 
 test "RouteOptions.max_body_bytes overrides server default" {

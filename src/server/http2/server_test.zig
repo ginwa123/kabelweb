@@ -12,7 +12,7 @@ const http_server = @import("../http_server.zig");
 const http_parser = @import("../http_parser.zig");
 const test_helpers = @import("../test_helpers.zig");
 
-/// A real `GinwaServer` (no listening socket) driven through a socketpair: this
+/// A real `KabelServer` (no listening socket) driven through a socketpair: this
 /// is the end-to-end contract between the protocol driver and the router.
 fn healthHandler(_: http_parser.HttpContext, _: http_parser.HttpRequest, res: http_parser.HttpResponse) anyerror!http_parser.HttpResponse {
     return res.withBody("ok");
@@ -78,7 +78,7 @@ const Fixture = struct {
     /// is reclaimed when the connection ends (`http_server.zig` does the same per
     /// connection), so per-request bookkeeping cannot leak.
     arena: std.heap.ArenaAllocator,
-    server: *http_server.GinwaServer,
+    server: *http_server.KabelServer,
     pair: [2]std.c.fd_t,
     client: i32,
     server_fd: i32,
@@ -109,7 +109,7 @@ const Fixture = struct {
         };
         const salloc = f.arena.allocator();
         const address = try http_server.Address.init("127.0.0.1", 0);
-        const gs = try http_server.GinwaServer.init(salloc, testing.io, address);
+        const gs = try http_server.KabelServer.init(salloc, testing.io, address);
         try gs.router.get("/health", healthHandler);
         try gs.router.post("/echo", echoHandler);
         try gs.router.sse("/events", sseHandler);

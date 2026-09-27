@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) void {
 //      ship alongside the executable, no 404 risk.
 //   2. The handler duplicates the constant into the per-request arena
 //      (so it lives for the lifetime of the request and is reaped when
-//      `GinwaServer.handle` calls `arena.deinit()` on the response).
+//      `KabelServer.handle` calls `arena.deinit()` on the response).
 //   3. We set `Content-Type: text/html; charset=utf-8` so browsers render
 //      it as HTML (vs. withBody() which would default the Content-Type to
 //      whatever the parser already has — i.e. nothing, making browsers
@@ -53,7 +53,7 @@ const LANDING_PAGE_HTML =
     \\<head>
     \\  <meta charset="utf-8" />
     \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
-    \\  <title>GinwaServer — Static HTML Demo</title>
+    \\  <title>KabelServer — Static HTML Demo</title>
     \\  <style>
     \\    :root {
     \\      --bg: #0f172a;
@@ -160,7 +160,7 @@ const LANDING_PAGE_HTML =
     \\<body>
     \\  <div class="container">
     \\    <header class="hero">
-    \\      <h1>GinwaServer</h1>
+    \\      <h1>KabelServer</h1>
     \\      <p class="subtitle">A static HTML page served by the custom HTTP server &mdash; this file lives as a comptime string in <code>src/main.zig</code>.</p>
     \\      <div class="badge-row">
     \\        <span class="badge ok">● Zig 0.16</span>
@@ -294,7 +294,7 @@ const LANDING_PAGE_HTML =
 /// the HTML body, sets `Content-Type: text/html; charset=utf-8`, and lets
 /// `withBody` add the matching `Content-Length` automatically. No defer
 /// needed — the per-request arena allocator reaps the dup'd buffer when
-/// `GinwaServer.handle` returns.
+/// `KabelServer.handle` returns.
 fn landingPageHandler(
     ctx: gserverz.HttpContext,
     req: gserverz.HttpRequest,
@@ -303,7 +303,7 @@ fn landingPageHandler(
     _ = req;
 
     // Duplicate into the per-request arena so the response is request-scoped
-    // (reaped by GinwaServer.handle via arena.deinit()). LANDING_PAGE_HTML
+    // (reaped by KabelServer.handle via arena.deinit()). LANDING_PAGE_HTML
     // itself lives in the binary's rodata; the arena copy is what the wire
     // receives. For a 4 KB page the dup is ~4 KB of arena — negligible.
     const body = ctx.allocator.dupe(u8, LANDING_PAGE_HTML) catch {
@@ -517,7 +517,7 @@ fn sseStreamHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, res: g
 const ws_frames = @import("kabelweb").server.ws_frames;
 
 fn wsEchoHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, server_ptr: *anyopaque, client_fd: i32, client_id: *[16]u8) !void {
-    const server: *gserverz.GinwaServer = @ptrCast(@alignCast(server_ptr));
+    const server: *gserverz.KabelServer = @ptrCast(@alignCast(server_ptr));
     _ = req;
 
     var buf: [4096]u8 = undefined;
@@ -594,7 +594,7 @@ fn wsEchoHandler(ctx: gserverz.HttpContext, req: gserverz.HttpRequest, server_pt
 // Cronjob demo — a single in-process callback that fires every minute.
 //
 // This is a normal cron job (server-internal scheduling), NOT an HTTP
-// endpoint. The cronjob manager is a private subsystem of GinwaServer —
+// endpoint. The cronjob manager is a private subsystem of KabelServer —
 // callbacks run on a background thread inside the process, and there is
 // intentionally no HTTP API to register / unregister / inspect jobs.
 //
@@ -636,7 +636,7 @@ pub fn run(init: std.process.Init) !void {
     std.debug.print("DEBUG: 1MB alloc succeeded\n", .{});
 
     const address = try gserverz.Address.init("127.0.0.1", 29590);
-    const gs = try gserverz.GinwaServer.init(allocator, io, address);
+    const gs = try gserverz.KabelServer.init(allocator, io, address);
     defer gs.deinit();
 
     // Start SSE event loop in a separate thread (non-blocking)

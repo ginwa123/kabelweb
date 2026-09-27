@@ -122,7 +122,7 @@ pub const Context = struct {
 ///
 /// **One entry point: `create(allocator) !*ContextStore`.** Heap-allocates
 /// the store so the pointer is stable for the entire server lifetime (the
-/// GinwaServer holds it; HttpContext borrows it per request). The
+/// KabelServer holds it; HttpContext borrows it per request). The
 /// matching `deinit` frees the store itself — no separate `destroy` call.
 ///
 /// **Ownership:** the store OWNS every Context passed to `put`. Handlers

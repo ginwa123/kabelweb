@@ -85,10 +85,10 @@ test "Address.init multiple instances on different ports" {
 }
 
 // ============================================================================
-// GinwaServer Initialization Tests
+// KabelServer Initialization Tests
 // ============================================================================
 
-test "GinwaServer.init creates server instance" {
+test "KabelServer.init creates server instance" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -96,14 +96,14 @@ test "GinwaServer.init creates server instance" {
     const addr = try http_server.Address.init("127.0.0.1", 45682);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     try std.testing.expect(server.address.sock_fd == addr.sock_fd);
     try std.testing.expectEqual(@as(u16, 45682), server.address.port);
 }
 
-test "GinwaServer.init router is initialized" {
+test "KabelServer.init router is initialized" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -111,7 +111,7 @@ test "GinwaServer.init router is initialized" {
     const addr = try http_server.Address.init("127.0.0.1", 45683);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     // Router should be accessible (we can't directly check internal state, but
@@ -123,7 +123,7 @@ test "GinwaServer.init router is initialized" {
 // Server with Router Integration Tests
 // ============================================================================
 
-test "GinwaServer with registered route" {
+test "KabelServer with registered route" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -131,7 +131,7 @@ test "GinwaServer with registered route" {
     const addr = try http_server.Address.init("127.0.0.1", 45684);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     try server.router.get("/test", struct {
@@ -148,7 +148,7 @@ test "GinwaServer with registered route" {
 // Server-level SecurityHeaders config (app-agnostic library)
 // ============================================================================
 
-test "GinwaServer.security_headers defaults to library baseline" {
+test "KabelServer.security_headers defaults to library baseline" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -156,7 +156,7 @@ test "GinwaServer.security_headers defaults to library baseline" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     // Default CSP must NOT contain app-specific hosts.
@@ -165,7 +165,7 @@ test "GinwaServer.security_headers defaults to library baseline" {
     try std.testing.expect(std.mem.indexOf(u8, csp, "cloudflareinsights") == null);
 }
 
-test "GinwaServer.applySecurityHeadersTo uses server-level CSP override" {
+test "KabelServer.applySecurityHeadersTo uses server-level CSP override" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -173,7 +173,7 @@ test "GinwaServer.applySecurityHeadersTo uses server-level CSP override" {
     const addr = try http_server.Address.init("127.0.0.1", 45687);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     // App opts in to its own CSP (tailwind CDN + CF analytics beacon).
@@ -195,7 +195,7 @@ test "GinwaServer.applySecurityHeadersTo uses server-level CSP override" {
 
 // ============================================================================
 // HttpContext.allowed_origins — handlers must read the SERVER's CORS
-// config instead of hardcoding "localhost:4021" (broke ginwa.site).
+// config instead of hardcoding "localhost:4021" (broke kabel.site).
 // ============================================================================
 
 test "HttpContext.allowed_origins defaults to empty slice" {
@@ -214,7 +214,7 @@ test "handler origin gate: checkOriginInList with ctx origins accepts whiteliste
     defer arena.deinit();
 
     const security = @import("security.zig");
-    const origins = [_][]const u8{ "localhost:4021", "ginwa.site" };
+    const origins = [_][]const u8{ "localhost:4021", "kabel.site" };
     const ctx = http_parser.HttpContext{
         .allocator = arena.allocator(),
         .io = undefined,
@@ -235,9 +235,9 @@ test "handler origin gate: checkOriginInList with ctx origins accepts whiteliste
     defer req.headers.deinit();
     defer req.params.deinit();
     defer req.query.deinit();
-    try req.headers.put("Origin", "https://ginwa.site");
+    try req.headers.put("Origin", "https://kabel.site");
 
-    // Must NOT throw — ginwa.site is in the server-configured list.
+    // Must NOT throw — kabel.site is in the server-configured list.
     try security.checkOriginInList(&req, ctx.allowed_origins);
 }
 
@@ -287,7 +287,7 @@ test "Address sock_fd is valid file descriptor" {
 // getClientPort Tests (when connected)
 // ============================================================================
 
-test "GinwaServer.getClientPort returns 0 for invalid fd" {
+test "KabelServer.getClientPort returns 0 for invalid fd" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -295,7 +295,7 @@ test "GinwaServer.getClientPort returns 0 for invalid fd" {
     const addr = try http_server.Address.init("127.0.0.1", 45688);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     // -1 is an invalid file descriptor, should return 0
@@ -307,7 +307,7 @@ test "GinwaServer.getClientPort returns 0 for invalid fd" {
 // recvFromClient and sendToClient Tests
 // ============================================================================
 
-test "GinwaServer.recvFromClient fails on invalid fd" {
+test "KabelServer.recvFromClient fails on invalid fd" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -315,7 +315,7 @@ test "GinwaServer.recvFromClient fails on invalid fd" {
     const addr = try http_server.Address.init("127.0.0.1", 45689);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     var buf: [1024]u8 = undefined;
@@ -323,7 +323,7 @@ test "GinwaServer.recvFromClient fails on invalid fd" {
     try std.testing.expectError(error.RecvFailed, result);
 }
 
-test "GinwaServer.sendToClient fails on invalid fd" {
+test "KabelServer.sendToClient fails on invalid fd" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -331,7 +331,7 @@ test "GinwaServer.sendToClient fails on invalid fd" {
     const addr = try http_server.Address.init("127.0.0.1", 45690);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     const result = server.sendToClient(-1, "Hello");
@@ -350,7 +350,7 @@ test "Server accepts client connection" {
     const addr = try http_server.Address.init("127.0.0.1", 45691);
     defer _ = closeI32Fd(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+    var server = try http_server.KabelServer.init(allocator, undefined, addr);
     defer server.destroy(allocator);
 
     // Create a client socket and connect

@@ -6,7 +6,7 @@
 //!   - URL decoder: percent-encoded sequences, edge cases, mixed content
 //!   - Router: complex patterns, traversal cases, edge cases
 //!   - Response builder: all status codes, multi-value headers, JSON edge cases
-//!   - HTTP server: lifecycle, edge cases in Address / GinwaServer
+//!   - HTTP server: lifecycle, edge cases in Address / KabelServer
 //!
 //! Each section has its own helper functions and shared imports.
 //! TDD methodology: tests are written first, the production code is
@@ -744,7 +744,7 @@ test "response: multiple headers preserved through toBytes" {
 }
 
 // ============================================================================
-// SECTION 5: GinwaServer / Address Edge Cases
+// SECTION 5: KabelServer / Address Edge Cases
 // ============================================================================
 
 test "address: invalid port (0) is accepted by kernel (port 0 = ephemeral)" {
@@ -800,24 +800,24 @@ fn getsocknamePort(fd: i32) !u16 {
 
 const GetSockNameFailed = error{GetSockNameFailed};
 
-test "ginwa: destroy then re-init works (no global state leak)" {
+test "kabel: destroy then re-init works (no global state leak)" {
     const a = allocator;
     const addr1 = try http_server.Address.init("127.0.0.1", 45710);
     defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr1.sock_fd)))) else @intCast(addr1.sock_fd));
 
-    var server1 = try http_server.GinwaServer.init(a, undefined, addr1);
+    var server1 = try http_server.KabelServer.init(a, undefined, addr1);
     defer server1.destroy(a);
 
     const addr2 = try http_server.Address.init("127.0.0.1", 45711);
     defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr2.sock_fd)))) else @intCast(addr2.sock_fd));
 
-    var server2 = try http_server.GinwaServer.init(a, undefined, addr2);
+    var server2 = try http_server.KabelServer.init(a, undefined, addr2);
     defer server2.destroy(a);
 
     try expect(server1.address.sock_fd != server2.address.sock_fd);
 }
 
-test "ginwa: destroy releases router routes (no leak via destroy alone)" {
+test "kabel: destroy releases router routes (no leak via destroy alone)" {
     // Regression test: previously `server.deinit()` had to be called
     // explicitly before `server.destroy(allocator)` because destroy
     // didn't free the router's ArrayList. Now destroy() calls deinit()
@@ -826,7 +826,7 @@ test "ginwa: destroy releases router routes (no leak via destroy alone)" {
     const addr = try http_server.Address.init("127.0.0.1", 45712);
     defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
 
-    var server = try http_server.GinwaServer.init(a, undefined, addr);
+    var server = try http_server.KabelServer.init(a, undefined, addr);
     // Intentionally do NOT call server.deinit() — destroy() should handle it.
     try server.router.get("/route1", struct {
         fn handle(_: http_parser.HttpContext, _: http_parser.HttpRequest, _: http_parser.HttpResponse) anyerror!http_parser.HttpResponse {
@@ -1175,7 +1175,7 @@ test "stress: 50 sequential server init/destroy cycles" {
         // EADDRINUSE — the flaky `BindFailed` this test used to hit.
         // Same fix as the 500-cycle test in complex_cases_extra_test.zig.
         const addr = try http_server.Address.init("127.0.0.1", 0);
-        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        var server = try http_server.KabelServer.init(allocator, undefined, addr);
         server.destroy(allocator);
         closeI32Fd(addr.sock_fd);
     }

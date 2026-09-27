@@ -111,7 +111,7 @@ const ProcessCpuTime = struct {
 
 /// Local HTTP test server. Same shape as `streaming_test.zig::TestServer`.
 const TestServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -124,7 +124,7 @@ const TestServer = struct {
 
         const port: u16 = try getBoundPort(addr.sock_fd);
 
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
 
         ts.* = .{
             .server = gs,
@@ -148,7 +148,7 @@ const TestServer = struct {
         return std.fmt.allocPrint(self.allocator, "http://127.0.0.1:{d}{s}", .{ self.port, path });
     }
 
-    fn listenFn(server: *gserverz.GinwaServer) void {
+    fn listenFn(server: *gserverz.KabelServer) void {
         server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
     }
 

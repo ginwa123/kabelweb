@@ -187,7 +187,7 @@ pub fn setBlocking(fd: i32) !void {
 /// TCP tuning for freshly-accepted client sockets: keepalive (10s idle,
 /// 5s interval, 3 probes → ~25s dead-conn detection) + TCP_NODELAY.
 ///
-/// Moved here from `GinwaServer.acceptClient` when the threaded `listen()`
+/// Moved here from `KabelServer.acceptClient` when the threaded `listen()`
 /// was deleted — the loop's `acceptDrain` is now the only accept path.
 /// Best-effort: failures are ignored (application heartbeats still work).
 pub fn applyTcpTuning(fd: i32) void {

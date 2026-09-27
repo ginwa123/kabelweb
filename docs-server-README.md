@@ -93,7 +93,7 @@ all stay present across edits — see "Running Tests" below.
 
 ### Serve path: the event-loop reactor (single source of truth)
 
-`GinwaServer.listenEventLoop(cfg)` is the only serve path (the old
+`KabelServer.listenEventLoop(cfg)` is the only serve path (the old
 thread-per-connection `listen()` was deleted). One thread runs `poll(2)`
 over the listener + all connections (`src/server/event_loop.zig`), with
 non-blocking helpers in `src/server/nb_socket.zig`. No per-connection
@@ -123,7 +123,7 @@ Scope:
   pre-gate → CORS preflight → router → 404 pipeline.
 
 ```zig
-var server = try kabelweb.GinwaServer.init(alloc, io, addr);
+var server = try kabelweb.KabelServer.init(alloc, io, addr);
 try server.router.get("/hello", helloHandler);
 try server.listenEventLoop(.{});
 ```
@@ -155,7 +155,7 @@ try server.listenEventLoop(.{ .dispatch_mode = .direct });
 
 ### Loops: one entry point, `loop_count` selects the shape
 
-`GinwaServer.listenEventLoop(cfg)` is the only reactor entry point:
+`KabelServer.listenEventLoop(cfg)` is the only reactor entry point:
 `loop_count` `0`/`1` runs a single loop on the calling thread, `>1`
 runs that many loops sharing one port via `SO_REUSEPORT`
 (`nb_socket.bindReusePort`). The kernel balances accepts; per-loop
@@ -192,7 +192,7 @@ backpressure, stop-drains).
 ```
 src/
 ├── main.zig                  # Server entry point, route setup, and static HTML page (LANDING_PAGE_HTML)
-├── http_server.zig           # Core server: Address, GinwaServer, RequestBuffer
+├── http_server.zig           # Core server: Address, KabelServer, RequestBuffer
 ├── http_parser.zig           # HTTP request/response parsing
 ├── router.zig                # Route matching with parameter extraction
 ├── sse_manager.zig           # SSE client management and event loop
@@ -207,7 +207,7 @@ src/
 
 **http_server.zig**
 - `Address`: Socket binding and port configuration
-- `GinwaServer`: Main server struct handling connections
+- `KabelServer`: Main server struct handling connections
 - `RequestBuffer`: Auto-growing buffer for reading HTTP requests
 
 **router.zig**
@@ -272,7 +272,7 @@ fn wsEchoHandler(
     server_ptr: *anyopaque,
     client_fd: i32,
 ) !void {
-    const server: *gserverz.GinwaServer = @ptrCast(@alignCast(server_ptr));
+    const server: *gserverz.KabelServer = @ptrCast(@alignCast(server_ptr));
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = try server.recvFromClient(client_fd, &buf);
@@ -361,8 +361,8 @@ Supported expression syntax:
 Standard 5 fields: `minute hour dom month dow`. UTC only. Minute
 precision. No persistence — jobs are dropped on server restart.
 
-The manager is automatically started by `GinwaServer.listenEventLoop()` and
-stopped by `GinwaServer.deinit()`. Callers do not need to (and should
+The manager is automatically started by `KabelServer.listenEventLoop()` and
+stopped by `KabelServer.deinit()`. Callers do not need to (and should
 not) call `start` / `stop` themselves.
 
 ## Running Tests

@@ -1,4 +1,4 @@
-//! End-to-end tests for `GinwaServer.listenEventLoop` (now the single
+//! End-to-end tests for `KabelServer.listenEventLoop` (now the single
 //! serve path): plain routes, static-dir hijack, SSE hijack, WS hijack,
 //! H2C hijack, worker-pool dispatch, and multi-loop aggregation.
 
@@ -40,7 +40,7 @@ fn sseStub(
 }
 
 const ServerThread = struct {
-    server: *http_server.GinwaServer,
+    server: *http_server.KabelServer,
     cfg: event_loop.Config = .{},
     err: ?anyerror = null,
 
@@ -87,7 +87,7 @@ test "listenEventLoop serves routes, echo, 404 and 501s" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     try server.router.get("/hello", helloHandler);
@@ -154,7 +154,7 @@ test "listenEventLoop worker_pool mode serves correctly" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     try server.router.get("/hello", helloHandler);
@@ -216,13 +216,13 @@ test "listenEventLoop loop_count=2 serves across loops with agg stats (POSIX)" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     try server.router.get("/hello", helloHandler);
 
     const MultiThread = struct {
-        srv: *http_server.GinwaServer,
+        srv: *http_server.KabelServer,
         err: ?anyerror = null,
         fn run(self: *@This()) void {
             self.srv.listenEventLoop(.{
@@ -310,7 +310,7 @@ test "listenEventLoop serves static-dir fallback via hijack (direct)" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     try server.router.get("/hello", helloHandler);
@@ -364,7 +364,7 @@ test "listenEventLoop serves static-dir fallback via hijack (pool)" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     var static_cfg: u8 = 0;
@@ -401,7 +401,7 @@ test "listenEventLoop serves static-dir fallback via hijack (pool)" {
 
 // --- SSE hijack ------------------------------------------------------------
 
-var sse_test_server: ?*http_server.GinwaServer = null;
+var sse_test_server: ?*http_server.KabelServer = null;
 
 fn sseTestHandler(
     ctx: http_server.HttpContext,
@@ -425,7 +425,7 @@ test "listenEventLoop serves SSE stream via hijack" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(alloc, std.testing.io, addr);
     defer server.destroy(alloc);
 
     try server.router.sse("/events", sseTestHandler);
@@ -480,7 +480,7 @@ fn wsTestHandler(
 ) anyerror!void {
     _ = req;
     _ = client_id;
-    const server: *http_server.GinwaServer = @ptrCast(@alignCast(server_ptr));
+    const server: *http_server.KabelServer = @ptrCast(@alignCast(server_ptr));
     var buf: [4096]u8 = undefined;
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(ctx.allocator);
@@ -534,7 +534,7 @@ test "listenEventLoop serves WebSocket echo via hijack" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(std.testing.allocator, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(std.testing.allocator, std.testing.io, addr);
     defer server.destroy(std.testing.allocator);
 
     try server.router.ws("/ws", wsTestHandler);
@@ -596,7 +596,7 @@ test "listenEventLoop hijacks H2 preface to H2 driver" {
     const addr = try http_server.Address.init("127.0.0.1", 0);
     const port = try serverPort(addr.sock_fd);
 
-    var server = try http_server.GinwaServer.init(std.testing.allocator, std.testing.io, addr);
+    var server = try http_server.KabelServer.init(std.testing.allocator, std.testing.io, addr);
     defer server.destroy(std.testing.allocator);
 
     try server.router.get("/hello", helloHandler);

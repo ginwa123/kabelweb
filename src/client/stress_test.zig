@@ -63,7 +63,7 @@ test "stress: 100 KiB body round-trips" {
 }
 
 const TestServer = struct {
-    server: *gserverz.GinwaServer,
+    server: *gserverz.KabelServer,
     io: std.Io,
     allocator: std.mem.Allocator,
     listener_thread: std.Thread,
@@ -73,7 +73,7 @@ const TestServer = struct {
         const ts = try allocator.create(TestServer);
         const addr = try gserverz.Address.init("127.0.0.1", 0);
         const port: u16 = try getBoundPort(addr.sock_fd);
-        const gs = try gserverz.GinwaServer.init(allocator, io, addr);
+        const gs = try gserverz.KabelServer.init(allocator, io, addr);
         ts.* = .{
             .server = gs,
             .io = io,
@@ -108,7 +108,7 @@ fn echoPostHandler(_: HttpContext, req: HttpRequest, res: HttpResponse) !HttpRes
     return res.withBody(req.body);
 }
 
-fn listenFn(server: *gserverz.GinwaServer) void {
+fn listenFn(server: *gserverz.KabelServer) void {
     server.listenEventLoop(.{ .dispatch_mode = .worker_pool }) catch {};
 }
 
