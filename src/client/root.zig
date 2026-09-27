@@ -35,28 +35,17 @@ pub const openStream = stream_mod.openStream;
 
 // ----- Tests -----
 //
-// We keep the test discovery block in `root.zig` (not `test_runner.zig`)
-// because the test target's `root_module` is rooted at this file. Zig's
-// test walker only descends into modules reachable from the root, so a
-// `test_runner.zig` would be invisible.
+// The client suites are colocated with the implementation they cover:
+// `client.zig`, `methods.zig`, `request.zig`, `response.zig`, `stream.zig`,
+// `curl.zig` and `options.zig` each carry their own `test { ... }` blocks
+// (the old `*_test.zig` files were merged into them and deleted).
 //
-// Mirrors the convention in `src/modules/http/test_runner.zig` but
-// colocates the imports with the module's public surface so they
-// always get discovered.
+// Test discovery lives in the package root (`src/root.zig`) because the test
+// targets are rooted there — that is also what lets the client suites reach
+// the in-process server through `@import("../server/http_server.zig")`
+// (a relative import that must stay inside the module path). Keeping the
+// discovery block here would make this file's own module root `src/client/`,
+// which rejects that relative import.
 //
-// All `*_test.zig` files in this directory are imported unconditionally:
-// even the network-touching integration / edge / stress / memory / FD
-// / streaming tests self-skip via `error.SkipZigTest` when the
-// environment doesn't support them.
-
-test {
-    _ = @import("client_test.zig");
-    _ = @import("options_test.zig");
-    _ = @import("memory_leak_test.zig");
-    _ = @import("fd_leak_test.zig");
-    _ = @import("edge_case_test.zig");
-    _ = @import("integration_test.zig");
-    _ = @import("stress_test.zig");
-    _ = @import("streaming_test.zig");
-    _ = @import("cpu_usage_test.zig");
-}
+// `zig build test-client` runs exactly these suites: the root is compiled
+// with the `client.` test-name filter.

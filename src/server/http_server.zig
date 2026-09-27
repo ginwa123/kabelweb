@@ -1599,3 +1599,1151 @@ pub const SseEvent = struct {
 /// `security.applyCORSResponse`) — this type is a thin field-mirror so
 /// `GinwaServer.cors` can be forwarded by value into those helpers.
 pub const CORSConfig = security.CORSConfig;
+
+// ============================================================================
+// Tests — moved here from `event_loop_server_test.zig` (the separate `*_test.zig` file was
+// deleted) so the tests live next to the implementation they cover.
+//
+// Kept in a namespace so the test helpers cannot shadow this file's own
+// declarations. `test { _ = event_loop_server_tests; }` below pulls them into the run.
+// ============================================================================
+
+const event_loop_server_tests = struct {
+    // End-to-end tests for `GinwaServer.listenEventLoop` (now the single
+    // serve path): plain routes, static-dir hijack, SSE hijack, WS hijack,
+    // H2C hijack, worker-pool dispatch, and multi-loop aggregation.
+
+
+    const http_server = @import("http_server.zig");
+    const event_loop = @import("event_loop.zig");
+    const test_tcp = @import("test_tcp.zig");
+
+    fn helloHandler(
+        ctx: http_server.HttpContext,
+        req: http_server.HttpRequest,
+        res: http_server.HttpResponse,
+    ) anyerror!http_server.HttpResponse {
+        _ = ctx;
+        _ = req;
+        return res.withBody("event-loop-hi");
+    }
+
+    fn echoHandler(
+        ctx: http_server.HttpContext,
+        req: http_server.HttpRequest,
+        res: http_server.HttpResponse,
+    ) anyerror!http_server.HttpResponse {
+        _ = ctx;
+        return res.withBody(req.body);
+    }
+
+    fn sseStub(
+        ctx: http_server.HttpContext,
+        req: http_server.HttpRequest,
+        res: http_server.HttpResponse,
+    ) anyerror!http_server.HttpResponse {
+        _ = ctx;
+        _ = req;
+        _ = res;
+        return error.Unreachable; // never runs on the event-loop path (501 first)
+    }
+
+    const ServerThread = struct {
+        server: *http_server.GinwaServer,
+        cfg: event_loop.Config = .{},
+        err: ?anyerror = null,
+
+        fn run(self: *ServerThread) void {
+            self.server.listenEventLoop(self.cfg) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    fn tcpConnect(port: u16) !i32 {
+        return test_tcp.connect(port);
+    }
+
+    fn writeAll(fd: i32, data: []const u8) !void {
+        return test_tcp.writeAll(fd, data);
+    }
+
+    fn readHttpResponse(fd: i32, buf: []u8) ![]u8 {
+        var len: usize = 0;
+        while (true) {
+            if (event_loop.findHeaderEnd(buf[0..len])) |he| {
+                const cl = try event_loop.parseContentLength(buf[0..he]);
+                if (len >= he + cl) return buf[0 .. he + cl];
+            }
+            if (len >= buf.len) return error.TooMuch;
+            const n = try test_tcp.read(fd, buf[len..]);
+            if (n == 0) return error.Closed;
+            len += n;
+        }
+    }
+
+    /// Ephemeral port of a bound server socket (port 0 → OS-picked).
+    fn serverPort(sock_fd: i32) !u16 {
+        const port = try test_tcp.boundPort(sock_fd);
+        try std.testing.expect(port != 0);
+        return port;
+    }
+
+    test "listenEventLoop serves routes, echo, 404 and 501s" {
+        const alloc = std.testing.allocator;
+
+        // Ephemeral port: bind 0, then discover via getsockname.
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.get("/hello", helloHandler);
+        try server.router.post("/echo", echoHandler);
+        try server.router.sse("/stream", sseStub);
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        defer {
+            server.shutdown();
+            t.join();
+        }
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+
+        var buf: [8192]u8 = undefined;
+
+        // 1. plain GET route, keep-alive.
+        try writeAll(cfd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+        const r1 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "event-loop-hi") != null);
+
+        // 2. POST echo with body on the SAME connection.
+        const body = "hello-event-loop";
+        const req2 = try std.fmt.allocPrint(
+            alloc,
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+            .{ body.len, body },
+        );
+        defer alloc.free(req2);
+        try writeAll(cfd, req2);
+        const r2 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r2, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r2, body) != null);
+
+        // 3. unknown path → 404, connection still reusable.
+        try writeAll(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+        const r3 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r3, "404") != null);
+
+        // 4. SSE route → 200 event-stream (hijacked to an SSE worker thread).
+        // The stub handler returns error.Unreachable immediately, so the
+        // stream closes right after the headers + terminator.
+        try writeAll(cfd, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        const r4 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r4, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r4, "text/event-stream") != null);
+    }
+
+    test "listenEventLoop worker_pool mode serves correctly" {
+        const alloc = std.testing.allocator;
+
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.get("/hello", helloHandler);
+        try server.router.post("/echo", echoHandler);
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+                .dispatch_mode = .worker_pool,
+                .worker_threads = 2,
+                .worker_queue_depth = 64,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+
+        var buf: [8192]u8 = undefined;
+
+        // Keep-alive reuse across pool dispatches.
+        try writeAll(cfd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+        const r1 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "event-loop-hi") != null);
+
+        // Pipelined pair on the same connection (second arrives while the
+        // first is still on the pool — ordering must hold).
+        const p1 = "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+        const p2 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping";
+        try writeAll(cfd, p1);
+        try writeAll(cfd, p2);
+        const rp1 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, rp1, "event-loop-hi") != null);
+        const rp2 = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, rp2, "ping") != null);
+
+        // All three responses were received, so every offload completed before
+        // shutdown: stats must show 3 pool dispatches, 3 served, no fallback.
+        // (Explicit shutdown+join — no defer — so `el_stats` is populated.)
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expectEqual(@as(u64, 3), server.el_stats.offloaded);
+        try std.testing.expectEqual(@as(u64, 3), server.el_stats.served);
+        try std.testing.expectEqual(@as(u64, 0), server.el_stats.inline_fallback);
+    }
+
+    test "listenEventLoop loop_count=2 serves across loops with agg stats (POSIX)" {
+        // Multi-loop needs SO_REUSEPORT: POSIX-only by design.
+        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const alloc = std.testing.allocator;
+
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.get("/hello", helloHandler);
+
+        const MultiThread = struct {
+            srv: *http_server.GinwaServer,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.srv.listenEventLoop(.{
+                    .max_conns = 64,
+                    .idle_timeout_ms = 10_000,
+                    .header_timeout_ms = 2_000,
+                    .loop_count = 2,
+                }) catch |err| {
+                    self.err = err;
+                };
+            }
+        };
+        var mt = MultiThread{ .srv = server };
+        const t = try std.Thread.spawn(.{}, MultiThread.run, .{&mt});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .real) catch {};
+        if (mt.err) |err| {
+            // Log the name: on CI the interesting case is a macOS REUSEPORT
+            // bind failure, and the bare `return err` hides which step failed.
+            std.debug.print("listenEventLoop(multi) failed: {s}\n", .{@errorName(err)});
+            return err;
+        }
+
+        // 8 connections × 2 keep-alive requests = 16 served, spread by the
+        // kernel across both REUSEPORT loops.
+        const n_conns = 8;
+        var fds: [n_conns]i32 = undefined;
+        for (&fds) |*fd| fd.* = try tcpConnect(port);
+        defer {
+            for (fds) |fd| test_tcp.close(fd);
+        }
+
+        var buf: [8192]u8 = undefined;
+        for (fds) |fd| {
+            for (0..2) |k| {
+                const ka: []const u8 = if (k == 0) "keep-alive" else "close";
+                const req = try std.fmt.allocPrint(
+                    alloc,
+                    "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: {s}\r\n\r\n",
+                    .{ka},
+                );
+                defer alloc.free(req);
+                try writeAll(fd, req);
+                const resp = try readHttpResponse(fd, &buf);
+                try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+                try std.testing.expect(std.mem.indexOf(u8, resp, "event-loop-hi") != null);
+            }
+        }
+
+        // Explicit shutdown+join so `el_stats` (summed across loops) is out.
+        server.shutdown();
+        t.join();
+        if (mt.err) |err| return err;
+        try std.testing.expectEqual(@as(u64, 16), server.el_stats.served);
+        try std.testing.expectEqual(@as(u64, 8), server.el_stats.accepted);
+    }
+
+    // --- static-dir hijack -----------------------------------------------------
+
+    fn staticTestHandler(
+        cfg: *const anyopaque,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        request_path: []const u8,
+        range_header: ?[]const u8,
+        stream: http_server.Stream,
+    ) anyerror!void {
+        _ = cfg;
+        _ = io;
+        _ = range_header;
+        // Minimal wire format owned by the handler (status + headers + body).
+        const body = try std.fmt.allocPrint(alloc, "static:{s}", .{request_path});
+        defer alloc.free(body);
+        const head = try std.fmt.allocPrint(
+            alloc,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n",
+            .{body.len},
+        );
+        defer alloc.free(head);
+        try stream.writeAll(head);
+        try stream.writeAll(body);
+    }
+
+    test "listenEventLoop serves static-dir fallback via hijack (direct)" {
+        const alloc = std.testing.allocator;
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.get("/hello", helloHandler);
+        var static_cfg: u8 = 0;
+        server.setStaticDirHandler(staticTestHandler, @ptrCast(&static_cfg));
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+                // Explicit: the config default is now `.worker_pool` — this
+                // test covers the `.direct` opt-out path.
+                .dispatch_mode = .direct,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        // Unmatched path → static handler (200 + echoed path), conn closes.
+        {
+            const cfd = try tcpConnect(port);
+            defer test_tcp.close(cfd);
+            var buf: [8192]u8 = undefined;
+            try writeAll(cfd, "GET /file.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            const r = try readHttpResponse(cfd, &buf);
+            try std.testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+            try std.testing.expect(std.mem.indexOf(u8, r, "static:/file.txt") != null);
+        }
+        // Server still serves plain routes afterwards (static close is clean).
+        {
+            const cfd = try tcpConnect(port);
+            defer test_tcp.close(cfd);
+            var buf: [8192]u8 = undefined;
+            try writeAll(cfd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            const r = try readHttpResponse(cfd, &buf);
+            try std.testing.expect(std.mem.indexOf(u8, r, "event-loop-hi") != null);
+        }
+
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expect(server.el_stats.hijacked >= 1);
+        try std.testing.expectEqual(@as(u64, 1), server.el_stats.served);
+    }
+
+    test "listenEventLoop serves static-dir fallback via hijack (pool)" {
+        const alloc = std.testing.allocator;
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        var static_cfg: u8 = 0;
+        server.setStaticDirHandler(staticTestHandler, @ptrCast(&static_cfg));
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+                .dispatch_mode = .worker_pool,
+                .worker_threads = 2,
+                .worker_queue_depth = 64,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+        var buf: [8192]u8 = undefined;
+        try writeAll(cfd, "GET /pool-file.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        const r = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "static:/pool-file.txt") != null);
+
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expect(server.el_stats.hijacked >= 1);
+    }
+
+    // --- SSE hijack ------------------------------------------------------------
+
+    var sse_test_server: ?*http_server.GinwaServer = null;
+
+    fn sseTestHandler(
+        ctx: http_server.HttpContext,
+        req: http_server.HttpRequest,
+        res: http_server.HttpResponse,
+    ) anyerror!http_server.HttpResponse {
+        _ = ctx;
+        _ = req;
+        _ = res;
+        // Registered before this runs (worker registers, then calls us):
+        // broadcast one event, linger briefly, then return (conn closes).
+        if (sse_test_server) |s| {
+            s.sse_manager.broadcast("sse-ok") catch {};
+            std.Io.sleep(std.testing.io, .{ .nanoseconds = 300 * std.time.ns_per_ms }, .real) catch {};
+        }
+        return error.WouldBlock;
+    }
+
+    test "listenEventLoop serves SSE stream via hijack" {
+        const alloc = std.testing.allocator;
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.sse("/events", sseTestHandler);
+        sse_test_server = server;
+        defer sse_test_server = null;
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+        var buf: [8192]u8 = undefined;
+        try writeAll(cfd, "GET /events HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n");
+        // Headers first (no Content-Length on SSE: returns after head).
+        const head = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, head, "200 OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, head, "text/event-stream") != null);
+        // Then the broadcast chunked event, then EOF after handler returns.
+        var evbuf: [1024]u8 = undefined;
+        var evlen: usize = 0;
+        while (std.mem.indexOf(u8, evbuf[0..evlen], "data: sse-ok") == null) {
+            if (evlen >= evbuf.len) break;
+            const n = try test_tcp.read(cfd, evbuf[evlen..]);
+            if (n == 0) break;
+            evlen += n;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, evbuf[0..evlen], "data: sse-ok") != null);
+
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expect(server.el_stats.hijacked >= 1);
+    }
+
+    // --- WebSocket hijack ------------------------------------------------------
+
+    fn wsTestHandler(
+        ctx: http_server.HttpContext,
+        req: http_server.HttpRequest,
+        server_ptr: *anyopaque,
+        client_fd: i32,
+        client_id: *[16]u8,
+    ) anyerror!void {
+        _ = req;
+        _ = client_id;
+        const server: *http_server.GinwaServer = @ptrCast(@alignCast(server_ptr));
+        var buf: [4096]u8 = undefined;
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(ctx.allocator);
+        while (true) {
+            const n = try server.recvFromClient(client_fd, &buf);
+            if (n == 0) return;
+            try acc.appendSlice(ctx.allocator, buf[0..n]);
+            var frame = ws_frames.parseFrame(ctx.allocator, acc.items) catch |err| {
+                // Partial frame: read more (loopback may split frames).
+                if (err == error.IncompleteFrame) continue;
+                return err;
+            };
+            defer frame.deinit(ctx.allocator);
+            switch (frame.opcode) {
+                .text => {
+                    const echo = try ws_frames.encodeFrame(ctx.allocator, .{
+                        .opcode = .text,
+                        .payload = frame.payload,
+                    });
+                    defer ctx.allocator.free(echo);
+                    _ = try server.sendToClient(client_fd, echo);
+                },
+                .ping => {
+                    const pong = try ws_frames.encodeFrame(ctx.allocator, .{
+                        .opcode = .pong,
+                        .payload = frame.payload,
+                    });
+                    defer ctx.allocator.free(pong);
+                    _ = try server.sendToClient(client_fd, pong);
+                },
+                .close => return,
+                else => {},
+            }
+            acc.clearRetainingCapacity();
+        }
+    }
+
+    /// Read exactly `buf.len` bytes (blocking).
+    fn readExact(fd: i32, buf: []u8) !void {
+        var off: usize = 0;
+        while (off < buf.len) {
+            const n = try test_tcp.read(fd, buf[off..]);
+            if (n == 0) return error.Closed;
+            off += n;
+        }
+    }
+
+    test "listenEventLoop serves WebSocket echo via hijack" {
+        const alloc = std.testing.allocator;
+        _ = alloc;
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(std.testing.allocator, std.testing.io, addr);
+        defer server.destroy(std.testing.allocator);
+
+        try server.router.ws("/ws", wsTestHandler);
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+
+        // RFC 6455 handshake (example key → well-known accept).
+        try writeAll(cfd, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        var buf: [8192]u8 = undefined;
+        const hs = try readHttpResponse(cfd, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, hs, "101") != null);
+        try std.testing.expect(std.mem.indexOf(u8, hs, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+
+        // Masked text frame "hi" (client MUST mask). Second byte 0x82 =
+        // MASK + length 2 (NOT 0x84: that declares 4 payload bytes and the
+        // server would rightly wait for 2 more bytes forever).
+        const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+        var masked = [2 + 4 + 2]u8{ 0x81, 0x82, mask[0], mask[1], mask[2], mask[3], 'h' ^ mask[0], 'i' ^ mask[1] };
+        try writeAll(cfd, &masked);
+        // Unmasked echo "hi" back.
+        var echo: [4]u8 = undefined;
+        try readExact(cfd, &echo);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, &echo);
+
+        // Masked close → server close frame + EOF.
+        var close_req = [2 + 4]u8{ 0x88, 0x80, mask[0], mask[1], mask[2], mask[3] };
+        try writeAll(cfd, &close_req);
+        var close_resp: [4]u8 = undefined;
+        try readExact(cfd, &close_resp);
+        try std.testing.expectEqual(@as(u8, 0x88), close_resp[0]);
+        var tail: [64]u8 = undefined;
+        const n = try test_tcp.read(cfd, &tail);
+        try std.testing.expectEqual(@as(usize, 0), n);
+
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expect(server.el_stats.hijacked >= 1);
+    }
+
+    // --- H2C hijack smoke ------------------------------------------------------
+
+    test "listenEventLoop hijacks H2 preface to H2 driver" {
+        const alloc = std.testing.allocator;
+        _ = alloc;
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(std.testing.allocator, std.testing.io, addr);
+        defer server.destroy(std.testing.allocator);
+
+        try server.router.get("/hello", helloHandler);
+        server.enable_h2c = true;
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+
+        // H2 connection preface + empty SETTINGS frame.
+        try writeAll(cfd, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        try writeAll(cfd, &[_]u8{ 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        // Server's first frame must be its SETTINGS (type 0x4).
+        var head: [9]u8 = undefined;
+        try readExact(cfd, &head);
+        try std.testing.expectEqual(@as(u8, 0x04), head[3]);
+
+        server.shutdown();
+        t.join();
+        if (st.err) |err| return err;
+        try std.testing.expect(server.el_stats.hijacked >= 1);
+    }
+};
+
+comptime {
+    _ = event_loop_server_tests;
+}
+
+// ============================================================================
+// Tests — moved here from `http_server_test.zig` (the separate `*_test.zig` file was
+// deleted) so the tests live next to the implementation they cover.
+//
+// Kept in a namespace so the test helpers cannot shadow this file's own
+// declarations. `test { _ = http_server_tests; }` below pulls them into the run.
+// ============================================================================
+
+const http_server_tests = struct {
+    const http_server = @import("http_server.zig");
+    const linux = std.posix.system;
+    const helpers = @import("test_helpers.zig");
+    const closeI32Fd = helpers.closeI32Fd;
+    const writeTestFd = helpers.writeTestFdAll;
+    const closeTestFd = helpers.closeTestFd;
+    const test_tcp = @import("test_tcp.zig");
+
+    /// A loopback port that is free *right now*.
+    ///
+    /// The Address tests below used hardcoded literals (45678…45692). Those
+    /// numbers are NOT reserved: any process on the box can be handed the same
+    /// number as an ephemeral *client* port by `connect()`. A Node process
+    /// parked on 45686 (CLOSE_WAIT) made the two tests that used it fail with
+    /// `error.BindFailed` — a spurious failure that has nothing to do with the
+    /// code under test. Bind :0, read back the kernel's choice, release it, and
+    /// hand that back: the window between release and the test's own bind is
+    /// microscopic, and nothing else in this binary asks for that number.
+    fn freePort() !u16 {
+        const probe = try http_server.Address.init("127.0.0.1", 0);
+        defer _ = closeI32Fd(probe.sock_fd);
+        return test_tcp.boundPort(probe.sock_fd);
+    }
+
+    /// Pumps headers+body into a test socketpair from a writer thread while
+    /// the main thread reads. Serial write-then-read deadlocks on platforms
+    /// whose socket/pipe buffer is smaller than the ~14KB payload
+    /// (macOS, Windows): the writer parks forever with no concurrent
+    /// reader. The writer ALWAYS closes the write end when done (success
+    /// or error) so the reader sees EOF instead of parking forever on a
+    /// failed pump.
+    const RequestPump = struct {
+        fd: std.c.fd_t,
+        headers: []const u8,
+        body: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *RequestPump) void {
+            defer closeTestFd(self.fd);
+            writeTestFd(self.fd, self.headers) catch |e| {
+                self.err = e;
+                return;
+            };
+            writeTestFd(self.fd, self.body) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    };
+
+    // ============================================================================
+    // Address Struct Tests
+    // ============================================================================
+
+    test "Address.init creates socket and binds" {
+        // Use a high port number to avoid permission issues
+        const addr = try http_server.Address.init("127.0.0.1", 45678);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        try std.testing.expect(addr.sock_fd >= 0);
+        try std.testing.expectEqual(@as(u16, 45678), addr.port);
+    }
+
+    test "Address.init with different port" {
+        const addr = try http_server.Address.init("127.0.0.1", 45679);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        try std.testing.expectEqual(@as(u16, 45679), addr.port);
+    }
+
+    test "Address.init multiple instances on different ports" {
+        const addr1 = try http_server.Address.init("127.0.0.1", 45680);
+        defer _ = closeI32Fd(addr1.sock_fd);
+
+        const addr2 = try http_server.Address.init("127.0.0.1", 45681);
+        defer _ = closeI32Fd(addr2.sock_fd);
+
+        try std.testing.expect(addr1.sock_fd >= 0);
+        try std.testing.expect(addr2.sock_fd >= 0);
+        try std.testing.expect(addr1.sock_fd != addr2.sock_fd);
+    }
+
+    // ============================================================================
+    // GinwaServer Initialization Tests
+    // ============================================================================
+
+    test "GinwaServer.init creates server instance" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45682);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        try std.testing.expect(server.address.sock_fd == addr.sock_fd);
+        try std.testing.expectEqual(@as(u16, 45682), server.address.port);
+    }
+
+    test "GinwaServer.init router is initialized" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45683);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        // Router should be accessible (we can't directly check internal state, but
+        // we can verify the server was created successfully)
+        try std.testing.expect(server.router.routes.items.len == 0); // Empty initially
+    }
+
+    // ============================================================================
+    // Server with Router Integration Tests
+    // ============================================================================
+
+    test "GinwaServer with registered route" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45684);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        try server.router.get("/test", struct {
+            fn handle(_: http_parser.HttpContext, _: http_parser.HttpRequest, _: http_parser.HttpResponse) anyerror!http_parser.HttpResponse {
+                return http_parser.ok("Test Response", std.heap.page_allocator);
+            }
+        }.handle);
+
+        try std.testing.expect(server.router.routes.items.len == 1);
+        try std.testing.expectEqualStrings("/test", server.router.routes.items[0].path);
+    }
+
+    // ============================================================================
+    // Server-level SecurityHeaders config (app-agnostic library)
+    // ============================================================================
+
+    test "GinwaServer.security_headers defaults to library baseline" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        // Default CSP must NOT contain app-specific hosts.
+        const csp = server.security_headers.content_security_policy;
+        try std.testing.expect(std.mem.indexOf(u8, csp, "cdn.tailwindcss.com") == null);
+        try std.testing.expect(std.mem.indexOf(u8, csp, "cloudflareinsights") == null);
+    }
+
+    test "GinwaServer.applySecurityHeadersTo uses server-level CSP override" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45687);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        // App opts in to its own CSP (tailwind CDN + CF analytics beacon).
+        server.security_headers.content_security_policy =
+            "default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://static.cloudflareinsights.com 'unsafe-inline'";
+
+        var res = http_parser.HttpResponse.init(200, "OK", allocator);
+        defer res.deinit();
+
+        server.applySecurityHeadersTo(&res);
+
+        const csp = res.headers.get("Content-Security-Policy") orelse
+            return error.ContentSecurityPolicyHeaderMissing;
+        try std.testing.expect(std.mem.indexOf(u8, csp, "cdn.tailwindcss.com") != null);
+        try std.testing.expect(std.mem.indexOf(u8, csp, "static.cloudflareinsights.com") != null);
+        // Non-overridden headers keep library defaults.
+        try std.testing.expectEqualStrings("nosniff", res.headers.get("X-Content-Type-Options").?);
+    }
+
+    // ============================================================================
+    // HttpContext.allowed_origins — handlers must read the SERVER's CORS
+    // config instead of hardcoding "localhost:4021" (broke ginwa.site).
+    // ============================================================================
+
+    test "HttpContext.allowed_origins defaults to empty slice" {
+        const ctx = http_parser.HttpContext{
+            .allocator = std.testing.allocator,
+            .io = undefined,
+        };
+        try std.testing.expectEqual(@as(usize, 0), ctx.allowed_origins.len);
+    }
+
+    test "handler origin gate: checkOriginInList with ctx origins accepts whitelisted host" {
+        // Documents the wiring contract handlers rely on: the dispatch loop
+        // fills ctx.allowed_origins from server.cors; handlers pass that
+        // slice to security.checkOriginInList.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const security_mod = @import("security.zig");
+        const origins = [_][]const u8{ "localhost:4021", "ginwa.site" };
+        const ctx = http_parser.HttpContext{
+            .allocator = arena.allocator(),
+            .io = undefined,
+            .allowed_origins = &origins,
+        };
+
+        var req = security_mod.HttpRequest{
+            .method = "POST",
+            .path = "/admin/signin",
+            .version = "HTTP/1.1",
+            .headers = std.StringHashMap([]const u8).init(arena.allocator()),
+            .body = "",
+            .raw = "",
+            .params = std.StringHashMap([]const u8).init(arena.allocator()),
+            .query = std.StringHashMap([]const u8).init(arena.allocator()),
+            ._client_fd = -1,
+        };
+        defer req.headers.deinit();
+        defer req.params.deinit();
+        defer req.query.deinit();
+        try req.headers.put("Origin", "https://ginwa.site");
+
+        // Must NOT throw — ginwa.site is in the server-configured list.
+        try security_mod.checkOriginInList(&req, ctx.allowed_origins);
+    }
+
+    // ============================================================================
+    // Error Handling Tests
+    // ============================================================================
+
+    test "Address.init fails on invalid port (0 is technically valid, use reserved)" {
+        // Test that we can detect port already in use by creating two addresses
+        // on the same port (note: SO_REUSEADDR may allow this on some systems,
+        // so this test may need adjustment based on platform behavior)
+        const addr1 = try http_server.Address.init("127.0.0.1", 45685);
+        defer _ = closeI32Fd(addr1.sock_fd);
+
+        // On Linux with SO_REUSEADDR, this should succeed. On other platforms
+        // this might fail. We test that at minimum one succeeds.
+        try std.testing.expect(addr1.sock_fd >= 0);
+    }
+
+    // ============================================================================
+    // Address Fields Validation Tests
+    // ============================================================================
+
+    test "Address port is correctly stored" {
+        // `freePort()` instead of a literal: the requested port must be
+        // bindable for `init` to succeed, and a hardcoded number can be held
+        // by an unrelated process's ephemeral socket (see `freePort`). The
+        // assertion under test is unchanged — whatever port is requested is
+        // what `Address` stores.
+        const test_port: u16 = try freePort();
+        const addr = try http_server.Address.init("127.0.0.1", test_port);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        try std.testing.expectEqual(test_port, addr.port);
+        try std.testing.expect(addr.sock_fd >= 0);
+    }
+
+    test "Address sock_fd is valid file descriptor" {
+        const addr = try http_server.Address.init("127.0.0.1", 45687);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        // On Linux, valid file descriptors are non-negative
+        try std.testing.expect(addr.sock_fd >= 0);
+    }
+
+    // ============================================================================
+    // getClientPort Tests (when connected)
+    // ============================================================================
+
+    test "GinwaServer.getClientPort returns 0 for invalid fd" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45688);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        // -1 is an invalid file descriptor, should return 0
+        const port = server.getClientPort(-1);
+        try std.testing.expectEqual(@as(u16, 0), port);
+    }
+
+    // ============================================================================
+    // recvFromClient and sendToClient Tests
+    // ============================================================================
+
+    test "GinwaServer.recvFromClient fails on invalid fd" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45689);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        var buf: [1024]u8 = undefined;
+        const result = server.recvFromClient(-1, &buf);
+        try std.testing.expectError(error.RecvFailed, result);
+    }
+
+    test "GinwaServer.sendToClient fails on invalid fd" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45690);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        const result = server.sendToClient(-1, "Hello");
+        try std.testing.expectError(error.SendFailed, result);
+    }
+
+    // ============================================================================
+    // Integration Test with Actual Connection
+    // ============================================================================
+
+    test "Server accepts client connection" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const addr = try http_server.Address.init("127.0.0.1", 45691);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(allocator, undefined, addr);
+        defer server.destroy(allocator);
+
+        // Create a client socket and connect
+        const client_fd_sock = linux.socket(2, 1, 0);
+        const client_fd: i32 = @intCast(client_fd_sock);
+        defer _ = closeI32Fd(client_fd);
+
+        // Connect to server
+        const addr2 = try http_server.Address.init("127.0.0.1", 45692);
+        defer _ = closeI32Fd(addr2.sock_fd);
+
+        // Socket creation verified - full integration test would require actual server listening
+    }
+
+    // ============================================================================
+    // RequestBuffer Tests - Auto-growing buffer for large payloads
+    // ============================================================================
+
+    test "RequestBuffer.init creates empty buffer" {
+        const allocator = std.testing.allocator;
+        var rb = http_server.RequestBuffer.init(allocator);
+        defer rb.deinit();
+
+        try std.testing.expect(rb.buf.items.len == 0);
+    }
+
+    // Test that simulates your exact request
+    test "RequestBuffer.readFullRequest with exact POST headers (13248 body)" {
+        const allocator = std.testing.allocator;
+
+        // Create a socket pair for testing. Cross-platform: socketpair on
+        // POSIX, CreatePipe on Windows (no AF_UNIX socketpair(2) in Winsock).
+        var pipe_fds: [2]std.c.fd_t = undefined;
+        const rc = if (comptime builtin.os.tag == .windows)
+            blk: {
+                // Use the shared helper (kernel32 CreatePipe) directly so the
+                // call returns the same error type as the POSIX branch.
+                const pair = helpers.createSocketPair() catch {
+                    // pipe creation failed, skip test
+                    return;
+                };
+                pipe_fds = pair;
+                break :blk 0;
+            }
+        else
+            posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pipe_fds);
+        if (rc < 0) {
+            // socketpair not supported, skip test
+            return;
+        }
+        // NOTE: no close-both defer here — the writer thread owns the
+        // write end (pipe_fds[1], closed when the pump finishes) and the
+        // pump defer below owns the read end (pipe_fds[0]).
+
+        // Build the exact headers you sent
+        const headers = 
+            "POST /api/llm/session HTTP/1.1\r\n" ++
+            "Accept: */*\r\n" ++
+            "Accept-Encoding: gzip, deflate, br, zstd\r\n" ++
+            "Accept-Language: en-US,en;q=0.9\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "Content-Length: 13248\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Host: localhost:5173\r\n" ++
+            "Origin: http://localhost:5173\r\n" ++
+            "Referer: http://localhost:5173/app?view=task&task=task_1779042417517\r\n" ++
+            "Sec-Fetch-Dest: empty\r\n" ++
+            "Sec-Fetch-Mode: cors\r\n" ++
+            "Sec-Fetch-Site: same-origin\r\n" ++
+            "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36\r\n" ++
+            "sec-ch-ua: \"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"\r\n" ++
+            "sec-ch-ua-mobile: ?0\r\n" ++
+            "sec-ch-ua-platform: \"Linux\"\r\n" ++
+            "\r\n";
+
+        // Create a 13248 byte body
+        const body_size: usize = 13248;
+        const body = try allocator.alloc(u8, body_size);
+        defer allocator.free(body);
+        // Fill with pattern
+        for (0..body_size) |i| {
+            body[i] = @as(u8, @truncate(i));
+        }
+
+        // Pump headers+body from a writer thread while the main thread
+        // reads (see RequestPump above — serial write-then-read deadlocks
+        // on macOS/Windows whose socket/pipe buffer is smaller than the
+        // ~14KB payload). The writer owns the write end (closes it when
+        // done); the single defer below joins the writer first, then
+        // closes the read end.
+        var pump = RequestPump{ .fd = pipe_fds[1], .headers = headers, .body = body };
+        const writer = try std.Thread.spawn(.{}, RequestPump.run, .{&pump});
+        defer {
+            writer.join();
+            closeTestFd(pipe_fds[0]);
+        }
+
+        // Use RequestBuffer to read
+        var rb = http_server.RequestBuffer.init(allocator);
+        defer rb.deinit();
+
+        const result = rb.readFullRequest(if (comptime builtin.os.tag == .windows)
+            @intCast(@intFromPtr(pipe_fds[0]))
+        else
+            @intCast(pipe_fds[0])) catch |err| {
+            std.debug.print("readFullRequest failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        defer allocator.free(result);
+
+        // Verify: total should be headers.len + body_size
+        const expected_len = headers.len + body_size;
+        try std.testing.expectEqual(expected_len, result.len);
+
+        // Verify the body content
+        const result_body = result[headers.len..];
+        try std.testing.expectEqual(@as(u8, 0), result_body[0]);
+        try std.testing.expectEqual(@as(u8, 1), result_body[1]);
+        try std.testing.expectEqual(@as(u8, 100), result_body[100]);
+        try std.testing.expectEqual(@as(u8, @truncate(body_size - 1)), result_body[body_size - 1]);
+
+        // The pump must have finished cleanly (the defer above already
+        // joined it — surfacing a writer-side failure as a test error
+        // keeps a broken pump from hiding behind a short read).
+        if (pump.err) |e| return e;
+    }
+
+    // Test getContentLength with your exact headers
+    test "RequestBuffer.getContentLength with your headers" {
+        const data = 
+            "POST /api/llm/session HTTP/1.1\r\n" ++
+            "Accept: */*\r\n" ++
+            "Content-Length: 13248\r\n" ++
+            "\r\n";
+
+        const content_length = http_server.RequestBuffer.getContentLength(data);
+        try std.testing.expect(content_length != null);
+        try std.testing.expectEqual(@as(usize, 13248), content_length.?);
+    }
+};
+
+comptime {
+    _ = http_server_tests;
+}
