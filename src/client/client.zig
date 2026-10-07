@@ -260,7 +260,7 @@ pub const Client = struct {
         if (rc != curl.C.CURLE_OK) {
             const err_msg: []const u8 = std.mem.sliceTo(&errbuf, 0);
             if (err_msg.len > 0) {
-                std.log.warn("curl_easy_perform failed: code={d} msg={s}", .{ rc, err_msg });
+                std.log.info("curl_easy_perform failed: code={d} msg={s}", .{ rc, err_msg });
             } else {
                 // errbuf is empty for many failures (e.g. connection
                 // reset before any server text). Fall back to libcurl's
@@ -272,7 +272,7 @@ pub const Client = struct {
                     std.mem.sliceTo(str_ptr, 0)
                 else
                     "unknown error";
-                std.log.warn("curl_easy_perform failed: code={d} msg={s}", .{ rc, str_slice });
+                std.log.info("curl_easy_perform failed: code={d} msg={s}", .{ rc, str_slice });
             }
             return mapCurlCode(rc);
         }
