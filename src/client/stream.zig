@@ -678,7 +678,7 @@ fn streamWorker(state: *SharedState) void {
         // identifies the actual cause.
         const err_msg_slice = std.mem.sliceTo(&state.errbuf, 0);
         if (err_msg_slice.len > 0) {
-            std.log.warn("curl_easy_perform failed: code={d} msg={s}", .{ rc, err_msg_slice });
+            std.log.info("curl_easy_perform failed: code={d} msg={s}", .{ rc, err_msg_slice });
         } else {
             // Same strerror fallback as client.zig's perform path —
             // keeps the worker log human-readable on every platform.
@@ -687,7 +687,7 @@ fn streamWorker(state: *SharedState) void {
                 std.mem.sliceTo(str_ptr, 0)
             else
                 "unknown error";
-            std.log.warn("curl_easy_perform failed: code={d} msg={s}", .{ rc, str_slice });
+            std.log.info("curl_easy_perform failed: code={d} msg={s}", .{ rc, str_slice });
         }
         state.worker_error = mapStreamError(rc);
     }
