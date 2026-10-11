@@ -516,6 +516,12 @@ pub const EventLoop = struct {
 
         self.running = true;
         var pollfds_buf: [4096 + 2]nb.PollFd = undefined;
+        // `poll_ids_buf[i]` is the conn id that owned slot `i` when
+        // `pollfds_buf` was built. The scan resolves each slot through it
+        // instead of indexing `conns` with the slot number: accept drains
+        // APPEND and completion drains REMOVE between the snapshot and the
+        // scan, so the two arrays stop lining up (see the scan's comment).
+        var poll_ids_buf: [4096]u64 = undefined;
 
         while (self.running) {
             const n_conns = self.conns.items.len;
@@ -530,6 +536,7 @@ pub const EventLoop = struct {
             const conn_base: usize = extra;
             if (use_pool) pollfds_buf[1] = nb.pollIn(self.wake_read);
             for (self.conns.items, 0..) |*c, i| {
+                poll_ids_buf[i] = c.id;
                 pollfds_buf[conn_base + i] = if (c.state == .writing)
                     nb.pollInOut(c.fd)
                 else
@@ -561,18 +568,42 @@ pub const EventLoop = struct {
                 if (!self.running) break;
             }
 
-            // 3. conns (iterate backwards so removal is index-safe)
+            // 3. conns — `i` is a POLL SLOT, not a conn index.
+            //
+            // Both drains above mutate `conns.items` between the snapshot
+            // (`pollfds_buf` / `poll_ids_buf`) and this scan: the listener
+            // drain appends, the completion drain removes. Every removal
+            // shifts the tail down, so `conns.items[i]` is NOT the conn that
+            // slot's revents belong to. Iterating backwards only keeps
+            // removals made INSIDE this loop index-safe — it does nothing
+            // about the ones that already happened.
+            //
+            // Applying a foreign revents to a conn is not cosmetic: a
+            // POLLNVAL belonging to a conn the static pool just closed would
+            // tear down an unrelated connection, and a POLLIN belonging to
+            // another conn would make the loop `recv` a socket it has nothing
+            // to read from. Resolve the slot by the id it owned at snapshot
+            // time instead.
             var i: usize = n_conns;
             while (i > 0) {
                 i -= 1;
-                if (i >= self.conns.items.len) continue;
                 const re = pollfds_buf[conn_base + i].revents;
                 if (re == 0) continue;
+                const idx = self.findConn(poll_ids_buf[i]) orelse continue;
                 if (nb.isErrorHungup(re) and (re & nb.POLL.IN) == 0 and (re & nb.POLL.OUT) == 0) {
-                    self.removeAt(i, .err);
+                    // A conn whose request is offloaded no longer owns its fd:
+                    // the worker may already have handed it to the static pool,
+                    // which blocks it and closes it when the serve finishes.
+                    // Closing the fd here would close a RECYCLED number — a
+                    // fresh connection — and leave the pending handoff serving
+                    // that other connection's socket. Its hijack completion
+                    // retires the conn; if the completion never comes the idle
+                    // sweep reaps it.
+                    if (self.conns.items[idx].pending) continue;
+                    self.removeAt(idx, .err);
                     continue;
                 }
-                self.serviceConn(i, re);
+                self.serviceConn(idx, re);
                 if (!self.running) break;
             }
 
@@ -1550,7 +1581,191 @@ const event_loop_tests = struct {
 
         try std.testing.expect(loop.stats.served >= 2);
     }
+
+    // --- hijack handoff vs the poll-slot scan (regression) --------------------
+    //
+    // A hijacked conn's fd LEAVES the loop: the worker owns it, makes it
+    // BLOCKING, writes the response raw and closes it (see
+    // `http_server.zig:runStaticServe`). Until the hijack completion lands the
+    // conn is still in `conns` and still in the poll array, and the completion
+    // drain removes conns BEFORE the scan runs — so the scan's slot number
+    // stops matching `conns` indices. Applying slot N's revents to a different
+    // conn is not cosmetic:
+    //
+    //   * a POLLNVAL belonging to the hijack conn that the worker just closed
+    //     tore down an UNRELATED connection -> the client's request died with
+    //     zero bytes (`net::ERR_EMPTY_RESPONSE` in a browser);
+    //   * a foreign POLLIN made the loop `recv` a socket with nothing to read
+    //     on an fd the worker had just flipped to blocking -> the reactor
+    //     blocked for SECONDS, stalling every other connection.
+    //
+    // Invariant asserted: a complete request always gets a response. A client
+    // that sends one must never see a bare close. Both arms are positive-
+    // controlled so an all-zero result cannot pass vacuously.
+    const HamCtx = struct {
+        hijacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        responded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        bare_close: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    };
+
+    // Mirrors `runStaticServe`: blocking flip, raw write, close.
+    fn hamHijack(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: i32, data: []const u8) void {
+        _ = alloc;
+        _ = io;
+        _ = data;
+        const c: *HamCtx = @ptrCast(@alignCast(ctx));
+        _ = c.hijacks.fetchAdd(1, .monotonic);
+        nb.setBlocking(fd) catch {
+            test_tcp.close(fd);
+            return;
+        };
+        const body = "ham-hijack-ok";
+        var buf: [160]u8 = undefined;
+        const resp = std.fmt.bufPrint(
+            &buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch {
+            test_tcp.close(fd);
+            return;
+        };
+        test_tcp.writeAll(fd, resp) catch {};
+        test_tcp.close(fd);
+    }
+
+    // Half the requests hijack (removing conns from the table mid-tick), half
+    // answer through the loop.
+    fn hamDispatch(
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        req_bytes: []const u8,
+        req: *const event_loop.HttpRequest,
+        http_ctx: event_loop.HttpContext,
+    ) anyerror!event_loop.DispatchResult {
+        _ = req_bytes;
+        _ = http_ctx;
+        const c: *HamCtx = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, req.path, "/hijack")) {
+            return .{ .hijack_static = .{ .ctx = ctx, .run = hamHijack } };
+        }
+        _ = c.responded.fetchAdd(1, .monotonic);
+        var res = event_loop.HttpResponse.init(200, "OK", alloc).withBody("ham-respond-ok");
+        res.keep_alive = false;
+        return .{ .respond = res };
+    }
+
+    fn hamNowMs() i64 {
+        const ns = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+        return @intCast(@divTrunc(ns, std.time.ns_per_ms));
+    }
+
+    const HamArgs = struct {
+        port: u16,
+        ctx: *HamCtx,
+        deadline_ms: i64,
+    };
+
+    /// One request, read with a BOUNDED wait. Zero bytes back == the bug.
+    ///
+    /// The read is poll-gated rather than a plain blocking read on purpose: the
+    /// pre-fix reactor could block in `recv` for as long as the buggy fd's peer
+    /// stayed open, so a blocking client would HANG the test instead of failing
+    /// it. Giving up after ~2 s of silence and closing the socket also unblocks
+    /// that reactor, which is what lets the loop thread join at the end.
+    fn hamOnce(port: u16, want_hijack: bool, ctx: *HamCtx) void {
+        const fd = tcpConnect(port) catch return; // refused != the bug
+        defer test_tcp.close(fd);
+        var req_buf: [160]u8 = undefined;
+        const req = std.fmt.bufPrint(
+            &req_buf,
+            "GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            .{if (want_hijack) "/hijack" else "/keep"},
+        ) catch return;
+        writeAll(fd, req) catch return;
+        var buf: [1024]u8 = undefined;
+        var len: usize = 0;
+        var quiet: usize = 0;
+        while (len < buf.len) {
+            var pfd = [_]nb.PollFd{nb.pollIn(fd)};
+            const ready = nb.pollOnce(&pfd, 250) catch break;
+            if (ready == 0) {
+                quiet += 1;
+                if (quiet >= 8) break; // ~2 s of silence: give up + unblock
+                continue;
+            }
+            quiet = 0;
+            const n = test_tcp.read(fd, buf[len..]) catch break;
+            if (n == 0) break;
+            len += n;
+        }
+        if (len == 0 or std.mem.indexOf(u8, buf[0..len], "200 OK") == null) {
+            _ = ctx.bare_close.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn hamClient(a: HamArgs) void {
+        var flip = false;
+        while (hamNowMs() < a.deadline_ms) {
+            hamOnce(a.port, flip, a.ctx);
+            flip = !flip;
+        }
+    }
+
+    test "event loop: a hijacked conn's closed fd never kills another connection" {
+        const alloc = std.testing.allocator;
+        const listener = try test_tcp.listenEphemeral();
+        const lfd = listener.fd;
+        const port = listener.port;
+        defer test_tcp.close(lfd);
+
+        var ctx = HamCtx{};
+        var loop = EventLoop.init(alloc, std.testing.io, .{
+            .max_conns = 512,
+            .idle_timeout_ms = 5_000,
+            .header_timeout_ms = 3_000,
+        });
+        defer loop.deinit();
+
+        const http_ctx: event_loop.HttpContext = .{ .allocator = alloc, .io = std.testing.io };
+        const t = try std.Thread.spawn(.{}, struct {
+            fn run(l: *EventLoop, fd: i32, ctxp: *HamCtx, hctx: event_loop.HttpContext) void {
+                l.run(fd, hamDispatch, @ptrCast(ctxp), hctx) catch {};
+
+            }
+        }.run, .{ &loop, lfd, &ctx, http_ctx });
+        defer {
+            loop.requestShutdown();
+            if (tcpConnect(port)) |w| {
+                test_tcp.close(w);
+            } else |_| {}
+            t.join();
+        }
+
+        // Let the reactor settle into poll before the hammer starts.
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .real) catch {};
+
+        const deadline = hamNowMs() + 1_500;
+        var threads: [5]std.Thread = undefined;
+        for (&threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, hamClient, .{HamArgs{
+                .port = port,
+                .ctx = &ctx,
+                .deadline_ms = deadline,
+            }});
+        }
+        for (&threads) |*th| th.join();
+
+        // Positive control: both arms really ran.
+        try std.testing.expect(ctx.hijacks.load(.monotonic) > 0);
+        try std.testing.expect(ctx.responded.load(.monotonic) > 0);
+        try std.testing.expectEqual(@as(u64, 0), ctx.bare_close.load(.monotonic));
+    }
 };
+
+comptime {
+    _ = event_loop_tests;
+}
+
 
 comptime {
     _ = event_loop_tests;
