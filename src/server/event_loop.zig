@@ -670,6 +670,22 @@ pub const EventLoop = struct {
         if (idx >= self.conns.items.len) return;
         var c = &self.conns.items[idx];
 
+        // A conn whose request is offloaded does NOT own its fd any more: the
+        // worker may already have handed it to the static pool, which blocks it
+        // and closes it when the serve finishes. Touching the fd here — a
+        // `recv` that errors, or the close that follows it — operates on
+        // whatever number the kernel has recycled in the meantime, so a
+        // brand-new connection dies with zero bytes (`net::ERR_EMPTY_RESPONSE`).
+        //
+        // Bytes that arrive while the request is in flight are not lost: they
+        // stay in the kernel buffer until the completion lands, flips the conn
+        // back to `.reading`, and poll reports them again. That
+        // buffer-then-dispatch shape is the one `dispatchBuffered` already
+        // assumes (`if (c.pending) return;`) — this just stops the read half
+        // from reaching for an fd it no longer owns, which is the same mistake
+        // the poll-slot scan above was fixed for.
+        if (c.pending) return;
+
         if ((revents & nb.POLL.IN) != 0 and c.state == .reading) {
             self.readAvailable(idx) orelse return; // closed inside
             if (idx >= self.conns.items.len) return;
