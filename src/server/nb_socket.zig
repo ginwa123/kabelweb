@@ -84,9 +84,28 @@ const winsock = if (is_windows) struct {
     const WSAECONNABORTED: c_int = 10053;
     const WSAESHUTDOWN: c_int = 10058;
     const WSAENOTCONN: c_int = 10057;
+    /// "Socket operation on non-socket" — what `WSAPoll` reports for the WHOLE
+    /// call when one handle in the array has been closed. POSIX `poll(2)` has
+    /// no equivalent: it reports `POLLNVAL` on that slot and keeps going.
+    const WSAENOTSOCK: c_int = 10038;
 
     const FIONBIO: c_long = @bitCast(@as(u32, 0x8004667E));
+    /// `ioctlsocket` "bytes available" (read-only). Used only as a handle
+    /// liveness probe — see `isLive`.
+    const FIONREAD: c_long = @bitCast(@as(u32, 0x4004667F));
     const SOCKET_ERROR: c_int = -1;
+
+    /// True when `sockfd` is still a live socket handle.
+    ///
+    /// Needed because `WSAPoll` fails the WHOLE call when any handle in the
+    /// array is invalid, whereas POSIX `poll(2)` marks just that slot
+    /// `POLLNVAL` — so before retrying a failed poll we must find out which
+    /// slots died. `ioctlsocket(FIONREAD)` is read-only and cheap: a closed
+    /// SOCKET answers `SOCKET_ERROR`/`WSAENOTSOCK`, a live one answers 0.
+    pub fn isLive(sockfd: c_int) bool {
+        var avail: c_ulong = 0;
+        return ioctlsocket(sockfd, FIONREAD, &avail) != SOCKET_ERROR;
+    }
 } else struct {};
 
 /// Winsock must be started before any other winsock call. Ref-counted by
@@ -385,7 +404,45 @@ pub fn pollOnce(fds: []PollFd, timeout_ms: i32) !usize {
             @intCast(fds.len),
             timeout_ms,
         );
-        if (rc == winsock.SOCKET_ERROR) return error.PollFailed;
+        if (rc == winsock.SOCKET_ERROR) {
+            // One dead handle fails the WHOLE call on Windows, where POSIX
+            // `poll(2)` would only mark that slot `POLLNVAL`. That difference
+            // is load-bearing here: `GinwaServer.shutdown()` deliberately does
+            // `shutdown(listener)` + `close(listener)` from another thread in
+            // order to break this loop (see `serveSingleLoop`), so the listener
+            // slot goes invalid while the loop is waiting in this very call.
+            // POSIX turns that into POLLNVAL, which `run` reads as "listener
+            // died" and breaks cleanly; Windows turned it into
+            // `error.PollFailed` and killed the loop thread instead.
+            //
+            // Restore parity: give the dead handles `POLLNVAL`, drop them from
+            // the set and retry once with what is left. Every other failure is
+            // still reported as before.
+            if (winsock.WSAGetLastError() != winsock.WSAENOTSOCK) return error.PollFailed;
+            var slot_of: [4098]u32 = undefined;
+            var live: usize = 0;
+            var dead: usize = 0;
+            for (fds, 0..) |*pfd, i| {
+                if (!winsock.isLive(pfd.fd)) {
+                    pfd.revents = POLL.NVAL;
+                    dead += 1;
+                    continue;
+                }
+                slot_of[live] = @intCast(i);
+                wsafds[live] = wsafds[i]; // live <= i always: compact in place
+                live += 1;
+            }
+            if (dead == 0) return error.PollFailed; // not the invalid-handle case
+            if (live == 0) return @intCast(dead); // everything died: all POLLNVAL
+            const rc2 = winsock.WSAPoll(
+                wsafds[0..].ptr,
+                @intCast(live),
+                timeout_ms,
+            );
+            if (rc2 == winsock.SOCKET_ERROR) return error.PollFailed;
+            for (0..live) |k| fds[slot_of[k]].revents = wsafds[k].revents;
+            return @as(usize, @intCast(rc2)) + dead; // + the POLLNVAL slots
+        }
         for (fds, 0..) |*pfd, i| pfd.revents = wsafds[i].revents;
         return @intCast(rc);
     }
