@@ -1352,6 +1352,17 @@ fn runTlsServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd: So
         closeFd(fd);
         return;
     };
+    // The event loop hands us a NON-BLOCKING fd (it set O_NONBLOCK on accept).
+    // `Conn.accept` does a single `SSL_accept` with no WANT_READ retry, so on a
+    // non-blocking fd it gets SSL_ERROR_WANT_READ on the first call (the
+    // ClientHello usually has not even landed) and reports HandshakeFailed,
+    // which closes the socket — every TLS client then dies with a broken pipe.
+    // Same fix as `runH2Serve` below: restore blocking mode before the
+    // handshake; TLS streams are served on a dedicated thread anyway.
+    nb_socket_mod.setBlocking(fd) catch {
+        closeFd(fd);
+        return;
+    };
     var tls_conn = tls_mod.Conn.accept(tls_ctx, fd) catch |err| {
         std.debug.print("HTTP_SERVER: TLS handshake failed: {s}\n", .{@errorName(err)});
         closeFd(fd);
