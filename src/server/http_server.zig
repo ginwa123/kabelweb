@@ -1666,6 +1666,12 @@ const event_loop_server_tests = struct {
 
         fn run(self: *ServerThread) void {
             self.server.listenEventLoop(self.cfg) catch |err| {
+                // Name it at the source. A loop-level failure (e.g. a Windows
+                // `WSAPoll` error surfacing as `error.PollFailed`) otherwise
+                // reaches the test as a bare `return err` and the runner prints
+                // only a return trace — no error name anywhere in the log —
+                // which is what made this flake unattributable from CI.
+                std.debug.print("ServerThread: listenEventLoop failed: {s}\n", .{@errorName(err)});
                 self.err = err;
             };
         }

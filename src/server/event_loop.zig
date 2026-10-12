@@ -535,15 +535,35 @@ pub const EventLoop = struct {
             pollfds_buf[0] = nb.pollIn(listener_fd);
             const conn_base: usize = extra;
             if (use_pool) pollfds_buf[1] = nb.pollIn(self.wake_read);
-            for (self.conns.items, 0..) |*c, i| {
-                poll_ids_buf[i] = c.id;
-                pollfds_buf[conn_base + i] = if (c.state == .writing)
+            // Only conns that still own their fd go into the set. A conn whose
+            // request is offloaded (`pending`) has handed its fd to a worker,
+            // which may already have passed it to the static pool — and that
+            // pool blocks on it and CLOSES it when the serve finishes. A closed
+            // handle in the array is survivable on POSIX (`poll(2)` merely sets
+            // `POLLNVAL` on that one slot, which the scan above treats as a
+            // foreign revents and drops) but WSAPoll fails the WHOLE call with
+            // `SOCKET_ERROR`/`WSAENOTSOCK`, which `pollOnce` maps to
+            // `error.PollFailed` — so on Windows a stale fd here does not
+            // degrade the loop, it stops it and kills the server thread.
+            //
+            // Leaving them out loses nothing: bytes that arrive while the
+            // request is in flight stay in the kernel buffer, the completion
+            // arrives on the wake channel, and `drainCompletions` re-runs the
+            // buffered dispatch — from the next snapshot on, the fd is polled
+            // again. Same ownership rule as the scan below; this is the one
+            // place that still ignored it.
+            var n_polled: usize = 0;
+            for (self.conns.items) |*c| {
+                if (c.pending) continue;
+                poll_ids_buf[n_polled] = c.id;
+                pollfds_buf[conn_base + n_polled] = if (c.state == .writing)
                     nb.pollInOut(c.fd)
                 else
                     nb.pollIn(c.fd);
+                n_polled += 1;
             }
             const timeout = self.pollTimeoutMs();
-            const ready = try nb.pollOnce(pollfds_buf[0 .. n_conns + extra], timeout);
+            const ready = try nb.pollOnce(pollfds_buf[0 .. n_polled + extra], timeout);
 
             if (!self.running) break;
             _ = ready;
@@ -584,7 +604,7 @@ pub const EventLoop = struct {
             // another conn would make the loop `recv` a socket it has nothing
             // to read from. Resolve the slot by the id it owned at snapshot
             // time instead.
-            var i: usize = n_conns;
+            var i: usize = n_polled;
             while (i > 0) {
                 i -= 1;
                 const re = pollfds_buf[conn_base + i].revents;
