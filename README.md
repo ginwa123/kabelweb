@@ -141,6 +141,7 @@ src/
   examples/
     server_demo.zig   # demo server: landing page, /health, SSE /stream, WS /ws, /template
     client_smoke.zig  # `kabelweb-client-smoke <METHOD> <URL>` manual smoke CLI
+    tls_server_probe.zig # `kabelweb-tls-server-probe` — HTTPS listener on :21997 (TLS hijack harness)
     templates/        # embedded demo templates
 scripts/
   build-vendor-curl.sh  # cross-compiles fat libcurl.a per target (curl 8.10.1 + OpenSSL 3.4.0)
@@ -197,6 +198,10 @@ zig build run             # server demo → zig-out/bin/kabelweb-server-demo (po
 # smoke client
 zig-out/bin/kabelweb-client-smoke GET https://example.com
 zig-out/bin/kabelweb-client-smoke GET http://127.0.0.1:29590/health
+
+# TLS server probe (self-signed, ALPN h2|http/1.1, :21997) — the HTTPS half of
+# the smoke pair. Terminal A: `zig-out/bin/kabelweb-tls-server-probe`
+# Terminal B: `curl -k -i https://127.0.0.1:21997/health`   # -> HTTP/2 200, "OK"
 
 # server demo checks
 curl -i http://127.0.0.1:29590/

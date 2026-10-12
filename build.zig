@@ -747,6 +747,32 @@ pub fn build(b: *std.Build) void {
     client_smoke_exe.root_module.link_libc = true;
     b.installArtifact(client_smoke_exe);
 
+    // TLS server probe. Boots a `GinwaServer` with `enableTls` on
+    // 127.0.0.1:21997 from a self-signed pair, using the same three calls a
+    // consumer makes (`GinwaServer.init` → `setTlsCtx` → `listenEventLoop`
+    // with `.dispatch_mode = .worker_pool`) — the fd path that
+    // `runTlsServe` owns. It is the manual harness for the TLS hijack:
+    //
+    //     zig-out/bin/kabelweb-tls-server-probe &
+    //     curl -k -i https://127.0.0.1:21997/health      # HTTP/2 200 + body "OK"
+    //
+    // Before the `setBlocking` fix in `runTlsServe` the same command gave
+    // `curl: (35) Send failure: Broken pipe` and the server logged
+    // `TLS handshake failed: HandshakeFailed`.
+    const tls_probe_exe = b.addExecutable(.{
+        .name = "kabelweb-tls-server-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/examples/tls_server_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "kabelweb", .module = mod },
+            },
+        }),
+    });
+    tls_probe_exe.root_module.link_libc = true;
+    b.installArtifact(tls_probe_exe);
+
     const run_step = b.step("run", "Run the kabelweb server demo");
     const run_cmd = b.addRunArtifact(server_demo_exe);
     run_step.dependOn(&run_cmd.step);
@@ -777,7 +803,7 @@ pub fn build(b: *std.Build) void {
     // the exes need it too.
     // Second iteration skips the Windows stub generation via the
     // fileExists check (first iteration already wrote the archive).
-    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_test_mod, client_test_mod, demo_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, test_mod, fast_test_mod, server_test_mod, client_test_mod, demo_test_mod, server_demo_exe.root_module, client_smoke_exe.root_module, tls_probe_exe.root_module }) |m| {
         if (sys.use_system) {
             // System libs path. `linkSystemLibrary("curl")` does NOT auto-
             // pull libssl/libcrypto (no pkg-config Requires honour), so we
