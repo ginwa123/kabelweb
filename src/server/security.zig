@@ -960,6 +960,24 @@ const security_tests = struct {
     const router = @import("router.zig");
     const linux = std.posix.system;
 
+    /// A loopback port that is free *right now*.
+    ///
+    /// Bind :0, read back the kernel's choice, release it, and hand that
+    /// back. A hardcoded literal is NOT reserved — any process on the box
+    /// can be handed the same number as an ephemeral client port by
+    /// `connect()`, and two shards of the suite binding the same literal
+    /// is a `error.BindFailed` that has nothing to do with the code under
+    /// test. The release→rebind window is microscopic and nothing else in
+    /// this binary asks for that number.
+    fn freePort() !u16 {
+        const probe = try http_server.Address.init("127.0.0.1", 0);
+        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
+        var sa: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+        var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(probe.sock_fd, @ptrCast(&sa), &sa_len) != 0) return error.GetSockNameFailed;
+        return std.mem.bigToNative(u16, sa.port);
+    }
+
     fn noopHandler(_: http_parser.HttpContext, _: http_parser.HttpRequest, res: http_parser.HttpResponse) anyerror!http_parser.HttpResponse {
         return res.withBody("");
     }
@@ -2790,7 +2808,7 @@ const security_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45688);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
 
         var server = try http_server.GinwaServer.init(arena.allocator(), undefined, addr);

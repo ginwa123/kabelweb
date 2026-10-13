@@ -1248,6 +1248,24 @@ const complex_cases_tests = struct {
 
     const http_parser = @import("http_parser.zig");
     const http_server = @import("http_server.zig");
+
+    /// A loopback port that is free *right now*.
+    ///
+    /// Bind :0, read back the kernel's choice, release it, and hand that
+    /// back. A hardcoded literal is NOT reserved — any process on the box
+    /// can be handed the same number as an ephemeral client port by
+    /// `connect()`, and two shards of the suite binding the same literal
+    /// is a `error.BindFailed` that has nothing to do with the code under
+    /// test. The release→rebind window is microscopic and nothing else in
+    /// this binary asks for that number.
+    fn freePort() !u16 {
+        const probe = try http_server.Address.init("127.0.0.1", 0);
+        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
+        var sa: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+        var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(probe.sock_fd, @ptrCast(&sa), &sa_len) != 0) return error.GetSockNameFailed;
+        return std.mem.bigToNative(u16, sa.port);
+    }
     const router = @import("router.zig");
     const sse_manager = @import("sse_manager.zig");
     const builtin = @import("builtin");
@@ -2034,13 +2052,13 @@ const complex_cases_tests = struct {
 
     test "ginwa: destroy then re-init works (no global state leak)" {
         const a = allocator;
-        const addr1 = try http_server.Address.init("127.0.0.1", 45710);
+        const addr1 = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr1.sock_fd)))) else @intCast(addr1.sock_fd));
 
         var server1 = try http_server.GinwaServer.init(a, undefined, addr1);
         defer server1.destroy(a);
 
-        const addr2 = try http_server.Address.init("127.0.0.1", 45711);
+        const addr2 = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr2.sock_fd)))) else @intCast(addr2.sock_fd));
 
         var server2 = try http_server.GinwaServer.init(a, undefined, addr2);
@@ -2055,7 +2073,7 @@ const complex_cases_tests = struct {
         // didn't free the router's ArrayList. Now destroy() calls deinit()
         // first, so a single destroy() should clean up everything.
         const a = allocator;
-        const addr = try http_server.Address.init("127.0.0.1", 45712);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
 
         var server = try http_server.GinwaServer.init(a, undefined, addr);
@@ -2081,7 +2099,7 @@ const complex_cases_tests = struct {
     }
 
     test "address: closeFd on Address fd closes it (kernel returns EBADF on next op)" {
-        const addr = try http_server.Address.init("127.0.0.1", 45713);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         const fd = addr.sock_fd;
         // fd_t form for the read below (SOCKET-as-pointer on Windows).
         const fd_t: std.c.fd_t = if (comptime builtin.os.tag == .windows)
