@@ -586,6 +586,731 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
     };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Sharded test execution
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `zig build test` was 402 s on a 16-core box: ~8 s of compile and ~390 s
+// of ONE test binary running its 791 tests strictly in sequence inside a
+// single process. No amount of `-j` touches that 390 s — the parallelism
+// has to come from SEPARATE test binaries.
+//
+// So the same test set is split at CONFIGURE time into N shards, each its
+// own `b.addTest` compile carrying a `--test-filter` subset, and `zig
+// build`'s own step scheduler compiles and runs them concurrently.
+//
+// ── Why filters and not one module per subtree ─────────────────────────
+// `src/root.zig` is the single root module every test step compiles, and
+// its files self-import by relative path. A second module rooted inside
+// `src/` would make Zig reject the build with "file exists in modules
+// 'root' and '…'" the moment the two modules' file tables overlap.
+// Filters sidestep that entirely: every shard shares ONE root module, so
+// there is nothing to collide.
+//
+// ── The contract that makes this safe ──────────────────────────────────
+//   1. EVERY named `test` under `src/` lands in EXACTLY one shard,
+//      discovered by scanning the sources — never a hand-written list.
+//   2. The one unnamed `test { _ = @import(...) }` discovery block in
+//      `src/root.zig` has an empty name, which no `--test-filter` can
+//      select, so Zig runs it in EVERY shard. Duplicated, never dropped.
+//   3. A shard is a normal build step, so `zig build --summary all` still
+//      prints per-shard pass counts and a failure in one shard does not
+//      mask another shard's results.
+//   4. `-Dtest-shards=1` restores the old single unfiltered binary
+//      verbatim, which is the escape hatch if a machine cannot afford N
+//      concurrent compilers (~500 MB RSS each).
+
+/// A `--test-filter` one shard gets compiled with, plus the cost weight the
+/// balancer assigns to it. Weight is relative, not milliseconds — it only
+/// has to be big enough that a 60-second soak outweighs every fast test put
+/// together, so the balancer gives it a shard of its own.
+const TestShardEntry = struct {
+    filter: []const u8,
+    weight: u64,
+    /// The test's real name, plus the filter shapes `name` can safely be
+    /// reduced to. Both are kept so `pickLeastOverlappingFilter` can compare
+    /// against every other name once the whole set is known.
+    name: []const u8,
+    candidates: TestFilterCandidates,
+};
+
+/// Weight of a test whose runtime is close to the suite median, which is
+/// roughly 10 ms on this box. Every weight below is expressed in THESE
+/// units, so mixing them is meaningful.
+const average_test_weight: u64 = 1;
+
+/// Tests whose runtime is orders of magnitude above that median, so a
+/// name-count-balanced split would still leave one shard holding all the
+/// wall clock. Measured on a 16-core Linux box.
+///
+/// This table is a load-balancing hint, NOT a correctness input: a test
+/// missing from it still runs, it just shares a shard. Re-measure and add an
+/// entry whenever a new test starts dominating `zig build test`.
+const slow_test_weights = [_]struct { name: []const u8, weight: u64 }{
+    // ~60 s each: the two SSE keepalive soaks. They self-skip unless
+    // KABELWEB_SOAK is set, so they only weigh on the full `test` step —
+    // but that is exactly the step being parallelized, and 120 s of the
+    // 402 s baseline is these two tests alone.
+    .{ .name = "sse keepalive: server does NOT mis-remove a healthy client under 60s", .weight = 6_000 },
+    .{ .name = "sse keepalive: server does NOT mis-remove 2 healthy clients under 60s", .weight = 6_000 },
+    // ~10 s: 100 real sequential GETs against example.com over the network.
+    .{ .name = "stress: 100 sequential successful GETs to example.com", .weight = 1_000 },
+    // ~2 s each: real process spawns / real socket traffic.
+    .{ .name = "stress: parse 1000 random-ish requests without crash", .weight = 200 },
+    .{ .name = "stress: 50 sequential server init/destroy cycles", .weight = 200 },
+    .{ .name = "stress: parse 10,000 small requests without leak", .weight = 200 },
+    .{ .name = "stress: parse 100 large requests (1 MB body each) without leak", .weight = 200 },
+    .{ .name = "stress: register and remove 1000 clients in mixed order", .weight = 200 },
+    .{ .name = "stress: hash map with 1000 query params parses correctly", .weight = 200 },
+    .{ .name = "stress: 500 sequential Address.init/destroy cycles", .weight = 200 },
+    .{ .name = "sse: 1000 concurrent client registrations produce 1000 unique IDs", .weight = 200 },
+    .{ .name = "integration: parse 100 sequential requests from socket pair", .weight = 200 },
+};
+
+fn testWeight(name: []const u8) u64 {
+    for (slow_test_weights) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry.weight;
+    }
+    return average_test_weight;
+}
+
+/// `haystack.contains(needle)`, but anchored on a SIMD `memchr` for the
+/// needle's first byte.
+///
+/// `std.mem.indexOf` on two ~60-byte slices is a naive O(n·m) scan and costs
+/// about a microsecond per call. The sharding passes below run millions of
+/// them (one per candidate filter per test name), which put seconds into
+/// every single `zig build` — including builds that never touch the test
+/// suite. Jumping straight to the handful of positions where the first byte
+/// occurs and comparing only those is the same answer for a tenth of the
+/// time.
+fn containsFast(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    // Stop early once too few bytes remain for the needle to fit — without
+    // that, a hit on the needle's first byte near the end of the haystack
+    // slices past it.
+    const last_start = haystack.len - needle.len;
+    var offset: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, haystack[0 .. last_start + 1], offset, needle[0])) |pos| {
+        if (std.mem.eql(u8, haystack[pos..][0..needle.len], needle)) return true;
+        offset = pos + 1;
+    }
+    return false;
+}
+
+/// An inverted index from 2-byte sequence to the test names containing it.
+///
+/// Sharding has to answer "which test names contain this filter?" a few
+/// million times. Doing that by scanning every name for every filter is a
+/// naive O(n·m) substring search, ~1 µs a pop, which put seconds into EVERY
+/// `zig build` — including builds that never touch the test suite.
+///
+/// Inverting it makes the common answer free. A filter is looked up by ONE
+/// of its 2-byte sequences; a specific pair occurs in roughly one name in a
+/// thousand, so the candidate list is a name or two and the exact compare
+/// runs that many times instead of 791.
+///
+/// The index is only ever a CANDIDATE FILTER: `candidates()` may return names
+/// that do not contain the filter, and the caller must confirm with
+/// `std.mem.indexOf`. That direction is safe — it costs a little time and can
+/// never drop a name. The reverse mistake is what silently re-runs tests in
+/// the wrong shard, so the exact compare stays at every call site.
+const PairIndex = struct {
+    const pair_count = 1 << 16;
+    const none = std.math.maxInt(u32);
+
+    /// Counting sort of every (2-byte sequence, name index) occurrence, so a
+    /// sequence's occurrences are the contiguous run `items[starts[p]..starts[p + 1]]`.
+    starts: []u32,
+    items: []u32,
+    allocator: std.mem.Allocator,
+
+    fn init(alloc: std.mem.Allocator, names: []const []const u8) !PairIndex {
+        // One slot per (name, adjacent byte pair).
+        var total: usize = 0;
+        for (names) |name| {
+            if (name.len >= 2) total += name.len - 1;
+        }
+
+        const counts = try alloc.alloc(u32, pair_count);
+        defer alloc.free(counts);
+        @memset(counts, 0);
+
+        const cursor = try alloc.alloc(u32, pair_count);
+        defer alloc.free(cursor);
+
+        for (names) |name| {
+            var i: usize = 0;
+            while (i + 2 <= name.len) : (i += 1) {
+                counts[pairOf(name, i)] += 1;
+            }
+        }
+
+        const starts = try alloc.alloc(u32, pair_count + 1);
+        var running: u32 = 0;
+        for (0..pair_count) |p| {
+            starts[p] = running;
+            running += counts[p];
+            cursor[p] = starts[p];
+        }
+        starts[pair_count] = running;
+
+        const items = try alloc.alloc(u32, total);
+        for (names, 0..) |name, name_index| {
+            var i: usize = 0;
+            while (i + 2 <= name.len) : (i += 1) {
+                const p = pairOf(name, i);
+                items[cursor[p]] = @intCast(name_index);
+                cursor[p] += 1;
+            }
+        }
+
+        return .{ .starts = starts, .items = items, .allocator = alloc };
+    }
+
+    fn deinit(self: *PairIndex) void {
+        self.allocator.free(self.starts);
+        self.allocator.free(self.items);
+    }
+
+    fn pairOf(name: []const u8, i: usize) usize {
+        return (@as(usize, name[i]) << 8) | name[i + 1];
+    }
+
+    /// The needle's 2-byte sequence with the shortest candidate list, i.e.
+    /// the one that will send the fewest names to the exact compare.
+    fn bestPair(self: *const PairIndex, needle: []const u8) u32 {
+        var best: u32 = 0;
+        var best_len: u32 = std.math.maxInt(u32);
+        var i: usize = 0;
+        while (i + 2 <= needle.len) : (i += 1) {
+            const p: u32 = @intCast(pairOf(needle, i));
+            const len = self.starts[p + 1] - self.starts[p];
+            if (len < best_len) {
+                best_len = len;
+                best = p;
+            }
+        }
+        return best;
+    }
+
+    fn candidates(self: *const PairIndex, pair: u32) []const u32 {
+        return self.items[self.starts[pair]..self.starts[pair + 1]];
+    }
+};
+
+/// Exactly how many of `all_names` contain `needle`, found by asking the
+/// index for candidates and confirming each one. Never derived from a
+/// cheaper approximation — this number decides which side of a name survives,
+/// and an undercount silently drags sibling tests into a second shard.
+fn countNamesContaining(all_names: []const []const u8, needle: []const u8, index: *const PairIndex) usize {
+    if (needle.len == 0) return all_names.len;
+    if (needle.len < 2) {
+        // No 2-byte sequence to index on. Rare, and answering 0 here instead
+        // of the truth is exactly how a one-character filter slipped past the
+        // fan-out guard below while re-running the entire suite.
+        var hits: usize = 0;
+        for (all_names) |name| {
+            if (std.mem.indexOf(u8, name, needle) != null) hits += 1;
+        }
+        return hits;
+    }
+    var hits: usize = 0;
+    for (index.candidates(index.bestPair(needle))) |name_index| {
+        if (std.mem.indexOf(u8, all_names[name_index], needle) != null) hits += 1;
+    }
+    return hits;
+}
+
+/// Report an unrecoverable build-configuration problem and stop.
+///
+/// Zig 0.16's `std.Build` has no `b.fatal`, and the rest of this file
+/// signals unrecoverable build problems with `@panic` — match that, but
+/// print the reason first, because a bare panic buries it in a stack trace.
+fn fatalConfig(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("error: " ++ fmt ++ "\n", args);
+    @panic("build configuration error");
+}
+
+/// Characters that cannot survive Zig's `@args-file` round trip.
+///
+/// Zig writes each `zig test` argument into a generated args file and quotes
+/// it. It escapes a double quote but writes `'` as `\'` and leaves a bare
+/// backslash alone — and the reader on the other side does not understand
+/// `\'`, so the quoted token ends early and the parser then tries to read the
+/// remainder as a filename ("unrecognized file extension of parameter ...").
+/// A control character breaks the file the same way. 16 of this repo's 791
+/// test names contain at least one of them, so every name goes through here
+/// before it can become a filter.
+fn isUnsafeFilterByte(c: u8) bool {
+    return c == '\"' or c == '\'' or c == '\\' or c < 0x20;
+}
+
+/// The `--test-filter` shapes a test name can safely be reduced to.
+///
+/// `whole` is non-null when the name has no byte the args file cannot
+/// carry, and is then always the right answer. Otherwise the name had to be
+/// cut, and `head`/`tail` are the two maximal safe pieces of it — a
+/// `--test-filter` is a SUBSTRING match, so either one still matches its own
+/// test. Which one is chosen is settled later by `pickLeastOverlappingFilter`,
+/// because the shorter we cut a name the more siblings it drags along.
+const TestFilterCandidates = struct {
+    whole: ?[]const u8,
+    head: []const u8,
+    tail: []const u8,
+};
+
+/// Reduce a test name to the `--test-filter` shapes that survive the args
+/// file. See `TestFilterCandidates`.
+fn safeTestFilter(name: []const u8) TestFilterCandidates {
+    for (name) |c| {
+        if (isUnsafeFilterByte(c)) break;
+    } else return .{ .whole = name, .head = name, .tail = name };
+
+    const first = blk: {
+        for (name, 0..) |c, i| {
+            if (isUnsafeFilterByte(c)) break :blk i;
+        }
+        break :blk name.len;
+    };
+    const last = blk: {
+        var i = name.len;
+        while (i > 0) {
+            i -= 1;
+            if (isUnsafeFilterByte(name[i])) break :blk i;
+        }
+        break :blk 0;
+    };
+    const head = std.mem.trim(u8, name[0..first], " \t");
+    const tail = std.mem.trim(u8, name[last + 1 ..], " \t");
+
+    // Both sides empty means the whole name is unsafe bytes — almost
+    // certainly a machine-generated name. Fail loudly: silently dropping it
+    // would leave a test that never runs, which is the exact failure this
+    // whole sharding scheme has to rule out.
+    if (head.len == 0 and tail.len == 0) {
+        fatalConfig(
+            "test name has no substring free of \" ' \\ or control bytes, so it " ++
+                "cannot be turned into a --test-filter and would silently stop " ++
+                "running under the sharded `test` step. Rename the test.\n" ++
+                "  offending name: {s}",
+            .{name},
+        );
+    }
+    return .{ .whole = null, .head = head, .tail = tail };
+}
+
+/// Choose between a test's candidate filters by picking the one that is a
+/// substring of the FEWEST other test names.
+///
+/// This is not cosmetic. A `--test-filter` is a substring match, so an
+/// over-broad filter does not merely waste time — it makes a sibling test
+/// match a shard it was not assigned to, and that test then runs in two
+/// shards AT THE SAME TIME. The suite used to be one sequential process, so
+/// tests sharing a fixture path were safe; running two copies concurrently
+/// is not. Every name is known at configure time, so measure the overlap
+/// instead of guessing.
+fn pickLeastOverlappingFilter(
+    candidates: TestFilterCandidates,
+    all_names: []const []const u8,
+    index: *const PairIndex,
+) []const u8 {
+    if (candidates.whole) |whole| return whole;
+
+    const head_hits = countNamesContaining(all_names, candidates.head, index);
+    const tail_hits = countNamesContaining(all_names, candidates.tail, index);
+    // Ties go to the longer filter: a longer substring matches fewer names in
+    // practice, and if it does not help it cannot hurt either.
+    if (head_hits < tail_hits) return candidates.head;
+    if (tail_hits < head_hits) return candidates.tail;
+    return if (candidates.head.len >= candidates.tail.len) candidates.head else candidates.tail;
+}
+
+/// Decode the body of a Zig string literal (without the quotes) into `out`.
+fn decodeZigStringBody(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < body.len) {
+        const c = body[i];
+        if (c != '\\' or i + 1 >= body.len) {
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        const esc = body[i];
+        i += 1;
+        switch (esc) {
+            'n' => try out.append(alloc, '\n'),
+            'r' => try out.append(alloc, '\r'),
+            't' => try out.append(alloc, '\t'),
+            '\\' => try out.append(alloc, '\\'),
+            '\"' => try out.append(alloc, '\"'),
+            '\'' => try out.append(alloc, '\''),
+            'x' => {
+                const n = std.fmt.parseUnsigned(u16, body[i..][0..2], 16) catch {
+                    try out.append(alloc, esc);
+                    continue;
+                };
+                try out.append(alloc, @intCast(n & 0x7f));
+                i += 2;
+            },
+            'u' => {
+                const close = std.mem.indexOfScalar(u8, body[i..], '}') orelse {
+                    try out.append(alloc, esc);
+                    continue;
+                };
+                const cp = std.fmt.parseUnsigned(u21, body[i..][0..close], 16) catch {
+                    try out.append(alloc, esc);
+                    continue;
+                };
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(cp & 0x10ffff), &buf) catch {
+                    try out.append(alloc, esc);
+                    continue;
+                };
+                try out.appendSlice(alloc, buf[0..n]);
+                i += close + 1;
+            },
+            else => try out.append(alloc, esc),
+        }
+    }
+}
+
+/// Collect one test name from the text starting at the `test` keyword's
+/// argument. Handles both `test "name" {` and `test ident {`. Returns null
+/// for `test {` (an unnamed discovery block) and `test(...)` (fuzz targets),
+/// which no filter can select and which Zig therefore runs unfiltered.
+fn parseTestName(
+    alloc: std.mem.Allocator,
+    arg: []const u8,
+) !?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, arg, " \t");
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == '{') return null;
+    if (trimmed[0] == '(') return null;
+    if (trimmed[0] == '\"') {
+        // Scan to the closing quote, honouring `\` escapes.
+        var i: usize = 1;
+        while (i < trimmed.len) : (i += 1) {
+            if (trimmed[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (trimmed[i] == '\"') break;
+        }
+        if (i >= trimmed.len) return null; // unterminated — not a test name
+        var name: std.ArrayList(u8) = .empty;
+        defer name.deinit(alloc);
+        try decodeZigStringBody(alloc, &name, trimmed[1..i]);
+        return try alloc.dupe(u8, name.items);
+    }
+    if (std.ascii.isAlphabetic(trimmed[0]) or trimmed[0] == '_') {
+        var i: usize = 0;
+        while (i < trimmed.len and (std.ascii.isAlphanumeric(trimmed[i]) or trimmed[i] == '_')) i += 1;
+        if (i == 0) return null;
+        return try alloc.dupe(u8, trimmed[0..i]);
+    }
+    return null;
+}
+
+/// Walk `src/`, collect every named `test` decl, and return the de-duplicated
+/// set of filters to shard across.
+///
+/// Scanning is deliberately permissive — a `test "..."` inside a comment or a
+/// multi-line string becomes a filter that matches nothing, which is inert.
+/// It is the misses that matter, and a `test` decl always starts its own line
+/// in this codebase (enforced by `zig fmt`), so line-initial matching cannot
+/// miss one.
+fn collectTestShardEntries(b: *std.Build) []const TestShardEntry {
+    const alloc = b.allocator;
+    var seen: std.StringHashMap(void) = .init(alloc);
+    defer seen.deinit();
+    var entries: std.ArrayList(TestShardEntry) = .empty;
+    errdefer entries.deinit(alloc);
+
+    var src_dir = std.Io.Dir.cwd().openDir(
+        b.graph.io,
+        "src",
+        .{ .iterate = true },
+    ) catch |err| {
+        fatalConfig("cannot open src/ to shard the test suite: {s}", .{@errorName(err)});
+    };
+    defer src_dir.close(b.graph.io);
+
+    var walker = src_dir.walk(alloc) catch |err| {
+        fatalConfig("cannot walk src/ to shard the test suite: {s}", .{@errorName(err)});
+    };
+    defer walker.deinit();
+
+    while (walker.next(b.graph.io) catch |err| {
+        fatalConfig("cannot walk src/ to shard the test suite: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+
+        // `entry.dir` + `entry.basename`, not cwd + `entry.path`: the
+        // walker's paths are relative to the directory it was opened on
+        // (`src`), so `entry.path` alone does not resolve from cwd.
+        const bytes = entry.dir.readFileAlloc(
+            b.graph.io,
+            entry.basename,
+            alloc,
+            .unlimited,
+        ) catch continue; // generated / unreadable: nothing to shard from
+
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimStart(u8, raw_line, " \t\r");
+            if (!std.mem.startsWith(u8, line, "test")) continue;
+            if (line.len == 4) continue; // bare `test`
+            if (!std.ascii.isWhitespace(line[4])) continue; // `testing.foo` etc.
+            const name = parseTestName(alloc, line[4..]) catch continue orelse continue;
+            if (name.len == 0) {
+                alloc.free(name);
+                continue;
+            }
+            if (seen.contains(name)) {
+                alloc.free(name);
+                continue;
+            }
+            // On success the hash map OWNS `name`, so it must not be freed
+            // here — freeing it left a dangling key and the next `put`
+            // aborted inside the map.
+            seen.put(name, {}) catch {
+                alloc.free(name);
+                continue;
+            };
+            const candidates = safeTestFilter(name);
+            entries.append(alloc, .{
+                // Refined below, once every name is known.
+                .filter = candidates.whole orelse candidates.head,
+                .weight = testWeight(name),
+                .name = name,
+                .candidates = candidates,
+            }) catch continue;
+        }
+    }
+
+    const collected = entries.toOwnedSlice(alloc) catch return &.{};
+
+    // Second pass: now that every test name is known, narrow each truncated
+    // filter to the side that overlaps the fewest siblings. See
+    // `pickLeastOverlappingFilter` for why an over-broad filter is a
+    // correctness problem and not just a slow one.
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(alloc);
+    for (collected) |entry| names.append(alloc, entry.name) catch return &.{};
+
+    var index = PairIndex.init(alloc, names.items) catch return &.{};
+    defer index.deinit();
+
+    for (collected) |*entry| {
+        entry.filter = pickLeastOverlappingFilter(entry.candidates, names.items, &index);
+    }
+
+    // Guard the thing that actually goes wrong: a filter SO broad that its
+    // shard runs a slice of the whole suite.
+    //
+    // The filter for a name is normally the name. It is shortened only when
+    // the name carries a byte the args file cannot carry, and then only to the
+    // safe piece before or after it — which can be one character long. A
+    // one-character filter is a substring of essentially every test name, so
+    // its shard silently re-runs the ENTIRE suite: this exact failure turned
+    // a 26 s build into 74 s while staying green, and nothing in the summary
+    // said which shard had gone wrong.
+    //
+    // `head` vs `tail` is chosen by fan-out, but when BOTH sides are that
+    // vague there is no better answer to pick, so the only honest response is
+    // to stop and name the test. Renaming it to something unique fixes it.
+    const max_filter_fanout = 64;
+    for (collected) |entry| {
+        const fanout = countNamesContaining(names.items, entry.filter, &index);
+        if (fanout <= max_filter_fanout) continue;
+        fatalConfig(
+            "test name {s} reduces to the --test-filter {s}, which is a substring of " ++
+                "{d} other test names. That shard would re-run {d} tests it does not " ++
+                "own, roughly doubling the suite. Rename the test so that no quoted " ++
+                "piece of its name is this short.\n" ++
+                "  (guard: max_filter_fanout = {d})",
+            .{ entry.name, entry.filter, fanout - 1, fanout - 1, max_filter_fanout },
+        );
+    }
+
+    // Invariant, checked before anything is scheduled: a test's filter must
+    // BE a substring of its own name. `--test-filter` is a substring match,
+    // so this single property is what guarantees the test still runs once
+    // the suite is split. Asserting it here turns the one failure mode that
+    // matters — a test that quietly stops running because someone narrowed
+    // the wrong side of a name — into a loud configure-time error naming the
+    // test, instead of a green CI run with a hole in it.
+    for (collected) |entry| {
+        if (std.mem.indexOf(u8, entry.name, entry.filter) != null) continue;
+        fatalConfig(
+            "internal error: --test-filter {s} is not a substring of test name {s}, " ++
+                "so that test would never run under the sharded `test` step.",
+            .{ entry.filter, entry.name },
+        );
+    }
+
+    return collected;
+}
+
+/// Group tests whose `--test-filter` would otherwise drag each other into
+/// two shards, then longest-processing-time-first across the groups.
+///
+/// The grouping is what keeps the split safe. A filter is a substring match,
+/// so if name A is a substring of name B, then whichever shard holds A's
+/// filter also runs B. Assign A and B to different shards and B executes
+/// TWICE, CONCURRENTLY — and this suite used to be one sequential process,
+/// where two tests sharing a fixture path were safe. Union-find over those
+/// containment edges puts both names in the same shard, where the duplicate
+/// collapses back into a single run.
+fn balanceTestShards(
+    b: *std.Build,
+    entries: []const TestShardEntry,
+    shard_count: usize,
+) [][]const []const u8 {
+    const alloc = b.allocator;
+
+    const parent: []usize = alloc.alloc(usize, entries.len) catch @panic("OOM");
+    defer alloc.free(parent);
+    for (parent, 0..) |*slot, i| slot.* = i;
+
+    const find = struct {
+        fn f(p: []usize, start: usize) usize {
+            var root = start;
+            while (p[root] != root) root = p[root];
+            // Path compression, so repeated finds stay near-flat.
+            var walk = start;
+            while (p[walk] != root) {
+                const next = p[walk];
+                p[walk] = root;
+                walk = next;
+            }
+            return root;
+        }
+    };
+    const merge = struct {
+        fn f(p: []usize, a: usize, b_: usize) void {
+            const ra = find.f(p, a);
+            const rb = find.f(p, b_);
+            if (ra == rb) return;
+            // Deterministic: the lower index always wins, so two checkouts
+            // produce the same grouping.
+            if (ra < rb) p[rb] = ra else p[ra] = rb;
+        }
+    };
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(alloc);
+    for (entries) |entry| names.append(alloc, entry.name) catch @panic("OOM");
+    var index = PairIndex.init(alloc, names.items) catch @panic("OOM");
+    defer index.deinit();
+
+    // No length cap and no O(filters x names) loop: the inverted index
+    // answers "which names could contain this filter" directly, and the exact
+    // compare confirms.
+    for (entries, 0..) |entry, i| {
+        if (entry.filter.len < 2) continue;
+        for (index.candidates(index.bestPair(entry.filter))) |name_index| {
+            if (name_index == i) continue;
+            if (entries[name_index].name.len <= entry.filter.len) continue;
+            if (std.mem.indexOf(u8, entries[name_index].name, entry.filter) == null) continue;
+            merge.f(parent, i, name_index);
+        }
+    }
+
+    // Collapse each group into one scheduling unit carrying the sum of its
+    // members' weights and all of their filters.
+    var group_weight = alloc.alloc(u64, entries.len) catch @panic("OOM");
+    defer alloc.free(group_weight);
+    @memset(group_weight, 0);
+    var group_seen = alloc.alloc(bool, entries.len) catch @panic("OOM");
+    defer alloc.free(group_seen);
+    @memset(group_seen, false);
+
+    var shards: std.ArrayList(std.ArrayList([]const u8)) = .empty;
+    var loads = alloc.alloc(u64, shard_count) catch @panic("OOM");
+    defer alloc.free(loads);
+    @memset(loads, 0);
+    var shard_sizes = alloc.alloc(usize, shard_count) catch @panic("OOM");
+    defer alloc.free(shard_sizes);
+    @memset(shard_sizes, 0);
+    for (0..shard_count) |_| shards.append(alloc, .empty) catch @panic("OOM");
+
+    var roots: std.ArrayList(usize) = .empty;
+    defer roots.deinit(alloc);
+    for (entries, 0..) |entry, i| {
+        group_weight[find.f(parent, i)] += entry.weight;
+    }
+    for (entries, 0..) |_, i| {
+        const root = find.f(parent, i);
+        if (group_seen[root]) continue;
+        group_seen[root] = true;
+        roots.append(alloc, root) catch @panic("OOM");
+    }
+
+    // Heaviest group first; the group's first filter name breaks ties so the
+    // result is stable even when every weight is the default 1.
+    const Ctx = struct {
+        entries: []const TestShardEntry,
+        group_weight: []const u64,
+        fn lessThan(ctx: @This(), a: usize, b_: usize) bool {
+            if (ctx.group_weight[a] != ctx.group_weight[b_]) {
+                return ctx.group_weight[a] > ctx.group_weight[b_];
+            }
+            return std.mem.lessThan(u8, ctx.entries[a].filter, ctx.entries[b_].filter);
+        }
+    };
+    std.mem.sort(
+        usize,
+        roots.items,
+        Ctx{ .entries = entries, .group_weight = group_weight },
+        Ctx.lessThan,
+    );
+
+    for (roots.items) |root| {
+        // Lightest by predicted time; ties broken by FEWEST FILTERS so equal
+        // -load shards still spread evenly. Picking the first minimum on a
+        // tie hands every tie to the lowest index and skews the split.
+        var lightest: usize = 0;
+        for (loads, shard_sizes, 0..) |load, size, i| {
+            if (load > loads[lightest]) continue;
+            if (load < loads[lightest]) {
+                lightest = i;
+                continue;
+            }
+            if (size < shard_sizes[lightest]) lightest = i;
+        }
+        loads[lightest] += group_weight[root];
+        // `&shards.items[...]`, NOT `shards.items[...]`: std.ArrayList is
+        // unmanaged in Zig 0.16, so indexing yields a COPY of the struct and
+        // an append through it grows a buffer nobody ever reads back. That
+        // silently produced shards of 1, 459 and 1457 filters instead of 8
+        // equal ones, while still "working" (green) because the union of the
+        // filters never changed.
+        const shard = &shards.items[lightest];
+        // Every member's filter goes into the group's shard. The group's
+        // tests all match at least the filter that created the edge, but
+        // keeping each member's own filter means a group can never lose a
+        // test if the containment relationship is ever refined away.
+        for (entries, 0..) |entry, i| {
+            if (find.f(parent, i) != root) continue;
+            shard.append(alloc, entry.filter) catch @panic("OOM");
+            shard_sizes[lightest] += 1;
+        }
+    }
+
+    const out: [][]const []const u8 = alloc.alloc([]const []const u8, shard_count) catch @panic("OOM");
+    for (shards.items, out) |shard, *slot| slot.* = shard.items;
+    return out;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -961,7 +1686,7 @@ pub fn build(b: *std.Build) void {
 
     // === Tests for the package itself ===
     // `b.addTest({ .root_module = test_mod })` runs the full entry
-    // (src/full_test.zig): fast suites + the 60 s SSE soaks. Both test
+    // (src/root.zig): fast suites + the 60 s SSE soaks. Both test
     // modules carry link_libc + (system or vendored) curl/ssl/crypto
     // (wired above), so the TLS + in-process-server suites link and
     // resolve cleanly. On
@@ -978,24 +1703,121 @@ pub fn build(b: *std.Build) void {
             }
         }
     }
-    const mod_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-    // The 2×60 s SSE soaks live in `server/sse_manager.zig` and self-skip
-    // (`error.SkipZigTest`) unless KABELWEB_SOAK is set — this is what makes
-    // `test` the slow, complete step and `test-fast`/`test-server`/
-    // `test-client` the fast ones.
-    run_mod_tests.setEnvironmentVariable("KABELWEB_SOAK", "1");
+
+    // ── Sharded `test` step ────────────────────────────────────────────
+    //
+    // The full `test` step was 402 s on a 16-core box: ~8 s of compile and
+    // ~390 s of ONE test binary running its 791 tests strictly in sequence
+    // inside a single process. No amount of `-j` touches that 390 s — the
+    // parallelism has to come from SEPARATE test binaries.
+    //
+    // So the same test set is split at CONFIGURE time into N shards, each
+    // its own `b.addTest` compile carrying a `--test-filter` subset, and
+    // `zig build`'s own step scheduler compiles and runs them concurrently.
+    // See the "Sharded test execution" block above for why filters (not
+    // separate modules) and why the shard membership is scanned from the
+    // sources rather than hand-listed.
+    //
+    // Default is half the core count, capped at 8: each shard is its own
+    // `zig test` compile peaking around 500 MB RSS, so an unconstrained
+    // `-j` on a big workstation would OOM rather than get faster. Pass
+    // `-Dtest-shards=1` for the old single-binary behaviour.
+    //
+    // An explicit `-Dtest-filter=…` disables sharding entirely: the user
+    // asked for one specific subset, so it goes through one unfiltered
+    // compile exactly as before.
+    const host_cpus = std.Thread.getCpuCount() catch 4;
+    const default_shards: usize = @max(1, @min(8, host_cpus / 2));
+    const shard_count = b.option(
+        usize,
+        "test-shards",
+        "Number of parallel shards for `zig build test` (default: min(8, cpus/2); 1 = single binary, legacy behaviour)",
+    ) orelse default_shards;
+
+    const shard_entries = if (test_filter.len > 0)
+        &[_]TestShardEntry{}
+    else
+        collectTestShardEntries(b);
+    // One shard means "no filters at all": pass the whole suite through a
+    // single unfiltered compile, which is both faster (one compile) and the
+    // exact legacy behaviour. Filtering by name would only slow it down.
+    const use_filters = shard_count > 1 and shard_entries.len > 0;
+    const shards = if (use_filters)
+        balanceTestShards(b, shard_entries, shard_count)
+    else
+        &[_][]const []const u8{};
+
+    if (shard_entries.len > 0) {
+        std.debug.print(
+            "[test] mod_tests split into {d} shard(s) from {d} scanned test names " ++
+                "(`zig build test:shard:<i>` runs one)\n",
+            .{ if (use_filters) shard_count else @as(usize, 1), shard_entries.len },
+        );
+    }
+
     const test_step = b.step("test", "Run kabelweb package tests (fast suites + 60s SSE soaks)");
-    test_step.dependOn(&run_mod_tests.step);
+
+    for (shards, 0..) |filters, i| {
+        const shard_tests = b.addTest(.{
+            .root_module = test_mod,
+            .filters = filters,
+        });
+        const run_shard = b.addRunArtifact(shard_tests);
+        // The 2×60 s SSE soaks live in `server/sse_manager.zig` and self-skip
+        // (`error.SkipZigTest`) unless KABELWEB_SOAK is set — every shard of
+        // the full `test` step gets it, so the soaks still run exactly once
+        // (they are in the weight table, so the balancer gives them their own
+        // shard rather than piling them onto one).
+        run_shard.setEnvironmentVariable("KABELWEB_SOAK", "1");
+        test_step.dependOn(&run_shard.step);
+        // Per-shard step so a failure — or a re-measure for
+        // `slow_test_weights` above — can be reproduced in isolation.
+        const shard_label = b.fmt("test:shard:{d}", .{i});
+        b.step(
+            shard_label,
+            b.fmt("Run shard {d}/{d} of the kabelweb test suite ({d} tests)", .{ i + 1, shards.len, filters.len }),
+        ).dependOn(&run_shard.step);
+    }
+
+    if (!use_filters) {
+        const mod_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
+        const run_mod_tests = b.addRunArtifact(mod_tests);
+        run_mod_tests.setEnvironmentVariable("KABELWEB_SOAK", "1");
+        test_step.dependOn(&run_mod_tests.step);
+    }
     test_step.dependOn(b.getInstallStep());
 
     // Fast suites only (no 60 s soaks) — what CI runs on every
     // platform. The soaks are timing-sensitive; they run in the
     // full `test` step (ubuntu job) instead of blocking mac/Windows.
-    const fast_tests = b.addTest(.{ .root_module = fast_test_mod, .filters = test_filters });
-    const run_fast_tests = b.addRunArtifact(fast_tests);
+    //
+    // Sharded the same way as `test` above: the fast set was 174 s of one
+    // sequential binary, and it is the step CI runs on every push.
+    const fast_shards = if (test_filter.len > 0 or shard_count <= 1)
+        &[_][]const []const u8{}
+    else
+        balanceTestShards(b, shard_entries, shard_count);
+    const fast_use_filters = fast_shards.len > 1;
+
     const test_fast_step = b.step("test-fast", "Run kabelweb fast suites (no 60s SSE soaks)");
-    test_fast_step.dependOn(&run_fast_tests.step);
+    for (fast_shards, 0..) |filters, i| {
+        const shard_tests = b.addTest(.{
+            .root_module = fast_test_mod,
+            .filters = filters,
+        });
+        const run_shard = b.addRunArtifact(shard_tests);
+        test_fast_step.dependOn(&run_shard.step);
+        const shard_label = b.fmt("test-fast:shard:{d}", .{i});
+        b.step(
+            shard_label,
+            b.fmt("Run shard {d}/{d} of the kabelweb fast suite ({d} tests)", .{ i + 1, fast_shards.len, filters.len }),
+        ).dependOn(&run_shard.step);
+    }
+    if (!fast_use_filters) {
+        const fast_tests = b.addTest(.{ .root_module = fast_test_mod, .filters = test_filters });
+        const run_fast_tests = b.addRunArtifact(fast_tests);
+        test_fast_step.dependOn(&run_fast_tests.step);
+    }
     test_fast_step.dependOn(b.getInstallStep());
 
     // Split halves of the fast set (server-only / client-only) — CI runs

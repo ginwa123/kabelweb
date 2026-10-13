@@ -2309,31 +2309,38 @@ const http_server_tests = struct {
     // ============================================================================
 
     test "Address.init creates socket and binds" {
-        // Use a high port number to avoid permission issues
-        const addr = try http_server.Address.init("127.0.0.1", 45678);
+        // Ephemeral port, not a literal: a hardcoded number is not reserved,
+        // and two shards of the suite binding the same literal is a
+        // `error.BindFailed` that has nothing to do with the code under test.
+        const port = try freePort();
+        const addr = try http_server.Address.init("127.0.0.1", port);
         defer _ = closeI32Fd(addr.sock_fd);
 
         try std.testing.expect(addr.sock_fd >= 0);
-        try std.testing.expectEqual(@as(u16, 45678), addr.port);
+        try std.testing.expectEqual(port, addr.port);
     }
 
     test "Address.init with different port" {
-        const addr = try http_server.Address.init("127.0.0.1", 45679);
+        const port = try freePort();
+        const addr = try http_server.Address.init("127.0.0.1", port);
         defer _ = closeI32Fd(addr.sock_fd);
 
-        try std.testing.expectEqual(@as(u16, 45679), addr.port);
+        try std.testing.expectEqual(port, addr.port);
     }
 
     test "Address.init multiple instances on different ports" {
-        const addr1 = try http_server.Address.init("127.0.0.1", 45680);
+        const port1 = try freePort();
+        const addr1 = try http_server.Address.init("127.0.0.1", port1);
         defer _ = closeI32Fd(addr1.sock_fd);
 
-        const addr2 = try http_server.Address.init("127.0.0.1", 45681);
+        const port2 = try freePort();
+        const addr2 = try http_server.Address.init("127.0.0.1", port2);
         defer _ = closeI32Fd(addr2.sock_fd);
 
         try std.testing.expect(addr1.sock_fd >= 0);
         try std.testing.expect(addr2.sock_fd >= 0);
         try std.testing.expect(addr1.sock_fd != addr2.sock_fd);
+        try std.testing.expect(addr1.port != addr2.port);
     }
 
     // ============================================================================
@@ -2345,14 +2352,15 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45682);
+        const port = try freePort();
+        const addr = try http_server.Address.init("127.0.0.1", port);
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
         defer server.destroy(allocator);
 
         try std.testing.expect(server.address.sock_fd == addr.sock_fd);
-        try std.testing.expectEqual(@as(u16, 45682), server.address.port);
+        try std.testing.expectEqual(port, server.address.port);
     }
 
     test "GinwaServer.init router is initialized" {
@@ -2360,7 +2368,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45683);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2380,7 +2388,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45684);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2422,7 +2430,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45687);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2501,7 +2509,7 @@ const http_server_tests = struct {
         // Test that we can detect port already in use by creating two addresses
         // on the same port (note: SO_REUSEADDR may allow this on some systems,
         // so this test may need adjustment based on platform behavior)
-        const addr1 = try http_server.Address.init("127.0.0.1", 45685);
+        const addr1 = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr1.sock_fd);
 
         // On Linux with SO_REUSEADDR, this should succeed. On other platforms
@@ -2528,7 +2536,7 @@ const http_server_tests = struct {
     }
 
     test "Address sock_fd is valid file descriptor" {
-        const addr = try http_server.Address.init("127.0.0.1", 45687);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         // On Linux, valid file descriptors are non-negative
@@ -2544,7 +2552,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45688);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2564,7 +2572,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45689);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2580,7 +2588,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45690);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2599,7 +2607,7 @@ const http_server_tests = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const addr = try http_server.Address.init("127.0.0.1", 45691);
+        const addr = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(allocator, undefined, addr);
@@ -2611,7 +2619,7 @@ const http_server_tests = struct {
         defer _ = closeI32Fd(client_fd);
 
         // Connect to server
-        const addr2 = try http_server.Address.init("127.0.0.1", 45692);
+        const addr2 = try http_server.Address.init("127.0.0.1", try freePort());
         defer _ = closeI32Fd(addr2.sock_fd);
 
         // Socket creation verified - full integration test would require actual server listening
