@@ -56,6 +56,7 @@ pub const OPT = struct {
     pub const USERAGENT: c_int = @intCast(C.CURLOPT_USERAGENT);
     pub const SSL_VERIFYPEER: c_int = @intCast(C.CURLOPT_SSL_VERIFYPEER);
     pub const SSL_VERIFYHOST: c_int = @intCast(C.CURLOPT_SSL_VERIFYHOST);
+    pub const SSL_OPTIONS: c_int = @intCast(C.CURLOPT_SSL_OPTIONS);
     pub const NOSIGNAL: c_int = @intCast(C.CURLOPT_NOSIGNAL);
     pub const NOPROGRESS: c_int = @intCast(C.CURLOPT_NOPROGRESS);
     pub const XFERINFOFUNCTION: c_int = @intCast(C.CURLOPT_XFERINFOFUNCTION);
@@ -65,6 +66,40 @@ pub const OPT = struct {
     pub const EFFECTIVE_URL: c_int = @intCast(C.CURLINFO_EFFECTIVE_URL);
     pub const TOTAL_TIME: c_int = @intCast(C.CURLINFO_TOTAL_TIME);
     pub const PRIMARY_IP: c_int = @intCast(C.CURLINFO_PRIMARY_IP);
+};
+
+/// Bits for `CURLOPT_SSL_OPTIONS` (libcurl's `CURLSSLOPT_*`).
+///
+/// `REVOKE_BEST_EFFORT` exists for exactly one failure mode, and it is a
+/// Windows one. libcurl's schannel backend (what a Windows build links —
+/// vcpkg's `curl` port forces `-DCURL_USE_SCHANNEL=ON` on Windows) sets
+/// `SCH_CRED_REVOCATION_CHECK_CHAIN` whenever `verifypeer` is on and
+/// neither `no_revoke` nor `revoke_best_effort` is set. schannel then
+/// asks the chain engine for the CRL/OCSP of every cert in the chain and
+/// **fails the whole handshake** when that endpoint cannot be reached:
+/// `InitializeSecurityContext` returns `CRYPT_E_REVOCATION_OFFLINE`
+/// (0x80092013), which libcurl surfaces as CURLE_SSL_CONNECT_ERROR (35).
+/// A network that allows the API host but not `crl.*` / OCSP — a
+/// corporate network, a machine with no proxy for the chain engine —
+/// therefore cannot make any outbound HTTPS request at all.
+///
+/// With `REVOKE_BEST_EFFORT` set, schannel adds
+/// `SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE`
+/// but KEEPS `SCH_CRED_REVOCATION_CHECK_CHAIN`: "could not check"
+/// continues, "checked, and it is revoked" still fails.
+///
+/// Other TLS backends ignore the bit (libcurl documents the option as
+/// schannel-only), so setting it unconditionally is safe. `NO_REVOKE` is
+/// declared for contrast and is NOT used: it drops the revocation check
+/// entirely, including for certs that are knowingly revoked.
+///
+/// libcurl's own words, `lib/vtls/schannel.c`:
+///   verifypeer && no_revoke        -> IGNORE_NO_REVOCATION_CHECK | IGNORE_REVOCATION_OFFLINE
+///   verifypeer && revoke_best_effort -> the same two, | REVOCATION_CHECK_CHAIN
+///   verifypeer only                -> REVOCATION_CHECK_CHAIN   (hard failure, the bug)
+pub const SSLOPT = struct {
+    pub const REVOKE_BEST_EFFORT: c_long = @intCast(C.CURLSSLOPT_REVOKE_BEST_EFFORT);
+    pub const NO_REVOKE: c_long = @intCast(C.CURLSSLOPT_NO_REVOKE);
 };
 
 /// `extern "c"` callback signatures. We declare them at module scope

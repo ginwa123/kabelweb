@@ -96,6 +96,15 @@ typedef unsigned int CURLoption;
 #define CURLOPT_XFERINFOFUNCTION 10020
 #define CURLOPT_XFERINFODATA 10021
 #define CURLOPT_ERRORBUFFER 10022
+#define CURLOPT_SSL_OPTIONS 10023
+
+// Bit values for CURLOPT_SSL_OPTIONS (real libcurl: ALLOW_BEAST = 1<<0,
+// NO_REVOKE = 1<<1, NO_PARTIALCHAIN = 1<<2, REVOKE_BEST_EFFORT = 1<<3,
+// ...). Only the two the client module can name are declared; the
+// schannel-only one carries the interesting semantics, see
+// `curl.zig`'s `SSLOPT`.
+#define CURLSSLOPT_NO_REVOKE (1<<1)
+#define CURLSSLOPT_REVOKE_BEST_EFFORT (1<<3)
 
 #define CURLINFO_RESPONSE_CODE 20000
 #define CURLINFO_EFFECTIVE_URL 20001
@@ -172,6 +181,7 @@ const char* curl_version(void);
 #define CURLE_READ_ERROR 26
 #define CURLE_HTTP_RANGE_ERROR 33
 #define CURLE_HTTP_POST_ERROR 34
+#define CURLE_UNKNOWN_OPTION 48
 #define CURLE_GOT_NOTHING 52
 #define CURLE_SSL_ENGINE_NOTFOUND 53
 #define CURLE_SSL_ENGINE_SETFAILED 54

@@ -217,6 +217,11 @@ pub const Client = struct {
         _ = setoptLong(handle, curl.OPT.NOSIGNAL, @as(c_long, 1)); // multi-thread safety
         _ = setoptLong(handle, curl.OPT.SSL_VERIFYPEER, if (options.verify_ssl) @as(c_long, 1) else @as(c_long, 0));
         _ = setoptLong(handle, curl.OPT.SSL_VERIFYHOST, if (options.verify_ssl) @as(c_long, 2) else @as(c_long, 0));
+        // Revocation — see `Options.revoke_best_effort` and `curl.SSLOPT`.
+        // Without this, a schannel (Windows) build aborts the handshake
+        // with CRYPT_E_REVOCATION_OFFLINE whenever the CRL/OCSP endpoint
+        // is unreachable. Non-schannel backends ignore the bits.
+        _ = setoptLong(handle, curl.OPT.SSL_OPTIONS, options.sslOptions());
 
         // ----- Write callback: buffers response body into an ArrayList.
         // Bounded by Options.max_body_bytes (default 10 MiB) so a
@@ -490,6 +495,34 @@ const client_tests = struct {
         try testing.expectEqualStrings("https://example.com", r.url);
         try testing.expectEqual(@as(?[]const u8, null), r.body);
         try testing.expectEqual(@as(usize, 0), r.headers.len);
+    }
+
+    test "CURLOPT_SSL_OPTIONS accepts the best-effort value on a live handle" {
+        // Asserts the constant and the value REACH libcurl: a wrong
+        // CURLOPT number is rejected with CURLE_UNKNOWN_OPTION, so this
+        // is the one check that would catch a bad `curl.zig` edit. The
+        // negative control below proves the assertion can fail.
+        //
+        // Runs wherever a real libcurl is linked — including the Windows
+        // CI runner, whose schannel backend is the one that reads the
+        // bit. A Windows dev box using the stub libcurl skips here.
+        //
+        // `Client.init` runs libcurl's process-global init, which
+        // `curl_easy_init` needs — so take the handle the way the
+        // production call paths do.
+        var client = custom_http_client.Client.init(testing.allocator);
+        defer client.deinit();
+        const handle = curl.easy_init() orelse return error.SkipZigTest;
+        defer curl.easy_cleanup(handle);
+
+        // `CURLcode` is `c_uint` on the wire, while the `CURLE_*`
+        // constants come out of @cImport as `c_int` (or a bare comptime
+        // int, depending on the curl.h revision), so name the type here.
+        const accepted: c_uint = setoptLong(handle, curl.OPT.SSL_OPTIONS, curl.SSLOPT.REVOKE_BEST_EFFORT);
+        try testing.expectEqual(@as(c_uint, curl.C.CURLE_OK), accepted);
+        // Negative control: not every option number is accepted.
+        const rejected: c_uint = setoptLong(handle, 0x7fff, 0);
+        try testing.expectEqual(@as(c_uint, curl.C.CURLE_UNKNOWN_OPTION), rejected);
     }
 };
 
