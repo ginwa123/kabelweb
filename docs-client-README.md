@@ -91,6 +91,6 @@ See `Error` in `root.zig`. The most common:
 | Timeout | no (`curl -s` default infinite) | yes (`Options.timeout_ms`) |
 | Redirects | no | yes (`Options.follow_redirects`) |
 | HTTP methods | GET, POST | all 5 |
-| TLS tuning | inherited from system curl | `Options.verify_ssl` |
+| TLS tuning | inherited from system curl | `Options.verify_ssl`, `Options.revoke_best_effort` |
 | Streams | no | no (v1) |
 | Tests | subprocess + httpbin | ~31, organised by class (unit/memory/FD/edge/stress/integration) |

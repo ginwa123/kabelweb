@@ -929,6 +929,10 @@ pub fn openStream(
     _ = setoptLong(handle, curl.OPT.NOSIGNAL, @as(c_long, 1));
     _ = setoptLong(handle, curl.OPT.SSL_VERIFYPEER, if (options.verify_ssl) @as(c_long, 1) else @as(c_long, 0));
     _ = setoptLong(handle, curl.OPT.SSL_VERIFYHOST, if (options.verify_ssl) @as(c_long, 2) else @as(c_long, 0));
+    // Revocation — same as `client.zig`'s perform(): the streaming path
+    // is the one pabrik's agent loop uses for LLM calls, so the fix has
+    // to land in both. See `Options.revoke_best_effort`.
+    _ = setoptLong(handle, curl.OPT.SSL_OPTIONS, options.sslOptions());
 
     _ = curl.easy_setopt_raw(handle, curl.OPT.WRITEFUNCTION, @as(curl.WriteCallback, @ptrCast(&writeCallback)));
     _ = curl.easy_setopt_raw(handle, curl.OPT.WRITEDATA, @as(*anyopaque, @ptrCast(state)));

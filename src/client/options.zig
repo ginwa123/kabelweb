@@ -5,6 +5,8 @@
 //! Field naming mirrors libcurl's `CURLOPT_*` so call sites read
 //! 1:1 against the manual page.
 
+const curl = @import("curl.zig");
+
 pub const Options = struct {
     /// Total time for the transfer, in milliseconds.
     /// Maps to `CURLOPT_TIMEOUT_MS`.
@@ -28,6 +30,28 @@ pub const Options = struct {
     /// Verify the server's TLS certificate (default `true`).
     verify_ssl: bool = true,
 
+    /// Continue the handshake when the certificate revocation check
+    /// cannot be *made* — an unreachable CRL / OCSP endpoint — instead
+    /// of failing the whole connection. Maps to libcurl's
+    /// `CURLSSLOPT_REVOKE_BEST_EFFORT` in `CURLOPT_SSL_OPTIONS`
+    /// (schannel-only; other backends ignore the bit).
+    ///
+    /// Default `true`, because the alternative is a hard failure the
+    /// caller cannot tell apart from "the server is down". The case that
+    /// matters in practice is Windows: libcurl's schannel backend does
+    /// the revocation check inline in the handshake, so a box that
+    /// cannot reach the CA's revocation servers — corporate network,
+    /// blocked `crl.*`/OCSP, no proxy for the chain engine — fails with
+    /// `CRYPT_E_REVOCATION_OFFLINE` (CURLE 35) on *every* HTTPS request.
+    /// Linux/macOS builds link an OpenSSL-backed curl, which never
+    /// fetches a CRL, so they never see it.
+    ///
+    /// This does not weaken trust: the chain and the revocation check
+    /// both still run — only "the answer is unknown" stops being fatal.
+    /// Set `false` for a strict caller that wants an unreachable
+    /// revocation server to abort the connection.
+    revoke_best_effort: bool = true,
+
     /// Max buffered response body in `Client.perform` (bytes).
     /// Prevents OOM on large downloads — use `openStream` for those.
     /// Default 10 MiB. `null` = unbounded (legacy).
@@ -42,6 +66,22 @@ pub const Options = struct {
 
     /// Max URL length (bytes). Default 8 KiB.
     max_url_bytes: usize = 8 * 1024,
+
+    /// The value this request hands to libcurl's `CURLOPT_SSL_OPTIONS`.
+    ///
+    /// One function called by both `CURLOPT_SSL_OPTIONS` sites —
+    /// `client.zig`'s buffered `perform` and `stream.zig`'s `openStream`
+    /// — so the two paths cannot drift. (The streaming path is what an
+    /// agent's LLM calls use; a fix applied to only one of them is how
+    /// this class of bug ships half-applied.)
+    ///
+    /// Zero means "relax nothing": `verify_ssl = false` already turns
+    /// verification — and with it revocation — off outright, and
+    /// `revoke_best_effort = false` asks for libcurl's strict default.
+    pub fn sslOptions(self: Options) c_long {
+        if (!self.verify_ssl) return 0;
+        return if (self.revoke_best_effort) curl.SSLOPT.REVOKE_BEST_EFFORT else 0;
+    }
 };
 
 // ============================================================================
@@ -75,6 +115,7 @@ const options_tests = struct {
             .max_redirects = 10,
             .user_agent = "test/1.0",
             .verify_ssl = false,
+            .revoke_best_effort = false,
         };
         try testing.expectEqual(@as(u32, 1500), opts.timeout_ms.?);
         try testing.expectEqual(@as(u32, 500), opts.connect_timeout_ms.?);
@@ -82,6 +123,26 @@ const options_tests = struct {
         try testing.expectEqual(@as(u16, 10), opts.max_redirects);
         try testing.expectEqualStrings("test/1.0", opts.user_agent);
         try testing.expectEqual(false, opts.verify_ssl);
+        try testing.expectEqual(false, opts.revoke_best_effort);
+    }
+
+    test "sslOptions: best-effort revocation is the default, and is not NO_REVOKE" {
+        // The Windows regression this guards: a default `Options{}` must
+        // ask libcurl to tolerate an unreachable CRL/OCSP endpoint.
+        // Without the bit, schannel hard-fails the handshake
+        // (CRYPT_E_REVOCATION_OFFLINE -> CURLE 35) on every HTTPS call.
+        try testing.expectEqual(curl.SSLOPT.REVOKE_BEST_EFFORT, (custom_http_client.Options{}).sslOptions());
+        // Best-effort keeps the revocation check; NO_REVOKE drops it.
+        // Shipping the wrong bit would silently disable revocation.
+        try testing.expect(curl.SSLOPT.REVOKE_BEST_EFFORT != curl.SSLOPT.NO_REVOKE);
+    }
+
+    test "sslOptions: strict revocation is the opt-out; verify_ssl=false relaxes nothing" {
+        try testing.expectEqual(@as(c_long, 0), (custom_http_client.Options{ .revoke_best_effort = false }).sslOptions());
+        // verify_ssl=false already turns verification — and revocation
+        // with it — off entirely, so the option carries no bits either way.
+        try testing.expectEqual(@as(c_long, 0), (custom_http_client.Options{ .verify_ssl = false }).sslOptions());
+        try testing.expectEqual(@as(c_long, 0), (custom_http_client.Options{ .verify_ssl = false, .revoke_best_effort = false }).sslOptions());
     }
 };
 
