@@ -1033,7 +1033,11 @@ fn collectTestShardEntries(b: *std.Build) []const TestShardEntry {
     var entries: std.ArrayList(TestShardEntry) = .empty;
     errdefer entries.deinit(alloc);
 
-    var src_dir = std.Io.Dir.cwd().openDir(
+    // `b.build_root`, not `Dir.cwd()`: this build script also runs as a
+    // DEPENDENCY sub-build (e.g. sparringhttp/bench/kabelweb), where the
+    // process cwd is the CONSUMER's directory and a cwd-relative `src`
+    // does not exist. See `pkg_dir_bs` above for the same reasoning.
+    var src_dir = b.build_root.handle.openDir(
         b.graph.io,
         "src",
         .{ .iterate = true },
