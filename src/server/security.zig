@@ -69,6 +69,11 @@ pub const CORSConfig = struct {
     allowed_headers: []const u8 = "Content-Type, X-CSRF-Token, X-Requested-With",
     allow_credentials: bool = false,
     max_age: u32 = 86400,
+    /// Whether a state-changing request whose `Origin` names the endpoint
+    /// the request was addressed to is allowed. Default true: with CORS
+    /// off the engine serves "same-origin only", so turning CORS on must
+    /// not start refusing the app's own pages.
+    allow_same_origin: bool = true,
 };
 
 /// Error codes returned by the framework's pre-handler fail redirect.
@@ -94,7 +99,6 @@ pub const PreHandlerFailCode = enum {
 /// `applyCORSHeaders`, `buildPreflightResponse`, `applyCORSResponse`
 /// remain as usable primitives; handlers continue to call `checkOrigin`
 /// and `enforceBodySizeLimit` themselves.)
-
 /// Token bucket state for one `(ip, route)` pair.
 const BucketState = struct {
     /// Window start (unix seconds).
@@ -362,7 +366,7 @@ pub fn rateLimitCheck(
     return 0;
 }
 
-fn makeError(retry_after: u32) error{ RateLimited } {
+fn makeError(retry_after: u32) error{RateLimited} {
     _ = retry_after; // surfaced via the return value via u32
     return error.RateLimited;
 }
@@ -439,6 +443,66 @@ pub fn extractHost(url: []const u8) []const u8 {
         if (c == '/' or c == '?' or c == '#') return rest[0..i];
     }
     return rest;
+}
+
+/// The `Host` the request was addressed to, if it names one. A request
+/// without a Host header cannot be same-origin with anything.
+pub fn requestHost(request: *const HttpRequest) ?[]const u8 {
+    var it = request.headers.iterator();
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "host")) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+/// A `host[:port]` string, split. An IPv6 literal keeps its brackets, so
+/// `[::1]:8443` splits into `[::1]` and `8443`; a bare `::1` has no port.
+const HostPort = struct {
+    name: []const u8,
+    port: ?[]const u8,
+};
+
+fn splitHostPort(hostport: []const u8) HostPort {
+    if (hostport.len == 0) return .{ .name = hostport, .port = null };
+    if (hostport[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, hostport, ']') orelse return .{ .name = hostport, .port = null };
+        if (close + 1 < hostport.len and hostport[close + 1] == ':') {
+            return .{ .name = hostport[0 .. close + 1], .port = hostport[close + 2 ..] };
+        }
+        return .{ .name = hostport[0 .. close + 1], .port = null };
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, hostport, ':') orelse return .{ .name = hostport, .port = null };
+    if (std.mem.indexOfScalar(u8, hostport[0..colon], ':') != null) return .{ .name = hostport, .port = null };
+    return .{ .name = hostport[0..colon], .port = hostport[colon + 1 ..] };
+}
+
+/// The port a scheme implies when the URL does not spell one out.
+fn defaultPort(scheme: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(scheme, "https")) return "443";
+    if (std.ascii.eqlIgnoreCase(scheme, "http")) return "80";
+    return null;
+}
+
+/// True when `origin` names the same endpoint as the `Host` the request
+/// arrived with — the browser's own origin, for a same-origin request.
+/// The origin's scheme decides what an omitted port means (https → 443),
+/// because the `Host` header does not carry the scheme.
+pub fn sameEndpoint(origin: []const u8, host: []const u8) bool {
+    const sep = std.mem.indexOf(u8, origin, "://") orelse return false;
+    const scheme = origin[0..sep];
+    const o = splitHostPort(extractHost(origin));
+    const h = splitHostPort(host);
+    if (!std.ascii.eqlIgnoreCase(o.name, h.name)) return false;
+    if (o.port) |op| {
+        if (h.port) |hp| return std.ascii.eqlIgnoreCase(op, hp);
+        const dp = defaultPort(scheme) orelse return false;
+        return std.ascii.eqlIgnoreCase(op, dp);
+    }
+    if (h.port) |hp| {
+        const dp = defaultPort(scheme) orelse return false;
+        return std.ascii.eqlIgnoreCase(hp, dp);
+    }
+    return true;
 }
 
 /// Check that the request's Origin or Referer matches the expected host.
@@ -531,18 +595,14 @@ pub fn checkOriginInList(
 /// `enforceBodySizeLimit` and forwards whichever error fires first.
 /// Useful as a single helper call at the top of state-changing
 /// handlers — replaces the inline two-line repetition:
-
 ///   gserverz.security.checkOrigin(&req, "localhost:4021") catch { ... };
 ///   gserverz.security.enforceBodySizeLimit(...)         catch { ... };
-
 /// with:
-
 ///   gserverz.security.preHandlerCheck(&req, cors_origins, MAX_BODY_BYTES)
 ///       catch |err| switch (err) {
 ///           error.CrossOriginForbidden => return redirect(...),
 ///           error.PayloadTooLarge      => return redirect(...),
 ///       };
-
 /// When the GinwaServer route is configured with
 /// `Route.on_pre_handler_fail`, this check runs automatically inside
 /// the dispatch loop and handlers don't need to call it at all.
@@ -802,7 +862,9 @@ pub fn isStateChanging(method: []const u8) bool {
 ///     servers that never enable CORS see no origin gating).
 ///   * No Origin header → `.pass` (curl / server-to-server clients don't
 ///     send one; the CSRF cookie remains the primary defence for forms).
-///   * Origin present but not in `config.allowed_origins` → `.block_cors`.
+///   * Origin present but not in `config.allowed_origins` → `.block_cors`,
+///     unless it names the endpoint the request was addressed to (the
+///     app's own pages) and `config.allow_same_origin` says so.
 pub fn preGateCheck(
     request: *const HttpRequest,
     config: CORSConfig,
@@ -821,13 +883,20 @@ pub fn preGateCheck(
     var it = request.headers.iterator();
     while (it.next()) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "origin")) {
-            const origin_host = extractHost(entry.value_ptr.*);
+            const origin = entry.value_ptr.*;
+            const origin_host = extractHost(origin);
             var allowed = false;
             for (config.allowed_origins) |candidate| {
                 if (std.ascii.eqlIgnoreCase(origin_host, candidate)) {
                     allowed = true;
                     break;
                 }
+            }
+            // The app's own pages: an Origin that names the endpoint the
+            // request was addressed to. The browser set the Host header,
+            // so a page on another site cannot claim it.
+            if (!allowed and config.allow_same_origin) {
+                if (requestHost(request)) |host| allowed = sameEndpoint(origin, host);
             }
             if (!allowed) return .block_cors;
             break;
@@ -1439,7 +1508,7 @@ const security_tests = struct {
         try req.headers.put("Origin", "http://localhost:4021");
         defer req.headers.deinit();
 
-        try testing.expect(security.originMatches(&req, &.{ "localhost:4021" }));
+        try testing.expect(security.originMatches(&req, &.{"localhost:4021"}));
     }
 
     test "originMatches returns false when Origin mismatches whitelist" {
@@ -1451,7 +1520,7 @@ const security_tests = struct {
         try req.headers.put("Origin", "http://evil.example.com");
         defer req.headers.deinit();
 
-        try testing.expect(!security.originMatches(&req, &.{ "localhost:4021" }));
+        try testing.expect(!security.originMatches(&req, &.{"localhost:4021"}));
     }
 
     test "getRequestOrigin returns null when missing, value when present" {
@@ -2671,7 +2740,7 @@ const security_tests = struct {
         defer arena.deinit();
         var req = gateReq(arena.allocator(), "POST", "https://ginwa.site");
 
-        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{ "ginwa.site" } };
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"ginwa.site"} };
         const result = try security.preGateCheck(&req, cfg, 1024);
         try testing.expect(result == .pass);
     }
@@ -2706,6 +2775,83 @@ const security_tests = struct {
 
         var opts_req = gateReq(arena.allocator(), "OPTIONS", "http://evil.example.com");
         try testing.expect((try security.preGateCheck(&opts_req, cfg, 1024)) == .pass);
+    }
+
+    fn gateReqWithHost(
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        origin: ?[]const u8,
+        host: ?[]const u8,
+    ) security.HttpRequest {
+        var req = gateReq(allocator, method, origin);
+        if (host) |h| req.headers.put("Host", h) catch unreachable;
+        return req;
+    }
+
+    test "preGateCheck: the app's own origin passes the gate without an allowlist entry" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var req = gateReqWithHost(arena.allocator(), "POST", "https://agent.ginwa.site", "agent.ginwa.site");
+
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"127.0.0.1:4021"} };
+        const result = try security.preGateCheck(&req, cfg, 1024);
+        try testing.expectEqual(security.PreGateResult.pass, result);
+    }
+
+    test "preGateCheck: an origin on another host is still blocked" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var req = gateReqWithHost(arena.allocator(), "POST", "https://evil.example", "agent.ginwa.site");
+
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{"127.0.0.1:4021"} };
+        const result = try security.preGateCheck(&req, cfg, 1024);
+        try testing.expectEqual(security.PreGateResult.block_cors, result);
+    }
+
+    test "preGateCheck: the same host on another port is blocked" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var req = gateReqWithHost(arena.allocator(), "POST", "https://agent.ginwa.site:8443", "agent.ginwa.site");
+
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{} };
+        const result = try security.preGateCheck(&req, cfg, 1024);
+        try testing.expectEqual(security.PreGateResult.block_cors, result);
+    }
+
+    test "preGateCheck: an origin without a Host to match falls back to the allowlist" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var req = gateReqWithHost(arena.allocator(), "POST", "https://agent.ginwa.site", null);
+
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{} };
+        const result = try security.preGateCheck(&req, cfg, 1024);
+        try testing.expectEqual(security.PreGateResult.block_cors, result);
+    }
+
+    test "preGateCheck: the same-origin rule can be turned off" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var req = gateReqWithHost(arena.allocator(), "POST", "https://agent.ginwa.site", "agent.ginwa.site");
+
+        const cfg = security.CORSConfig{ .enabled = true, .allowed_origins = &.{}, .allow_same_origin = false };
+        const result = try security.preGateCheck(&req, cfg, 1024);
+        try testing.expectEqual(security.PreGateResult.block_cors, result);
+    }
+
+    test "sameEndpoint: the default port and an explicit one are one endpoint" {
+        try testing.expect(security.sameEndpoint("https://agent.ginwa.site", "agent.ginwa.site"));
+        try testing.expect(security.sameEndpoint("https://agent.ginwa.site", "agent.ginwa.site:443"));
+        try testing.expect(security.sameEndpoint("http://agent.ginwa.site", "agent.ginwa.site:80"));
+        try testing.expect(security.sameEndpoint("https://agent.ginwa.site:8443", "agent.ginwa.site:8443"));
+        try testing.expect(security.sameEndpoint("https://AGENT.ginwa.site", "agent.ginwa.site"));
+    }
+
+    test "sameEndpoint: a different host, a different port or no scheme is not one endpoint" {
+        try testing.expect(!security.sameEndpoint("https://evil.example", "agent.ginwa.site"));
+        try testing.expect(!security.sameEndpoint("https://agent.ginwa.site:8443", "agent.ginwa.site"));
+        try testing.expect(!security.sameEndpoint("https://agent.ginwa.site", "agent.ginwa.site:8443"));
+        try testing.expect(!security.sameEndpoint("null", "agent.ginwa.site"));
+        try testing.expect(!security.sameEndpoint("agent.ginwa.site", "agent.ginwa.site"));
     }
 
     test "preGateCheck: oversized body → block_body_too_large" {
