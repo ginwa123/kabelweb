@@ -1176,6 +1176,7 @@ const complex_cases_extra_tests = struct {
 
     const http_parser = @import("http_parser.zig");
     const http_server = @import("http_server.zig");
+    const test_tcp = @import("test_tcp.zig");
 
     /// A loopback port that is free *right now*.
     ///
@@ -1189,10 +1190,7 @@ const complex_cases_extra_tests = struct {
     fn freePort() !u16 {
         const probe = try http_server.Address.init("127.0.0.1", 0);
         defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
-        var sa: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
-        var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-        if (std.c.getsockname(probe.sock_fd, @ptrCast(&sa), &sa_len) != 0) return error.GetSockNameFailed;
-        return std.mem.bigToNative(u16, sa.port);
+        return test_tcp.boundPort(probe.sock_fd);
     }
     const router = @import("router.zig");
     const sse_manager = @import("sse_manager.zig");
