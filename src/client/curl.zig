@@ -40,6 +40,9 @@ pub const version = C.curl_version;
 pub const OPT = struct {
     pub const URL: c_int = @intCast(C.CURLOPT_URL);
     pub const CUSTOMREQUEST: c_int = @intCast(C.CURLOPT_CUSTOMREQUEST);
+    /// Makes libcurl issue a HEAD: no body is expected, so the transfer
+    /// completes on the response head instead of waiting for one.
+    pub const NOBODY: c_int = @intCast(C.CURLOPT_NOBODY);
     pub const HTTPHEADER: c_int = @intCast(C.CURLOPT_HTTPHEADER);
     pub const POSTFIELDS: c_int = @intCast(C.CURLOPT_POSTFIELDS);
     pub const COPYPOSTFIELDS: c_int = @intCast(C.CURLOPT_COPYPOSTFIELDS);

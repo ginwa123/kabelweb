@@ -151,6 +151,9 @@ pub const Client = struct {
         method_z[mlen] = 0;
         const method_slice: [:0]const u8 = method_z[0..mlen :0];
         _ = setoptPtr(handle, curl.OPT.CUSTOMREQUEST, method_slice.ptr);
+        // HEAD carries no body, and `CUSTOMREQUEST` alone still waits for
+        // one. `NOBODY` is what makes libcurl finish on the response head.
+        if (req.method == .HEAD) _ = setoptLong(handle, curl.OPT.NOBODY, 1);
 
         // ----- Headers: build a slist chain.
         // Each header becomes "Name: Value\0" in a stack buffer, then is
@@ -410,43 +413,27 @@ fn mapCurlCode(rc: c_uint) Error {
         // 0 = CURLE_OK — caller checks before calling us
         0 => unreachable,
         @intCast(curl.C.CURLE_URL_MALFORMAT) => Error.InvalidUrl,
-        @intCast(curl.C.CURLE_COULDNT_RESOLVE_PROXY),
-        @intCast(curl.C.CURLE_COULDNT_RESOLVE_HOST) => Error.DnsError,
+        @intCast(curl.C.CURLE_COULDNT_RESOLVE_PROXY), @intCast(curl.C.CURLE_COULDNT_RESOLVE_HOST) => Error.DnsError,
         // libcurl 8.x collapses connect-timeout and operation-timeout
         // into CURLE_OPERATION_TIMEDOUT. Map both error names to the
         // same code — callers can't distinguish the two anyway.
         @intCast(curl.C.CURLE_OPERATION_TIMEDOUT) => Error.OperationTimedOut,
         @intCast(curl.C.CURLE_COULDNT_CONNECT) => Error.ConnectionRefused,
-        @intCast(curl.C.CURLE_PEER_FAILED_VERIFICATION),
-        @intCast(curl.C.CURLE_SSL_CERTPROBLEM),
-        @intCast(curl.C.CURLE_SSL_CIPHER),
-        @intCast(curl.C.CURLE_SSL_CONNECT_ERROR) => Error.TlsError,
+        @intCast(curl.C.CURLE_PEER_FAILED_VERIFICATION), @intCast(curl.C.CURLE_SSL_CERTPROBLEM), @intCast(curl.C.CURLE_SSL_CIPHER), @intCast(curl.C.CURLE_SSL_CONNECT_ERROR) => Error.TlsError,
         @intCast(curl.C.CURLE_UNSUPPORTED_PROTOCOL) => Error.UnsupportedProtocol,
         @intCast(curl.C.CURLE_TOO_MANY_REDIRECTS) => Error.TooManyRedirects,
         @intCast(curl.C.CURLE_OUT_OF_MEMORY) => Error.OutOfMemory,
         @intCast(curl.C.CURLE_FAILED_INIT) => Error.InitFailed,
         // HTTP-layer failures: server spoke but the exchange failed.
-        @intCast(curl.C.CURLE_WEIRD_SERVER_REPLY),
-        @intCast(curl.C.CURLE_REMOTE_ACCESS_DENIED),
-        @intCast(curl.C.CURLE_HTTP_RETURNED_ERROR),
-        @intCast(curl.C.CURLE_HTTP_RANGE_ERROR),
-        @intCast(curl.C.CURLE_HTTP_POST_ERROR),
-        @intCast(curl.C.CURLE_GOT_NOTHING) => Error.HttpError,
+        @intCast(curl.C.CURLE_WEIRD_SERVER_REPLY), @intCast(curl.C.CURLE_REMOTE_ACCESS_DENIED), @intCast(curl.C.CURLE_HTTP_RETURNED_ERROR), @intCast(curl.C.CURLE_HTTP_RANGE_ERROR), @intCast(curl.C.CURLE_HTTP_POST_ERROR), @intCast(curl.C.CURLE_GOT_NOTHING) => Error.HttpError,
         // Local callback / transfer-direction failures.
         @intCast(curl.C.CURLE_WRITE_ERROR) => Error.WriteError,
         @intCast(curl.C.CURLE_READ_ERROR) => Error.ReadError,
-        @intCast(curl.C.CURLE_SEND_ERROR),
-        @intCast(curl.C.CURLE_SEND_FAIL_REWIND) => Error.SendError,
+        @intCast(curl.C.CURLE_SEND_ERROR), @intCast(curl.C.CURLE_SEND_FAIL_REWIND) => Error.SendError,
         @intCast(curl.C.CURLE_RECV_ERROR) => Error.RecvError,
         @intCast(curl.C.CURLE_PARTIAL_FILE) => Error.PartialFile,
         // Remaining TLS-engine failures fold into TlsError.
-        @intCast(curl.C.CURLE_SSL_ENGINE_NOTFOUND),
-        @intCast(curl.C.CURLE_SSL_ENGINE_SETFAILED),
-        @intCast(curl.C.CURLE_USE_SSL_FAILED),
-        @intCast(curl.C.CURLE_SSL_CACERT_BADFILE),
-        @intCast(curl.C.CURLE_SSL_SHUTDOWN_FAILED),
-        @intCast(curl.C.CURLE_SSL_CRL_BADFILE),
-        @intCast(curl.C.CURLE_SSL_ISSUER_ERROR) => Error.TlsError,
+        @intCast(curl.C.CURLE_SSL_ENGINE_NOTFOUND), @intCast(curl.C.CURLE_SSL_ENGINE_SETFAILED), @intCast(curl.C.CURLE_USE_SSL_FAILED), @intCast(curl.C.CURLE_SSL_CACERT_BADFILE), @intCast(curl.C.CURLE_SSL_SHUTDOWN_FAILED), @intCast(curl.C.CURLE_SSL_CRL_BADFILE), @intCast(curl.C.CURLE_SSL_ISSUER_ERROR) => Error.TlsError,
         // Aborted by our own callback (e.g. OOM in writeCallback):
         // surfaced as a timeout so callers retry rather than crash.
         @intCast(curl.C.CURLE_ABORTED_BY_CALLBACK) => Error.OperationTimedOut,
@@ -472,6 +459,7 @@ const client_tests = struct {
         try testing.expectEqual(@as(custom_http_client.Method, .PUT), custom_http_client.Method.parse("PUT").?);
         try testing.expectEqual(@as(custom_http_client.Method, .PATCH), custom_http_client.Method.parse("PATCH").?);
         try testing.expectEqual(@as(custom_http_client.Method, .DELETE), custom_http_client.Method.parse("DELETE").?);
+        try testing.expectEqual(@as(custom_http_client.Method, .HEAD), custom_http_client.Method.parse("HEAD").?);
         try testing.expectEqual(@as(?custom_http_client.Method, null), custom_http_client.Method.parse("get")); // case-sensitive
         try testing.expectEqual(@as(?custom_http_client.Method, null), custom_http_client.Method.parse("BREW"));
         try testing.expectEqual(@as(?custom_http_client.Method, null), custom_http_client.Method.parse(""));
@@ -619,8 +607,7 @@ const fd_leak_tests = struct {
 
         const tolerance: usize = 10;
         if (after > before + tolerance) {
-            std.debug.print("!! FD leak: before={d} after={d} delta={d} (ok_calls={d}) !!\n",
-                .{ before, after, after - before, ok });
+            std.debug.print("!! FD leak: before={d} after={d} delta={d} (ok_calls={d}) !!\n", .{ before, after, after - before, ok });
             return error.FdLeakSuspected;
         }
         if (ok == 0) return error.SkipZigTest;
@@ -644,8 +631,7 @@ const fd_leak_tests = struct {
         const after = try countOpenFds();
         const tolerance: usize = 10;
         if (after > before + tolerance) {
-            std.debug.print("!! FD leak on errors: before={d} after={d} delta={d} !!\n",
-                .{ before, after, after - before });
+            std.debug.print("!! FD leak on errors: before={d} after={d} delta={d} !!\n", .{ before, after, after - before });
             return error.FdLeakOnErrorsSuspected;
         }
     }
@@ -911,8 +897,7 @@ const stress_tests = struct {
         var client = custom_http_client.Client.init(allocator);
         defer client.deinit();
         return client.perform(req, .{ .timeout_ms = 30_000 }) catch |err| switch (err) {
-            error.ConnectionRefused, error.ConnectionTimeout, error.OperationTimedOut,
-            error.DnsError, error.TlsError => return error.SkipZigTest,
+            error.ConnectionRefused, error.ConnectionTimeout, error.OperationTimedOut, error.DnsError, error.TlsError => return error.SkipZigTest,
             else => return err,
         };
     }
