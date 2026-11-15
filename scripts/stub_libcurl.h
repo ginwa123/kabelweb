@@ -97,6 +97,8 @@ typedef unsigned int CURLoption;
 #define CURLOPT_XFERINFODATA 10021
 #define CURLOPT_ERRORBUFFER 10022
 #define CURLOPT_SSL_OPTIONS 10023
+// HEAD: CUSTOMREQUEST alone still waits for a body, so the client asks for NOBODY too.
+#define CURLOPT_NOBODY 10024
 
 // Bit values for CURLOPT_SSL_OPTIONS (real libcurl: ALLOW_BEAST = 1<<0,
 // NO_REVOKE = 1<<1, NO_PARTIALCHAIN = 1<<2, REVOKE_BEST_EFFORT = 1<<3,
