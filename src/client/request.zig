@@ -15,6 +15,9 @@ pub const Method = enum {
     /// Body-less metadata request. libcurl needs `CURLOPT_NOBODY` for this
     /// one: `CUSTOMREQUEST` alone still waits for a response body.
     HEAD,
+    /// Capability discovery. Sent through `CUSTOMREQUEST` like every other
+    /// verb, so it carries an optional body too.
+    OPTIONS,
 
     /// Parse a method name (case-sensitive: `POST`, `POST`, `POST`).
     /// Returns null for unknown verbs so callers can decide whether to
@@ -29,6 +32,7 @@ pub const Method = enum {
         if (std.mem.eql(u8, s, "PATCH")) return .PATCH;
         if (std.mem.eql(u8, s, "DELETE")) return .DELETE;
         if (std.mem.eql(u8, s, "HEAD")) return .HEAD;
+        if (std.mem.eql(u8, s, "OPTIONS")) return .OPTIONS;
         return null;
     }
 
@@ -40,6 +44,7 @@ pub const Method = enum {
             .PATCH => "PATCH",
             .DELETE => "DELETE",
             .HEAD => "HEAD",
+            .OPTIONS => "OPTIONS",
         };
     }
 };
