@@ -559,6 +559,7 @@ done
 echo ""
 echo "=== Done. Run 'zig build' to verify ==="
 echo "  Linux native + macOS arm64 + macOS x86_64 vendored curl (with OpenSSL/HTTPS) ready."
-echo "  Windows archive (vendor/curl/windows-amd64/) NOT built yet — needs MinGW setup."
+echo "  Windows is built by the OTHER script: bash scripts/build-vendor-curl-windows.sh"
+echo "  (it needs no OpenSSL at all — curl there uses Schannel)."
 echo "  Note: HTTP/2 and HTTP/3 are still disabled (nghttp2/nghttp3/ngtcp2 not vendored)."
 echo "        Compression (gzip/br/zstd) is still disabled (zlib/brotli/zstd not vendored)."

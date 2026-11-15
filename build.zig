@@ -1339,6 +1339,18 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always use the vendored libcurl archive",
     ) orelse false;
 
+    // Refuse the no-op stub. The stub exists so a checkout with no curl at all
+    // still COMPILES on Windows, but a binary linked against it can never reach
+    // the network — it reports a failed request instead. CI passes
+    // `-Drequire-real-curl=true` on every leg (kurirw's Windows job does), so a
+    // stub can never reach a release artifact: the build fails at configure time
+    // with the reason and the fix, instead of shipping a client that cannot send.
+    const require_real_curl = b.option(
+        bool,
+        "require-real-curl",
+        "Fail the build instead of falling back to the no-op stub libcurl (CI uses this)",
+    ) orelse false;
+
     // Test filter (substring match on the test name). Zig 0.16's test
     // runner no longer parses `--test-filter` on its own command line
     // (it only accepts `--listen=-` / `--seed=` / `--cache-dir=`), so the
@@ -1474,7 +1486,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     client_smoke_exe.root_module.link_libc = true;
-    b.installArtifact(client_smoke_exe);
+    const client_smoke_install = b.addInstallArtifact(client_smoke_exe, .{});
+    b.getInstallStep().dependOn(&client_smoke_install.step);
+
+    // The client half ALONE, cross-compilable.
+    //
+    // `zig build` also builds the server demo + the TLS server probe, and those
+    // need OpenSSL for the *server* side — which Windows has no static archive
+    // for here (the vendored Windows curl is Schannel-only by design). So the
+    // client half, the one every consumer actually links, gets its own step:
+    //
+    //   zig build client-smoke -Dtarget=x86_64-windows-gnu -Dforce-vendor=true -Drequire-real-curl=true
+    //
+    // That installs `zig-out/bin/kabelweb-client-smoke[.exe]` — a real Windows
+    // binary linked against the committed vendored archive, buildable from any
+    // host. CI builds it and then RUNS it against a real URL on the Windows
+    // runner: a linked stub would fail that, a real curl prints its status.
+    const client_smoke_step = b.step("client-smoke", "Build only the client smoke CLI (cross-compiles to any target)");
+    client_smoke_step.dependOn(&client_smoke_install.step);
 
     // TLS server probe. Boots a `GinwaServer` with `enableTls` on
     // 127.0.0.1:21997 from a self-signed pair, using the same three calls a
@@ -1661,54 +1690,90 @@ pub fn build(b: *std.Build) void {
             // (no separate -L/-l needed — Zig's linker resolves the archive's
             // undefined symbols at consumer link time).
             //
-            // The archive is a FAT build: curl + libssl + libcrypto objects
-            // merged in one .a (see scripts/build-vendor-curl.sh). So we
-            // do NOT also link ssl/crypto — they're already in the archive.
-            const libcurl_a = b.path(b.fmt("{s}/lib/libcurl.a", .{target_dir}));
+            // Linux + macOS archives are FAT builds: curl + libssl +
+            // libcrypto objects merged in one .a (scripts/build-vendor-curl.sh),
+            // so we do NOT also link ssl/crypto.
+            //
+            // The Windows archive is a real libcurl too, built by
+            // `scripts/build-vendor-curl-windows.sh` for `x86_64-windows-gnu`
+            // with **Schannel** as its only TLS backend — no OpenSSL at all —
+            // and every optional dependency switched off. That combination is
+            // what makes it linkable here: its remaining undefined symbols are
+            // Win32 system libraries, which Zig's bundled mingw-w64 already
+            // ships (see the Windows link list below). The archive is committed
+            // to the repository because kabelweb is consumed by URL + hash: an
+            // archive that is not in git does not exist for a consumer.
+            const archive_rel = b.fmt("{s}/lib/libcurl.a", .{target_dir});
+            const libcurl_a = b.path(archive_rel);
+            const pkg_dir = b.build_root.path orelse ".";
+            const have_archive = fileExists(b.fmt("{s}/{s}", .{ pkg_dir, archive_rel }));
 
-            // WINDOWS-DEV-BOX STUB PATH:
-            //
-            // `build-vendor-curl.sh` intentionally never builds a Windows
-            // archive (it only cross-compiles Linux + macOS targets; the
-            // Windows script section is a no-op with an informative message
-            // — see the script's `case "$(uname -s)"` Windows-host arm).
-            // On a Windows host without vcpkg libcurl + openssl installed,
-            // there's no `vendor/curl/windows-amd64/lib/libcurl.a` AND no
-            // header at `vendor/curl/windows-amd64/include/curl/curl.h`,
-            // which causes two failures during `zig build test`:
-            //
-            //   1. `src/modules/agent/Agent.zig` transitively pulls in
-            //      kabelweb (via the test runner imports), so
-            //      the test compile includes kabelweb's client sources.
-            //      kabelweb `src/client/curl.zig` does
-            //      `@cImport(@cInclude("curl/curl.h"))` — without the
-            //      header, the cimport fails with "file not found".
-            //   2. The test compile's link line references the missing
-            //      `libcurl.a` via `addObjectFile`, which fails with
-            //      "file not found" at link-line construction time.
-            //
-            // The fix: when the vendored archive is missing on Windows,
-            // generate a STUB archive + STUB header from the sources in
-            // `scripts/stub_libcurl.{h,c}`. The stub functions are empty
-            // no-ops (curl_easy_init returns NULL, curl_easy_perform
-            // returns CURLE_FAILED_INIT) — enough to satisfy the linker +
-            // cimport without providing real network capability. Tests that
-            // merely construct a kabelweb `Client` and never fire
-            // a request pass; tests that actually call .get/.post/.stream
-            // fail at runtime with a clear InitFailed error from the stub
-            // (visible in `zig build test` output).
-            //
-            // This stub path is Windows-only (Linux + macOS still require
-            // the real archive or system libcurl). To get a real libcurl
-            // on Windows: install vcpkg (`vcpkg install curl:x64-windows
-            // openssl:x64-windows`) — the system probe above takes over
-            // and the stub is bypassed entirely.
-            if (target.result.os.tag == .windows and !fileExists(b.fmt("{s}/lib/libcurl.a", .{target_dir}))) {
+            // A STATICALLY linked libcurl must be told so: without this, curl.h
+            // declares every entry point `__declspec(dllimport)` on Windows and
+            // the link dies on undefined `__imp_curl_easy_init` / `__imp_curl_easy_perform`.
+            m.addCMacro("CURL_STATICLIB", "1");
+
+            if (have_archive) {
+                std.debug.print(
+                    "[kabelweb] libcurl: real static archive {s} (target {s})\n",
+                    .{ archive_rel, @tagName(target.result.os.tag) },
+                );
+            } else if (target.result.os.tag == .windows) {
+                // LAST RESORT — THE STUB:
+                //
+                // `scripts/stub_libcurl.{h,c}` is a no-op libcurl: curl_easy_init
+                // returns NULL, curl_easy_perform returns CURLE_FAILED_INIT. It
+                // exists only so a checkout with NO curl anywhere still
+                // COMPILES on Windows (the cimport in src/client/curl.zig needs
+                // the header, and the link line needs an archive). A binary
+                // linked against it can never reach the network: every Send
+                // fails with a clear InitFailed error.
+                //
+                // The repository carries `vendor/curl/windows-amd64/`, so the
+                // normal path is the real archive above. `-Drequire-real-curl=true`
+                // turns this fallback into a hard build error, which is what CI
+                // passes so a stub can never end up in a release artifact.
+                if (require_real_curl) {
+                    std.debug.print(
+                        "[kabelweb] FATAL: -Drequire-real-curl was set, but there is no vendored libcurl at {s}.\n" ++
+                            "          Build it with scripts/build-vendor-curl-windows.sh (Windows)\n" ++
+                            "          or scripts/build-vendor-curl.sh (Linux/macOS).\n",
+                        .{archive_rel},
+                    );
+                    @panic("-Drequire-real-curl: refusing to fall back to the no-op stub libcurl");
+                }
+                std.debug.print(
+                    "[kabelweb] libcurl: STUB (no-op) — {s} is missing, so this build CANNOT reach the network.\n" ++
+                        "          Build the real archive: scripts/build-vendor-curl-windows.sh\n",
+                    .{archive_rel},
+                );
                 generateStubLibcurlWindows(b, target_dir);
                 // After the stub is generated, addObjectFile points at
                 // the now-existing file. (The compile step's file existence
                 // check is lazy — addObjectFile records the path; the actual
                 // check happens at link-line construction time.)
+            } else {
+                std.debug.print(
+                    "[kabelweb] libcurl: no archive at {s} and no system libcurl — the link will fail.\n" ++
+                        "          Build one: scripts/build-vendor-curl.sh\n",
+                    .{archive_rel},
+                );
+            }
+
+            if (target.result.os.tag == .windows) {
+                // Windows' libcurl links against Win32 itself, never against a
+                // bundled libssl: ws2_32 (sockets), crypt32 + secur32 + bcrypt
+                // (Schannel TLS), advapi32 + user32 (system cert store and
+                // windows), iphlpapi + wldap32 (interface lookup, LDAP),
+                // normaliz (IDN). Zig's mingw-w64 provides every one of them, so
+                // this needs nothing installed on the machine that builds.
+                for ([_][]const u8{
+                    "ws2_32",   "crypt32", "secur32",  "bcrypt",
+                    "advapi32", "user32",  "iphlpapi", "wldap32",
+                    "normaliz",
+                }) |win_lib| {
+                    m.linkSystemLibrary(win_lib, .{});
+                }
             }
             m.addObjectFile(libcurl_a);
         }

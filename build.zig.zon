@@ -11,6 +11,12 @@
         "build.zig.zon",
         "src",
         "scripts",
+        // The prebuilt libcurl archives. `vendor/curl/windows-amd64/` is a REAL
+        // libcurl (Schannel, no OpenSSL) committed on purpose: kabelweb is
+        // consumed by URL + hash, and a `.paths` list that omits `vendor` makes
+        // the archive invisible to every consumer — which is exactly how the
+        // Windows build ended up linking a no-op stub for months.
+        "vendor",
         "README.md",
     },
 }

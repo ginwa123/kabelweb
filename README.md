@@ -144,8 +144,9 @@ src/
     tls_server_probe.zig # `kabelweb-tls-server-probe` — HTTPS listener on :21997 (TLS hijack harness)
     templates/        # embedded demo templates
 scripts/
-  build-vendor-curl.sh  # cross-compiles fat libcurl.a per target (curl 8.10.1 + OpenSSL 3.4.0)
-  stub_libcurl.h/.c     # Windows dev-box no-op fallback
+  build-vendor-curl.sh  # cross-compiles fat libcurl.a per POSIX target (curl 8.10.1 + OpenSSL 3.4.0)
+  build-vendor-curl-windows.sh # cross-compiles the REAL Windows libcurl.a (Schannel, no OpenSSL)
+  stub_libcurl.h/.c     # last-resort no-op fallback (Windows, no archive anywhere)
 ```
 
 ---
@@ -164,8 +165,8 @@ sudo apt install libcurl4-openssl-dev libssl-dev
 # Arch / Fedora: curl-devel + openssl-devel equivalent
 # macOS
 brew install curl openssl@3
-# Windows
-vcpkg install curl:x64-windows openssl:x64-windows
+# Windows: nothing to install — vendor/curl/windows-amd64/ ships a real static
+# libcurl (Schannel TLS, no OpenSSL) built for x86_64-windows-gnu.
 ```
 
 Vendored fallback (hermetic, static):
@@ -174,9 +175,20 @@ Vendored fallback (hermetic, static):
 - Layout: `vendor/curl/<target>/lib/libcurl.a` + `vendor/curl/<target>/include/curl/curl.h`
   where `<target>` = `linux-x86_64 | linux-aarch64 | macos-arm64 | macos-x86_64 | windows-amd64`.
 - Fat archive = curl + ssl + crypto merged, wired via `addObjectFile` (not `-lcurl`).
+- **Windows** (`vendor/curl/windows-amd64/`, committed) is built by
+  `bash scripts/build-vendor-curl-windows.sh`: curl 8.10.1 compiled with `zig cc -target
+  x86_64-windows-gnu`, **Schannel** as its only TLS backend, every optional dependency off.
+  It therefore needs no OpenSSL — only Win32 system libs (`ws2_32 crypt32 secur32 bcrypt
+  advapi32 user32 iphlpapi wldap32 normaliz`), which Zig's bundled mingw-w64 provides. It is
+  a REAL client: `https://` works through the Windows certificate store. The build adds
+  `-DCURL_STATICLIB` so `curl.h` does not declare the entry points `dllimport`.
 - Force it: `zig build -Dforce-vendor=true ...`; custom dir: `-Dvendor-dir=...`.
-- Windows with neither vcpkg nor vendor archive auto-generates a no-op stub from
-  `scripts/stub_libcurl.*` (`curl_easy_init → NULL`, `perform → CURLE_FAILED_INIT`).
+- If no archive is found on Windows, a no-op stub is generated from `scripts/stub_libcurl.*`
+  (`curl_easy_init → NULL`, `perform → CURLE_FAILED_INIT`) so the package still compiles —
+  but it cannot reach the network. `-Drequire-real-curl=true` turns that fallback into a
+  build error, which is what CI passes.
+- Cross-link the client half for Windows from any host:
+  `zig build client-smoke -Dtarget=x86_64-windows-gnu -Dforce-vendor=true -Drequire-real-curl=true`.
 
 ---
 
@@ -687,7 +699,7 @@ Snapshot semantics; `*WithOpts` for CORS/body gate.
 ## Troubleshooting
 
 - `zig build test` fails on curl link → install system libs above, or `zig build -Dforce-vendor=true`.
-- Windows without vcpkg/vendor → stub libcurl compiles but every client call returns `CURLE_FAILED_INIT` (expected).
+- Windows without vcpkg/vendor → stub libcurl compiles but every client call returns `CURLE_FAILED_INIT` (expected). The repository ships `vendor/curl/windows-amd64/`, so this only happens on a checkout that lost it; `bash scripts/build-vendor-curl-windows.sh` restores it.
 - `413` → `max_body_bytes` exceeded; raise via `getWithOpts` / group.
 - `501` in reactor → SSE/WS/H2/TLS not enabled on that loop; use `listen()` or enable hijack path.
 - Template `500` → check stderr: every `ParseError` prints `template:<line>:<column>` + source line + caret.

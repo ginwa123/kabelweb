@@ -71,6 +71,81 @@ jobs:
         timeout-minutes: 30
         run: zig build test-client --summary all
 
+  # The Windows client, through the VENDORED archive, built and then actually
+  # RUN against a real server.
+  #
+  # The `test` job above links vcpkg's curl on Windows, so it never touches
+  # `vendor/curl/windows-amd64/` — which is how that archive could rot unnoticed.
+  # This job does the opposite: no vcpkg, `-Dforce-vendor=true` (skip the system
+  # probe) and `-Drequire-real-curl=true` (a missing archive is a hard error, not
+  # a no-op stub). The binary it produces is then executed against a local HTTP
+  # server and against a public HTTPS endpoint, so "it links" is not the claim —
+  # "it sends" is.
+  windows-vendored-curl:
+    name: windows-vendored-curl
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: The archive is in the repo (and the script that rebuilds it)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l vendor/curl/windows-amd64/lib/libcurl.a
+          ls vendor/curl/windows-amd64/include/curl/curl.h
+          test -x scripts/build-vendor-curl-windows.sh || test -f scripts/build-vendor-curl-windows.sh
+
+      - name: Build the client against the vendored archive (no stub allowed)
+        shell: bash
+        run: zig build client-smoke -Dforce-vendor=true -Drequire-real-curl=true --summary all
+
+      - name: It must FAIL if the archive is gone (the stub gate works)
+        shell: bash
+        # `-Dvendor-dir` points at an empty directory, so the build has to
+        # refuse. A green build here would mean the stub silently took over.
+        run: |
+          set +e
+          zig build client-smoke -Dforce-vendor=true -Drequire-real-curl=true \
+            -Dvendor-dir=vendor/does-not-exist > stub-gate.log 2>&1
+          rc=$?
+          set -e
+          cat stub-gate.log | tail -5
+          test "$rc" -ne 0 || { echo "::error::require-real-curl did not reject the stub path"; exit 1; }
+          grep -q "refusing to fall back to the no-op stub" stub-gate.log
+
+      - name: Send a real request over HTTP (local server)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m http.server 8123 --bind 127.0.0.1 &
+          server=$!
+          sleep 2
+          ./zig-out/bin/kabelweb-client-smoke.exe GET http://127.0.0.1:8123/
+          kill $server
+
+      - name: Send a real request over HTTPS (Schannel + the system cert store)
+        shell: bash
+        # Retried twice: a flaky runner network must not be confused with a
+        # broken TLS stack. A stubbed build fails all three attempts, always.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if ./zig-out/bin/kabelweb-client-smoke.exe GET https://example.com/; then
+              echo "https ok on attempt $attempt"
+              exit 0
+            fi
+            echo "https attempt $attempt failed"
+            sleep 3
+          done
+          echo "::error::the vendored Windows libcurl could not complete an HTTPS request"
+          exit 1
+
   soak:
     name: soak (ubuntu, 60s SSE soaks)
     runs-on: ubuntu-latest
