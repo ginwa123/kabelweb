@@ -1261,7 +1261,7 @@ const complex_cases_tests = struct {
     /// this binary asks for that number.
     fn freePort() !u16 {
         const probe = try http_server.Address.init("127.0.0.1", 0);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
+        defer closeI32Fd(probe.sock_fd);
         return test_tcp.boundPort(probe.sock_fd);
     }
     const router = @import("router.zig");
@@ -1999,7 +1999,7 @@ const complex_cases_tests = struct {
         // Port 0 is valid — it asks the kernel to pick an ephemeral port.
         // The Address struct must accept it without error.
         const addr = try http_server.Address.init("127.0.0.1", 0);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer closeI32Fd(addr.sock_fd);
         try expect(addr.sock_fd >= 0);
         try expectEqual(@as(u16, 0), addr.port);
     }
@@ -2007,7 +2007,7 @@ const complex_cases_tests = struct {
     test "address: maximum u16 port (65535) is accepted" {
         // Port 65535 is the top of the u16 range — must not overflow.
         const addr = try http_server.Address.init("127.0.0.1", 65535);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer closeI32Fd(addr.sock_fd);
         try expectEqual(@as(u16, 65535), addr.port);
     }
 
@@ -2021,7 +2021,7 @@ const complex_cases_tests = struct {
         if (builtin.os.tag == .windows) return error.SkipZigTest;
 
         const addr = try http_server.Address.init("127.0.0.1", 0);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer closeI32Fd(addr.sock_fd);
 
         // Read SO_REUSEADDR back and confirm it's set to a non-zero value.
         var optval: c_int = 0;
@@ -2048,13 +2048,13 @@ const complex_cases_tests = struct {
     test "ginwa: destroy then re-init works (no global state leak)" {
         const a = allocator;
         const addr1 = try http_server.Address.init("127.0.0.1", try freePort());
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr1.sock_fd)))) else @intCast(addr1.sock_fd));
+        defer closeI32Fd(addr1.sock_fd);
 
         var server1 = try http_server.GinwaServer.init(a, undefined, addr1);
         defer server1.destroy(a);
 
         const addr2 = try http_server.Address.init("127.0.0.1", try freePort());
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr2.sock_fd)))) else @intCast(addr2.sock_fd));
+        defer closeI32Fd(addr2.sock_fd);
 
         var server2 = try http_server.GinwaServer.init(a, undefined, addr2);
         defer server2.destroy(a);
@@ -2069,7 +2069,7 @@ const complex_cases_tests = struct {
         // first, so a single destroy() should clean up everything.
         const a = allocator;
         const addr = try http_server.Address.init("127.0.0.1", try freePort());
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(a, undefined, addr);
         // Intentionally do NOT call server.deinit() — destroy() should handle it.
