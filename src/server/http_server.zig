@@ -2233,7 +2233,6 @@ const event_loop_server_tests = struct {
         if (st.err) |err| return err;
 
         const cfd = try tcpConnect(port);
-        defer test_tcp.close(cfd);
 
         // H2 connection preface + empty SETTINGS frame.
         try writeAll(cfd, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -2242,6 +2241,11 @@ const event_loop_server_tests = struct {
         var head: [9]u8 = undefined;
         try readExact(cfd, &head);
         try std.testing.expectEqual(@as(u8, 0x04), head[3]);
+
+        // The connection must end before the loop is torn down: the H2 driver
+        // owns a blocking reader on this fd, and a live one keeps the loop
+        // thread from returning, so `join` waits forever (seen on Windows).
+        test_tcp.close(cfd);
 
         server.shutdown();
         t.join();
