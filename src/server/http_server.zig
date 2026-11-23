@@ -75,7 +75,7 @@ const winsock = if (builtin.os.tag == .windows) struct {
     /// WSADATA struct passed to WSAStartup. 400 bytes is the canonical
     /// size per Winsock 2 docs; the contents are intentionally ignored
     /// (we just need the call to succeed so the winsock runtime is
-    /// available for subsequent socket() calls).
+    /// available for subsequent WSASocketW calls).
     const WSADATA = [400]u8;
     const SOL_SOCKET: c_int = 0xffff;
     const SO_EXCLUSIVEADDRUSE: c_int = -5;
@@ -84,7 +84,7 @@ const winsock = if (builtin.os.tag == .windows) struct {
 } else struct {};
 
 /// Winsock must be initialised with WSAStartup() before any other
-/// winsock function call. Without this call, `socket()` returns
+/// winsock function call. Without this call, `WSASocketW` returns
 /// `INVALID_SOCKET` (WSAEINPROGRESS / WSANOTINITIALISED) on every
 /// invocation. The runtime keeps an internal ref count, so calling
 /// WSAStartup multiple times is safe as long as each call is paired
@@ -104,8 +104,8 @@ fn ensureWinsockInitialized() void {
     var wsa_data: winsock.WSADATA = undefined;
     // MAKEWORD(2, 2) = 0x0202 — request Winsock 2.2 (the highest version
     // every Windows version since Windows 98 supports). Winsock 2 is the
-    // API surface this file relies on (WSASocket/setsockopt with the
-    // SOL_SOCKET/SO_REUSEADDR constants).
+    // API surface this file relies on (WSASocketW, setsockopt with
+    // SOL_SOCKET options).
     const version: c_ushort = (2 << 8) | 2;
     const rc = winsock.WSAStartup(version, &wsa_data);
     if (rc != 0) {
@@ -163,18 +163,12 @@ const AF_UNIX = if (builtin.os.tag == .windows) @as(u32, 1) else posix.AF.UNIX;
 const SOCK_STREAM = if (builtin.os.tag == .windows) @as(u32, 1) else posix.SOCK.STREAM;
 const IPPROTO_TCP = if (builtin.os.tag == .windows) @as(u32, 6) else posix.IPPROTO.TCP;
 
-// Cross-platform socket fd type. On Linux/macOS this is i32 (no behavior
-// change vs. the prior hard-coded `i32`). On Windows the production code
-// uses winsock handles via SOCKET (= *anyopaque); callers cast
-// `addr.sock_fd` to `c_int` at the winsock call site when needed.
-//
-// NB: keeping this as `i32` (not `std.c.fd_t`) is deliberate — the test
-// suite compares `addr.sock_fd` against integer literals (e.g. `>= 0`,
-// `== -1`) and casts it via `@intCast`/`@intFromPtr` in only a handful of
-// places. Switching to `std.c.fd_t` (= *anyopaque on Windows) would
-// cascade into 50+ test-comparison sites. The winsock declarations use
-// `SOCKET` directly, so the type mismatch surfaces only at the @ptrCast
-// boundaries that already exist.
+// Cross-platform socket fd type, `i32` on every platform. On Windows the
+// real value is a pointer-sized `SOCKET`, which always fits: the kernel
+// hands out small sequential handles. Keeping `i32` is deliberate — the
+// test suite compares `sock_fd` against integer literals (`>= 0`, `== -1`),
+// and `std.c.fd_t` (= `*anyopaque` on Windows) would cascade into 50+ of
+// those sites.
 pub const SocketFd = i32;
 
 pub const Address = struct {
@@ -238,9 +232,23 @@ pub const Address = struct {
         } else {
             const fd = socket.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (fd < 0) return error.SocketCreationFailed;
+            errdefer _ = socket.close(fd);
+            try setCloseOnExec(fd);
             return @intCast(fd);
         }
     }
+
+    fn setCloseOnExec(fd: i32) !void {
+        if (builtin.os.tag == .linux) {
+            const rc: isize = @bitCast(std.os.linux.fcntl(fd, F_SETFD, FD_CLOEXEC));
+            if (rc < 0) return error.FcntlFailed;
+        } else {
+            if (std.c.fcntl(fd, F_SETFD, @as(c_int, FD_CLOEXEC)) < 0) return error.FcntlFailed;
+        }
+    }
+
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
 
     fn applyBindOption(sock_fd: SocketFd) !void {
         if (builtin.os.tag == .windows) {
@@ -2337,24 +2345,24 @@ const http_server_tests = struct {
         }
     }
 
-    fn listenerInheritFlag(fd: i32) !u32 {
+    fn fdInheritableByaChild(fd: i32) !bool {
         if (builtin.os.tag == .windows) {
             var flags: u32 = 0;
             if (kernel32.GetHandleInformation(@ptrFromInt(@as(usize, @intCast(fd))), &flags) == 0) return error.HandleInfoFailed;
-            return flags & kernel32.HANDLE_FLAG_INHERIT;
+            return flags & kernel32.HANDLE_FLAG_INHERIT != 0;
         } else if (builtin.os.tag == .linux) {
             const rc: isize = @bitCast(std.os.linux.fcntl(fd, F_GETFD, 0));
             if (rc < 0) return error.HandleInfoFailed;
-            return @intCast(@as(usize, @bitCast(rc)) & FD_CLOEXEC);
+            return @as(usize, @bitCast(rc)) & @as(usize, @intCast(FD_CLOEXEC)) == 0;
         } else {
             const rc = std.c.fcntl(fd, F_GETFD);
             if (rc < 0) return error.HandleInfoFailed;
-            return @intCast(@as(u32, @intCast(rc)) & FD_CLOEXEC);
+            return @as(u32, @intCast(rc)) & @as(u32, @intCast(FD_CLOEXEC)) == 0;
         }
     }
 
     const F_GETFD: i32 = 1;
-    const FD_CLOEXEC: u32 = 1;
+    const FD_CLOEXEC: i32 = 1;
 
     const kernel32 = if (builtin.os.tag == .windows) struct {
         const HANDLE_FLAG_INHERIT: u32 = 0x1;
@@ -2375,7 +2383,7 @@ const http_server_tests = struct {
         const addr = try http_server.Address.init("127.0.0.1", port);
         defer _ = closeI32Fd(addr.sock_fd);
 
-        try std.testing.expectEqual(@as(u32, 0), try listenerInheritFlag(addr.sock_fd));
+        try std.testing.expect(!try fdInheritableByaChild(addr.sock_fd));
     }
 
     test "Address.init multiple instances on different ports" {
@@ -2550,10 +2558,6 @@ const http_server_tests = struct {
         // Must NOT throw — ginwa.site is in the server-configured list.
         try security_mod.checkOriginInList(&req, ctx.allowed_origins);
     }
-
-    // ============================================================================
-    // Error Handling Tests
-    // ============================================================================
 
     // ============================================================================
     // Address Fields Validation Tests
