@@ -612,6 +612,23 @@ try gs.router.getWithOpts("/api/data", h, .{
 // CSRF HMAC, rate-limit, origin gate — see security.zig + example_group.zig
 ```
 
+Custom 404 (`not_found_handler`) — the response for any request no route claims,
+an unknown path or a method no route serves:
+
+```zig
+// Return null to keep the engine's default plain-text "Not Found".
+gs.not_found_handler = myNotFound;
+
+fn myNotFound(allocator: std.mem.Allocator, path: []const u8) anyerror!?HttpResponse {
+    const body = try std.fmt.allocPrint(allocator, "{{\"error\":\"no route for {s}\"}}", .{path});
+    return HttpResponse.init(404, "Not Found", allocator)
+        .withBody(body)
+        .setContentType("application/problem+json");
+}
+```
+
+CORS, the security headers and keep-alive framing are still applied by the engine.
+
 Cron (`cron_expression.zig` + `cronjob_manager.zig`):
 
 ```zig
@@ -701,6 +718,7 @@ Snapshot semantics; `*WithOpts` for CORS/body gate.
 - `zig build test` fails on curl link → install system libs above, or `zig build -Dforce-vendor=true`.
 - Windows without vcpkg/vendor → stub libcurl compiles but every client call returns `CURLE_FAILED_INIT` (expected). The repository ships `vendor/curl/windows-amd64/`, so this only happens on a checkout that lost it; `bash scripts/build-vendor-curl-windows.sh` restores it.
 - `413` → `max_body_bytes` exceeded; raise via `getWithOpts` / group.
+- `404` comes back as plain text → set `gs.not_found_handler` to answer with your own body (JSON, HTML).
 - `501` in reactor → SSE/WS/H2/TLS not enabled on that loop; use `listen()` or enable hijack path.
 - Template `500` → check stderr: every `ParseError` prints `template:<line>:<column>` + source line + caret.
 - SSE stalls behind proxy → ensure chunked + no buffering (`curl -N`, `X-Accel-Buffering: no`).
