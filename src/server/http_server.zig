@@ -58,17 +58,10 @@ pub const MiddlewareChain = router.MiddlewareChain;
 const socket = posix.system;
 
 /// Winsock extern declarations for Windows
-// Winsock SOCKET type — opaque handle (pointer-sized) returned by
-// socket() and accepted by all other winsock calls. Locally declared
-// as `*anyopaque` (same ABI as the underlying HANDLE on Win32/Win64).
-// Used at the call-site @ptrCast boundaries so the winsock decls can
-// stay typed as `c_int` (matching SocketFd = i32).
-const SOCKET = *anyopaque;
-
 const winsock = if (builtin.os.tag == .windows) struct {
     extern "ws2_32" fn WSAStartup(wVersionRequested: c_ushort, wsaData: *WSADATA) callconv(.c) c_int;
     extern "ws2_32" fn WSACleanup() callconv(.c) c_int;
-    extern "ws2_32" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) callconv(.c) c_int;
+    extern "ws2_32" fn WSASocketW(af: c_int, sock_type: c_int, protocol: c_int, protocol_info: ?*anyopaque, group: c_uint, flags: c_uint) callconv(.c) c_int;
     extern "ws2_32" fn closesocket(sockfd: c_int) callconv(.c) c_int;
     extern "ws2_32" fn shutdown(sockfd: c_int, how: c_int) callconv(.c) c_int;
     extern "ws2_32" fn bind(sockfd: c_int, addr: ?*const anyopaque, addrlen: c_int) callconv(.c) c_int;
@@ -82,12 +75,16 @@ const winsock = if (builtin.os.tag == .windows) struct {
     /// WSADATA struct passed to WSAStartup. 400 bytes is the canonical
     /// size per Winsock 2 docs; the contents are intentionally ignored
     /// (we just need the call to succeed so the winsock runtime is
-    /// available for subsequent socket() calls).
+    /// available for subsequent WSASocketW calls).
     const WSADATA = [400]u8;
+    const SOL_SOCKET: c_int = 0xffff;
+    const SO_EXCLUSIVEADDRUSE: c_int = -5;
+    const WSA_FLAG_NO_HANDLE_INHERIT: c_uint = 0x80;
+    const INVALID_SOCKET: c_int = -1;
 } else struct {};
 
 /// Winsock must be initialised with WSAStartup() before any other
-/// winsock function call. Without this call, `socket()` returns
+/// winsock function call. Without this call, `WSASocketW` returns
 /// `INVALID_SOCKET` (WSAEINPROGRESS / WSANOTINITIALISED) on every
 /// invocation. The runtime keeps an internal ref count, so calling
 /// WSAStartup multiple times is safe as long as each call is paired
@@ -107,8 +104,8 @@ fn ensureWinsockInitialized() void {
     var wsa_data: winsock.WSADATA = undefined;
     // MAKEWORD(2, 2) = 0x0202 — request Winsock 2.2 (the highest version
     // every Windows version since Windows 98 supports). Winsock 2 is the
-    // API surface this file relies on (WSASocket/setsockopt with the
-    // SOL_SOCKET/SO_REUSEADDR constants).
+    // API surface this file relies on (WSASocketW, setsockopt with
+    // SOL_SOCKET options).
     const version: c_ushort = (2 << 8) | 2;
     const rc = winsock.WSAStartup(version, &wsa_data);
     if (rc != 0) {
@@ -166,18 +163,12 @@ const AF_UNIX = if (builtin.os.tag == .windows) @as(u32, 1) else posix.AF.UNIX;
 const SOCK_STREAM = if (builtin.os.tag == .windows) @as(u32, 1) else posix.SOCK.STREAM;
 const IPPROTO_TCP = if (builtin.os.tag == .windows) @as(u32, 6) else posix.IPPROTO.TCP;
 
-// Cross-platform socket fd type. On Linux/macOS this is i32 (no behavior
-// change vs. the prior hard-coded `i32`). On Windows the production code
-// uses winsock handles via SOCKET (= *anyopaque); callers cast
-// `addr.sock_fd` to `c_int` at the winsock call site when needed.
-//
-// NB: keeping this as `i32` (not `std.c.fd_t`) is deliberate — the test
-// suite compares `addr.sock_fd` against integer literals (e.g. `>= 0`,
-// `== -1`) and casts it via `@intCast`/`@intFromPtr` in only a handful of
-// places. Switching to `std.c.fd_t` (= *anyopaque on Windows) would
-// cascade into 50+ test-comparison sites. The winsock declarations use
-// `SOCKET` directly, so the type mismatch surfaces only at the @ptrCast
-// boundaries that already exist.
+// Cross-platform socket fd type, `i32` on every platform. On Windows the
+// real value is a pointer-sized `SOCKET`, which always fits: the kernel
+// hands out small sequential handles. Keeping `i32` is deliberate — the
+// test suite compares `sock_fd` against integer literals (`>= 0`, `== -1`),
+// and `std.c.fd_t` (= `*anyopaque` on Windows) would cascade into 50+ of
+// those sites.
 pub const SocketFd = i32;
 
 pub const Address = struct {
@@ -216,7 +207,7 @@ pub const Address = struct {
         const socket_fd = try createSocket();
         errdefer closeFd(socket_fd);
 
-        try setReuseAddr(socket_fd);
+        try applyBindOption(socket_fd);
         try bindPort(try parseHostLe(host), port, socket_fd);
 
         return .{
@@ -228,42 +219,43 @@ pub const Address = struct {
     fn createSocket() !SocketFd {
         if (comptime builtin.os.tag == .windows) {
             ensureWinsockInitialized();
-            const fd_raw = winsock.socket(@intCast(AF_INET), @intCast(SOCK_STREAM), @intCast(IPPROTO_TCP));
-            // winsock.socket returns c_int — but the underlying return
-            // value is a SOCKET (pointer-sized). Compare to the Winsock
-            // sentinel INVALID_SOCKET (the C constant ((SOCKET)(LONG_PTR)-1), i.e.
-            // ~0usize) via intFromPtr == maxInt(usize), then narrow
-            // fd_raw back to SocketFd (= i32) — Windows socket handles
-            // are small integers assigned sequentially by the kernel
-            // (typically < 2^31) so the @intCast is safe here.
-            const fd_handle: SOCKET = @ptrFromInt(@as(usize, @intCast(fd_raw)));
-            if (@intFromPtr(fd_handle) == std.math.maxInt(usize)) return error.SocketCreationFailed;
-            return @intCast(fd_raw); // narrow SOCKET → SocketFd (i32)
+            const fd = winsock.WSASocketW(
+                @intCast(AF_INET),
+                @intCast(SOCK_STREAM),
+                @intCast(IPPROTO_TCP),
+                null,
+                0,
+                winsock.WSA_FLAG_NO_HANDLE_INHERIT,
+            );
+            if (fd == winsock.INVALID_SOCKET) return error.SocketCreationFailed;
+            return fd;
         } else {
             const fd = socket.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (fd < 0) return error.SocketCreationFailed;
+            errdefer _ = socket.close(fd);
+            try setCloseOnExec(fd);
             return @intCast(fd);
         }
     }
 
-    fn setReuseAddr(sock_fd: SocketFd) !void {
+    fn setCloseOnExec(fd: i32) !void {
+        if (builtin.os.tag == .linux) {
+            const rc: isize = @bitCast(std.os.linux.fcntl(fd, F_SETFD, FD_CLOEXEC));
+            if (rc < 0) return error.FcntlFailed;
+        } else {
+            if (std.c.fcntl(fd, F_SETFD, @as(c_int, FD_CLOEXEC)) < 0) return error.FcntlFailed;
+        }
+    }
+
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+
+    fn applyBindOption(sock_fd: SocketFd) !void {
         if (builtin.os.tag == .windows) {
             const opt: c_int = 1;
-            const rc = winsock.setsockopt(sock_fd, 0xffff, 4, &opt, @sizeOf(c_int));
+            const rc = winsock.setsockopt(sock_fd, winsock.SOL_SOCKET, winsock.SO_EXCLUSIVEADDRUSE, &opt, @sizeOf(c_int));
             if (rc != 0) return error.SetSockOptFailed;
         } else {
-            // Use the OS-correct SOL_SOCKET / SO_REUSEADDR constants from
-            // std.posix (which routes to std.os.<platform>.SO). The previous
-            // hardcoded `1, 2` happened to be `SOL_SOCKET, SO_DEBUG` on
-            // Linux (silently succeeded — DEBUG is a benign no-op-ish
-            // option) but was `SOL_SOCKET, SO_TYPE` on macOS, which is an
-            // invalid direction on a listen socket and triggers an
-            // `INVAL` in `posix.setsockopt`'s switch — the `unreachable`
-            // arm crashes the process during GinwaServer.init().
-            //
-            // sys/socket.h SOL_SOCKET = 1 on Linux and 0xffff on macOS;
-            // SO_REUSEADDR = 0x0004 on both. Using the standard library's
-            // os-tagged aliases keeps both platforms correct.
             const opt: i32 = 1;
             try posix.setsockopt(
                 sock_fd,
@@ -2241,7 +2233,6 @@ const event_loop_server_tests = struct {
         if (st.err) |err| return err;
 
         const cfd = try tcpConnect(port);
-        defer test_tcp.close(cfd);
 
         // H2 connection preface + empty SETTINGS frame.
         try writeAll(cfd, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -2250,6 +2241,11 @@ const event_loop_server_tests = struct {
         var head: [9]u8 = undefined;
         try readExact(cfd, &head);
         try std.testing.expectEqual(@as(u8, 0x04), head[3]);
+
+        // The connection must end before the loop is torn down: the H2 driver
+        // owns a blocking reader on this fd, and a live one keeps the loop
+        // thread from returning, so `join` waits forever (seen on Windows).
+        test_tcp.close(cfd);
 
         server.shutdown();
         t.join();
@@ -2343,6 +2339,55 @@ const http_server_tests = struct {
         defer _ = closeI32Fd(addr.sock_fd);
 
         try std.testing.expectEqual(port, addr.port);
+    }
+
+    fn listenTestFd(fd: i32) !void {
+        if (builtin.os.tag == .windows) {
+            if (winsock.listen(fd, 8) != 0) return error.ListenFailed;
+        } else {
+            if (socket.listen(fd, 8) != 0) return error.ListenFailed;
+        }
+    }
+
+    fn fdInheritableByaChild(fd: i32) !bool {
+        if (builtin.os.tag == .windows) {
+            var flags: u32 = 0;
+            if (kernel32.GetHandleInformation(@ptrFromInt(@as(usize, @intCast(fd))), &flags) == 0) return error.HandleInfoFailed;
+            return flags & kernel32.HANDLE_FLAG_INHERIT != 0;
+        } else if (builtin.os.tag == .linux) {
+            const rc: isize = @bitCast(std.os.linux.fcntl(fd, F_GETFD, 0));
+            if (rc < 0) return error.HandleInfoFailed;
+            return @as(usize, @bitCast(rc)) & @as(usize, @intCast(FD_CLOEXEC)) == 0;
+        } else {
+            const rc = std.c.fcntl(fd, F_GETFD);
+            if (rc < 0) return error.HandleInfoFailed;
+            return @as(u32, @intCast(rc)) & @as(u32, @intCast(FD_CLOEXEC)) == 0;
+        }
+    }
+
+    const F_GETFD: i32 = 1;
+    const FD_CLOEXEC: i32 = 1;
+
+    const kernel32 = if (builtin.os.tag == .windows) struct {
+        const HANDLE_FLAG_INHERIT: u32 = 0x1;
+        extern "kernel32" fn GetHandleInformation(object: *anyopaque, flags: *u32) callconv(.winapi) i32;
+    } else struct {};
+
+    test "a listening socket refuses a second bind on its port" {
+        const port = try freePort();
+        const first = try http_server.Address.init("127.0.0.1", port);
+        defer _ = closeI32Fd(first.sock_fd);
+        try listenTestFd(first.sock_fd);
+
+        try std.testing.expectError(error.BindFailed, http_server.Address.init("127.0.0.1", port));
+    }
+
+    test "the listening socket is not inheritable by a child process" {
+        const port = try freePort();
+        const addr = try http_server.Address.init("127.0.0.1", port);
+        defer _ = closeI32Fd(addr.sock_fd);
+
+        try std.testing.expect(!try fdInheritableByaChild(addr.sock_fd));
     }
 
     test "Address.init multiple instances on different ports" {
@@ -2516,22 +2561,6 @@ const http_server_tests = struct {
 
         // Must NOT throw — ginwa.site is in the server-configured list.
         try security_mod.checkOriginInList(&req, ctx.allowed_origins);
-    }
-
-    // ============================================================================
-    // Error Handling Tests
-    // ============================================================================
-
-    test "Address.init fails on invalid port (0 is technically valid, use reserved)" {
-        // Test that we can detect port already in use by creating two addresses
-        // on the same port (note: SO_REUSEADDR may allow this on some systems,
-        // so this test may need adjustment based on platform behavior)
-        const addr1 = try http_server.Address.init("127.0.0.1", try freePort());
-        defer _ = closeI32Fd(addr1.sock_fd);
-
-        // On Linux with SO_REUSEADDR, this should succeed. On other platforms
-        // this might fail. We test that at minimum one succeeds.
-        try std.testing.expect(addr1.sock_fd >= 0);
     }
 
     // ============================================================================

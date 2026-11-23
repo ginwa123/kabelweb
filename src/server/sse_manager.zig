@@ -1189,7 +1189,7 @@ const complex_cases_extra_tests = struct {
     /// this binary asks for that number.
     fn freePort() !u16 {
         const probe = try http_server.Address.init("127.0.0.1", 0);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
+        defer helpers.closeI32Fd(probe.sock_fd);
         return test_tcp.boundPort(probe.sock_fd);
     }
     const router = @import("router.zig");
@@ -1901,7 +1901,7 @@ const complex_cases_extra_tests = struct {
             // leak detection), and port 0 exercises exactly that without ever
             // colliding.
             const addr = try http_server.Address.init("127.0.0.1", 0);
-            _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+            helpers.closeI32Fd(addr.sock_fd);
         }
     }
 
@@ -1966,7 +1966,7 @@ const complex_cases_extra_tests = struct {
         const a = allocator;
         const port = try freePort();
         const addr = try http_server.Address.init("127.0.0.1", port);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer helpers.closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(a, undefined, addr);
         defer server.destroy(a);

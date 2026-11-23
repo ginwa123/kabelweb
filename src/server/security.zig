@@ -1027,6 +1027,7 @@ const security_tests = struct {
     const security = @import("security.zig");
     const http_server = @import("http_server.zig");
     const test_tcp = @import("test_tcp.zig");
+    const helpers = @import("test_helpers.zig");
     const router = @import("router.zig");
     const linux = std.posix.system;
 
@@ -1041,7 +1042,7 @@ const security_tests = struct {
     /// this binary asks for that number.
     fn freePort() !u16 {
         const probe = try http_server.Address.init("127.0.0.1", 0);
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, probe.sock_fd)))) else @intCast(probe.sock_fd));
+        defer helpers.closeI32Fd(probe.sock_fd);
         return test_tcp.boundPort(probe.sock_fd);
     }
 
@@ -2953,7 +2954,7 @@ const security_tests = struct {
         defer arena.deinit();
 
         const addr = try http_server.Address.init("127.0.0.1", try freePort());
-        defer _ = std.c.close(if (comptime builtin.os.tag == .windows) @ptrFromInt(@as(usize, @bitCast(@as(isize, addr.sock_fd)))) else @intCast(addr.sock_fd));
+        defer helpers.closeI32Fd(addr.sock_fd);
 
         var server = try http_server.GinwaServer.init(arena.allocator(), undefined, addr);
         defer server.destroy(arena.allocator());
