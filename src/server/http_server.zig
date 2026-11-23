@@ -437,6 +437,16 @@ pub const GinwaServer = struct {
         // ciphertext, and only the stream knows how.
         stream: Stream,
     ) anyerror!void = null,
+
+    /// Optional builder for the response when no route claims a request — an
+    /// unknown path, or a method no route serves. Return `null` to keep the
+    /// default plain-text `Not Found`. The engine still applies CORS, the
+    /// security headers and keep-alive framing to whatever comes back, so an
+    /// API can answer with a JSON (e.g. RFC 9457) body instead of text.
+    not_found_handler: ?*const fn (
+        allocator: std.mem.Allocator,
+        request_path: []const u8,
+    ) anyerror!?HttpResponse = null,
     /// Opaque cfg pointer forwarded to `static_dir_handler`. Set together
     /// with the handler via `setStaticDirHandler`.
     static_dir_cfg: ?*const anyopaque = null,
@@ -557,7 +567,6 @@ pub const GinwaServer = struct {
         self.deinit();
         allocator.destroy(self);
     }
-
 
     /// Serve through the poll reactor — the single serve path (the old
     /// thread-per-connection `listen()` was deleted). One entry point:
@@ -1048,7 +1057,7 @@ fn dispatchEventLoopRequest(
     if (server.static_dir_handler != null and server.static_dir_cfg != null) {
         return .{ .hijack_static = .{ .ctx = ctx_ptr, .run = runStaticServe } };
     }
-    var not_found = http_parser.notFound(alloc);
+    var not_found = try buildNotFoundResponse(server, alloc, req.path);
     server.applyCORSResponse(&req, &not_found) catch {};
     server.applySecurityHeadersTo(&not_found);
     not_found.keep_alive = server.clientWantsKeepAlive(&req);
@@ -1089,12 +1098,12 @@ fn runStaticServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd:
 
     const stream: Stream = .{ .plain = fd };
     const handler = server.static_dir_handler orelse {
-        serveNotFound(server, a, stream);
+        serveNotFound(server, a, stream, req.path);
         closeFd(fd);
         return;
     };
     const cfg = server.static_dir_cfg orelse {
-        serveNotFound(server, a, stream);
+        serveNotFound(server, a, stream, req.path);
         closeFd(fd);
         return;
     };
@@ -1109,15 +1118,24 @@ fn runStaticServe(ctx_ptr: *anyopaque, alloc: std.mem.Allocator, io: std.Io, fd:
     handler(cfg, a, io, req.path, range_hdr, stream) catch {
         // Handler error → 404 fallback (same as the old threaded arm;
         // best-effort: a partially-written body can't be unwound).
-        serveNotFound(server, a, stream);
+        serveNotFound(server, a, stream, req.path);
     };
     closeFd(fd);
 }
 
+/// The response for a request no route claimed: the application's when it
+/// installed a `not_found_handler`, otherwise the engine's plain text.
+fn buildNotFoundResponse(server: *GinwaServer, alloc: std.mem.Allocator, request_path: []const u8) anyerror!HttpResponse {
+    if (server.not_found_handler) |build| {
+        if (try build(alloc, request_path)) |custom| return custom;
+    }
+    return http_parser.notFound(alloc);
+}
+
 /// Best-effort 404 write for hijack runners (no keep-alive framing —
 /// hijacked conns always close afterwards).
-fn serveNotFound(server: *GinwaServer, alloc: std.mem.Allocator, stream: Stream) void {
-    var nf = http_parser.notFound(alloc);
+fn serveNotFound(server: *GinwaServer, alloc: std.mem.Allocator, stream: Stream, request_path: []const u8) void {
+    var nf = buildNotFoundResponse(server, alloc, request_path) catch http_parser.notFound(alloc);
     server.applySecurityHeadersTo(&nf);
     const bytes = nf.toBytes() catch return;
     defer alloc.free(bytes);
@@ -1616,10 +1634,20 @@ const event_loop_server_tests = struct {
     // serve path): plain routes, static-dir hijack, SSE hijack, WS hijack,
     // H2C hijack, worker-pool dispatch, and multi-loop aggregation.
 
-
     const http_server = @import("http_server.zig");
     const event_loop = @import("event_loop.zig");
     const test_tcp = @import("test_tcp.zig");
+
+    fn problemNotFound(allocator: std.mem.Allocator, path: []const u8) anyerror!?http_server.HttpResponse {
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"about:blank\",\"status\":404,\"instance\":\"{s}\"}}",
+            .{path},
+        );
+        return http_server.HttpResponse.init(404, "Not Found", allocator)
+            .withBody(body)
+            .setContentType("application/problem+json");
+    }
 
     fn helloHandler(
         ctx: http_server.HttpContext,
@@ -1764,6 +1792,46 @@ const event_loop_server_tests = struct {
         const r4 = try readHttpResponse(cfd, &buf);
         try std.testing.expect(std.mem.indexOf(u8, r4, "200 OK") != null);
         try std.testing.expect(std.mem.indexOf(u8, r4, "text/event-stream") != null);
+    }
+
+    test "a not_found_handler replaces the plain 404 body" {
+        const alloc = std.testing.allocator;
+
+        const addr = try http_server.Address.init("127.0.0.1", 0);
+        const port = try serverPort(addr.sock_fd);
+
+        var server = try http_server.GinwaServer.init(alloc, std.testing.io, addr);
+        defer server.destroy(alloc);
+
+        try server.router.get("/hello", helloHandler);
+        server.not_found_handler = problemNotFound;
+
+        var st = ServerThread{
+            .server = server,
+            .cfg = .{
+                .max_conns = 32,
+                .idle_timeout_ms = 10_000,
+                .header_timeout_ms = 2_000,
+            },
+        };
+        const t = try std.Thread.spawn(.{}, ServerThread.run, .{&st});
+        defer {
+            server.shutdown();
+            t.join();
+        }
+        std.Io.sleep(std.testing.io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+        if (st.err) |err| return err;
+
+        const cfd = try tcpConnect(port);
+        defer test_tcp.close(cfd);
+
+        var buf: [8192]u8 = undefined;
+        try writeAll(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        const answer = try readHttpResponse(cfd, &buf);
+
+        try std.testing.expect(std.mem.indexOf(u8, answer, "404") != null);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "application/problem+json") != null);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "\"instance\":\"/nope\"") != null);
     }
 
     test "listenEventLoop worker_pool mode serves correctly" {
@@ -2690,19 +2758,16 @@ const http_server_tests = struct {
         // Create a socket pair for testing. Cross-platform: socketpair on
         // POSIX, CreatePipe on Windows (no AF_UNIX socketpair(2) in Winsock).
         var pipe_fds: [2]std.c.fd_t = undefined;
-        const rc = if (comptime builtin.os.tag == .windows)
-            blk: {
-                // Use the shared helper (kernel32 CreatePipe) directly so the
-                // call returns the same error type as the POSIX branch.
-                const pair = helpers.createSocketPair() catch {
-                    // pipe creation failed, skip test
-                    return;
-                };
-                pipe_fds = pair;
-                break :blk 0;
-            }
-        else
-            posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pipe_fds);
+        const rc = if (comptime builtin.os.tag == .windows) blk: {
+            // Use the shared helper (kernel32 CreatePipe) directly so the
+            // call returns the same error type as the POSIX branch.
+            const pair = helpers.createSocketPair() catch {
+                // pipe creation failed, skip test
+                return;
+            };
+            pipe_fds = pair;
+            break :blk 0;
+        } else posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pipe_fds);
         if (rc < 0) {
             // socketpair not supported, skip test
             return;
@@ -2712,7 +2777,7 @@ const http_server_tests = struct {
         // pump defer below owns the read end (pipe_fds[0]).
 
         // Build the exact headers you sent
-        const headers = 
+        const headers =
             "POST /api/llm/session HTTP/1.1\r\n" ++
             "Accept: */*\r\n" ++
             "Accept-Encoding: gzip, deflate, br, zstd\r\n" ++
@@ -2786,7 +2851,7 @@ const http_server_tests = struct {
 
     // Test getContentLength with your exact headers
     test "RequestBuffer.getContentLength with your headers" {
-        const data = 
+        const data =
             "POST /api/llm/session HTTP/1.1\r\n" ++
             "Accept: */*\r\n" ++
             "Content-Length: 13248\r\n" ++
