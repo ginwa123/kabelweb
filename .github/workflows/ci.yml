@@ -48,14 +48,118 @@ jobs:
         run: |
           brew install pkg-config openssl@3 curl
 
+      - name: vcpkg baseline (Windows)
+        if: runner.os == 'Windows'
+        id: vcpkg-baseline
+        shell: pwsh
+        run: |
+          $rev = ""
+          if (Test-Path "C:\vcpkg\.git") {
+            $rev = (git -C C:\vcpkg rev-parse HEAD 2>$null | Select-Object -First 1)
+          }
+          if (-not $rev -or $rev.Length -ne 40) {
+            Write-Warning "C:\vcpkg has no readable git history -- keying the port cache to the image only"
+            $rev = "nogit"
+          }
+          Write-Host "vcpkg baseline $rev"
+          "rev=$rev" >> $env:GITHUB_OUTPUT
+
+      - name: Restore the vcpkg cache (Windows)
+        if: runner.os == 'Windows'
+        id: vcpkg-cache
+        # `restore` + `save` (not `cache`) so the exact key is written on the
+        # first run and refreshed on later ones. Both the source tarballs and
+        # the built binaries are cached: a cache hit needs NO download at all,
+        # which is what removes the github.com/archive 503 that made PR #15's
+        # Windows leg red (zlib 1.4, run 45534795579).
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:/vcpkg/downloads
+            C:/vcpkg/archives
+          key: vcpkg-x64-windows-curl-openssl-${{ steps.vcpkg-baseline.outputs.rev }}
+          restore-keys: |
+            vcpkg-x64-windows-curl-openssl-
+
+      - name: Seed vcpkg source archives (Windows)
+        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # vcpkg's ports fetch sources from github.com/<repo>/archive/<ref>.tar.gz.
+          # That endpoint intermittently answers 503 on hosted runners; the
+          # codeload.github.com URL serves byte-identical tarballs. Seed them
+          # into vcpkg's download cache and verify the SHA512 each port pins,
+          # so a cold cache never depends on the flaky URL. When the runner
+          # image advances its vcpkg baseline, these files simply stop matching
+          # the new port versions and vcpkg downloads the new ones normally.
+          $downloads = 'C:\vcpkg\downloads'
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          $archives = @(
+            @{
+              Name = 'madler-zlib-v1.4.tar.gz'
+              Url  = 'https://codeload.github.com/madler/zlib/tar.gz/refs/tags/v1.4'
+              Sha  = '67f3ce120210a69aa05cece6f76d5f45b50d947c095169f0d699732d0182d7d04aec1af56a3fc6bbcc2af91a57e099cd73980b17f7d96ad90aeabbeaafbf1cbc'
+            },
+            @{
+              Name = 'curl-curl-curl-8_23_0.tar.gz'
+              Url  = 'https://codeload.github.com/curl/curl/tar.gz/refs/tags/curl-8_23_0'
+              Sha  = 'e1003f374675a6ae50463995a6c705208c4247120093f1fcccf030847161235b3dfc0e40927114ccbc5b4530893990ccb96ec15400ffe4bcb275d26a0499f10e'
+            },
+            @{
+              Name = 'openssl-openssl-openssl-3.6.5.tar.gz'
+              Url  = 'https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-3.6.5'
+              Sha  = '40f0b346a9a5cf4cb37f1ecebdc74750c39a95783710061bfac58964883b0831543ecee0aee9f747ea093781b13c58a543b0b935d222519e3cb19648d77a0276'
+            }
+          )
+          foreach ($archive in $archives) {
+            $path = Join-Path $downloads $archive.Name
+            if (-not (Test-Path $path)) {
+              Write-Host "seeding $($archive.Name) from $($archive.Url)"
+              try {
+                Invoke-WebRequest -Uri $archive.Url -OutFile $path
+              } catch {
+                Remove-Item -Force $path -ErrorAction SilentlyContinue
+                throw
+              }
+            }
+            $actual = (Get-FileHash -Algorithm SHA512 -Path $path).Hash.ToLowerInvariant()
+            if ($actual -ne $archive.Sha) {
+              Remove-Item -Force $path
+              throw "vcpkg source archive $($archive.Name) failed SHA512 verification"
+            }
+            Write-Host "ok $($archive.Name)"
+          }
+
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          vcpkg install --recurse curl:x64-windows openssl:x64-windows
+          $env:VCPKG_DOWNLOADS = 'C:\vcpkg\downloads'
+          # --binarysource makes the restored C:/vcpkg/archives the package
+          # cache: on a hit vcpkg extracts the ports instead of rebuilding
+          # them (8-10 min -> seconds) and never touches the network.
+          & C:\vcpkg\vcpkg.exe install --recurse --binarysource="files,C:/vcpkg/archives,readwrite" curl:x64-windows openssl:x64-windows
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "vcpkg install failed with exit code $LASTEXITCODE"
+            exit 1
+          }
           # Runtime DLLs (libcurl.dll, libssl-3-x64.dll, ...) must be on
           # PATH or the test binary aborts before main() runs.
           "C:\vcpkg\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Save the vcpkg cache (Windows)
+        if: runner.os == 'Windows' && !cancelled() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        # Runs even if a later step fails: whatever vcpkg managed to fetch or
+        # build is still worth keeping. A cache entry is immutable, so an
+        # exact-key hit skips the upload.
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:/vcpkg/downloads
+            C:/vcpkg/archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Build
         run: zig build --summary all
