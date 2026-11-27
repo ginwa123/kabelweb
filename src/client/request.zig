@@ -481,10 +481,12 @@ const edge_case_tests = struct {
     //     client-side timeout behaviour.
     //
     //   - "edge: gzipped response (Content-Encoding: gzip) is decoded" —
-    //     httpbin.org/gzip. The local handler would need to actually
-    //     gzip-encode bytes (or use libcurl's manual inflation); the
-    //     current /gzip route just sets the encoding header without
-    //     compressing. Add a zlib-backed route when needed.
+    //     httpbin.org/gzip. The local /gzip route only sets the encoding header
+    //     without compressing: libcurl decodes transparently, but only when it
+    //     sent Accept-Encoding, which the client has no option for yet. The
+    //     server CAN now produce real gzip bodies (see
+    //     `server/compression.zig`), so this becomes a real test once the
+    //     client grows an accept-encoding option (CURLOPT_ACCEPT_ENCODING).
     //
     //   - "edge: IPv6 URL parses" — was a URL parser test against
     //     httpbin.org. The parser is exercised by other tests that hit
