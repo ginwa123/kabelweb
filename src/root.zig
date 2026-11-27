@@ -30,6 +30,8 @@ pub const HttpRequest = server.HttpRequest;
 pub const HttpResponse = server.HttpResponse;
 pub const HttpContext = server.HttpContext;
 pub const Session = server.Session;
+/// Response compression (gzip): `Config`, `Workspace`, `Pool`, `negotiate`.
+pub const compression = server.compression;
 pub const Context = server.Context;
 pub const ContextStore = server.ContextStore;
 pub const SseManager = server.SseManager;
@@ -77,6 +79,9 @@ test {
     _ = @import("server/router.zig");
     _ = @import("server/context.zig");
     _ = @import("server/security.zig");
+    // Response compression (gzip over std.compress.flate).
+    _ = @import("server/compression.zig");
+    _ = @import("server/compression_wire.zig");
     _ = @import("server/stream.zig");
     _ = @import("server/read_html.zig");
     _ = @import("server/template.zig");

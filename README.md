@@ -711,6 +711,21 @@ Worker pool (`worker_pool.zig` `Config`): `thread_count` (`0` = ncpu, min 2),
 Router: registration order = match order. `Group{prefix, middlewares, max_body_bytes}`.
 Snapshot semantics; `*WithOpts` for CORS/body gate.
 
+Compression (`compression.zig` `Config`, on `GinwaServer.compression`): **gzip, on by
+default** — a `text/*`, JSON or XML body is compressed whenever the client sends
+`Accept-Encoding: gzip` and the body is at least `min_bytes` (default 512). Level
+defaults to `.default` = 6 (~80% smaller, what Cloudflare and nginx use on the fly);
+`.level_3` is the cheap option when the box is CPU-bound (~70%). Skipped for
+already-compressed types, an existing `Content-Encoding`, `206`/`Content-Range`,
+`Cache-Control: no-transform`, SSE/WS and the static-file fallback. Emits
+`Content-Encoding: gzip` + `Vary: Accept-Encoding`:
+
+```zig
+server.compression.enabled = false;      // off entirely
+server.compression.min_bytes = 1024;     // only large bodies
+server.compression.level = .level_3;     // less CPU, slightly worse ratio
+```
+
 ---
 
 ## Troubleshooting

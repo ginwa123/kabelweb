@@ -14,6 +14,10 @@ A lightweight, pure Zig HTTP server implementation with routing, SSE support, We
 - **SSE (Server-Sent Events)**: Built-in SSE manager with heartbeat and broadcasting
 - **WebSocket**: RFC 6455 WebSocket transport with frame parsing/encoding, handshake, and a client manager (broadcast + targeted send)
 - **JSON Handling**: JSON request/response parsing and generation
+- **gzip Compression**: response bodies are gzipped when the client accepts it
+  (`Accept-Encoding: gzip`) — on by default at level 6 (Cloudflare/nginx's
+  on-the-fly level), 512-byte floor, no dependencies (std flate). See
+  `compression.zig` (`server.compression`).
 - **Concurrent**: Per-connection request handling with arena allocators
 - **Cross-Platform**: Linux, macOS, BSD, and Windows support
 

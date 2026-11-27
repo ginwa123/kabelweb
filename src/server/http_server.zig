@@ -7,6 +7,10 @@ pub const router = @import("router.zig");
 const connection_reader = @import("connection_reader.zig");
 const http2_server = @import("http2/server.zig");
 pub const security = @import("security.zig");
+// Response compression (gzip), zero-dependency: std.compress.flate.
+pub const compression = @import("compression.zig");
+const compression_mod = compression;
+pub const CompressionConfig = compression.Config;
 pub const sse_manager = @import("sse_manager.zig");
 pub const ws_manager = @import("websocket_manager.zig");
 pub const ws_frames = @import("websocket_frames.zig");
@@ -262,6 +266,11 @@ pub const GinwaServer = struct {
 
     cors: CORSConfig = .{},
 
+    /// Response compression (gzip): on by default; see `compression.Config`.
+    compression: CompressionConfig = .{},
+    /// Encoder workspaces, one per concurrent compression; `capacity` bounds them.
+    compression_pool: compression_mod.Pool = .{},
+
     max_body_bytes: usize = std.math.maxInt(usize),
 
     security_headers: security.SecurityHeaders = .{},
@@ -348,6 +357,7 @@ pub const GinwaServer = struct {
     }
 
     pub fn deinit(self: *GinwaServer) void {
+        self.compression_pool.deinit(self.allocator);
         self.cronjob_manager.stop();
         self.cronjob_manager.deinit();
         self.sse_manager.gracefulShutdown();
@@ -629,6 +639,17 @@ pub const GinwaServer = struct {
         security.applySecurityHeadersWith(resp, self.security_headers);
     }
 
+    /// Compress `resp` in place per `self.compression`; on an OOM it stays identity.
+    pub fn compressResponse(self: *GinwaServer, req: *const HttpRequest, resp: *HttpResponse) bool {
+        return compression_mod.maybeCompress(
+            self.allocator,
+            resp,
+            compression_mod.acceptEncodingOf(req),
+            self.compression,
+            &self.compression_pool,
+        );
+    }
+
     fn buildCORSPreflight(self: *GinwaServer, request: *const HttpRequest, allocator: std.mem.Allocator) !HttpResponse {
         return security.buildPreflightResponse(allocator, request, self.cors);
     }
@@ -655,6 +676,16 @@ fn dispatchEventLoopRequest(
     var session = Session.init(server.context_store, lookup.context, lookup.id);
     req.session = &session;
 
+    // Every `.respond` leaves through here, so gzip runs last, on the final body.
+    const respond = struct {
+        fn make(s: *GinwaServer, r: *const HttpRequest, built: HttpResponse) event_loop_mod.DispatchResult {
+            var resp = built;
+            _ = s.compressResponse(r, &resp);
+            return .{ .respond = resp };
+        }
+    }.make;
+
+    // Engine pre-gate (body cap + origin allowlist).
     {
         const gate = security.preGateCheck(&req, server.cors, server.max_body_bytes) catch .pass;
         if (gate != .pass) {
@@ -679,14 +710,14 @@ fn dispatchEventLoopRequest(
                 ) catch {};
             }
             page.keep_alive = false;
-            return .{ .respond = page };
+            return respond(server, &req, page);
         }
     }
 
     if (server.cors.enabled and std.mem.eql(u8, req.method, "OPTIONS")) {
         var preflight = try server.buildCORSPreflight(&req, alloc);
         preflight.keep_alive = false;
-        return .{ .respond = preflight };
+        return respond(server, &req, preflight);
     }
 
     if (server.router.matchRoute(req.method, req.path, &req, http_ctx)) |result| {
@@ -697,21 +728,21 @@ fn dispatchEventLoopRequest(
                     if (gate != .pass) {
                         var page = try security.buildEngineBlockPage(alloc, gate, null, "your-domain");
                         page.keep_alive = false;
-                        return .{ .respond = page };
+                        return respond(server, &req, page);
                     }
                 }
                 var final = try h.chain.run(h.ctx, h.req, h.res);
                 server.applyCORSResponse(&req, &final) catch {};
                 server.applySecurityHeadersTo(&final);
                 final.keep_alive = server.clientWantsKeepAlive(&req);
-                return .{ .respond = final };
+                return respond(server, &req, final);
             },
             .websocket => {
                 if (server.tls_ctx != null) {
                     var res = HttpResponse.init(501, "Not Implemented", alloc)
                         .withBody("WebSocket is not available over TLS yet.");
                     res.keep_alive = false;
-                    return .{ .respond = res };
+                    return respond(server, &req, res);
                 }
                 return .{ .hijack_ws = .{ .ctx = ctx_ptr, .run = runWsServe } };
             },
@@ -720,7 +751,7 @@ fn dispatchEventLoopRequest(
                     var res = HttpResponse.init(501, "Not Implemented", alloc)
                         .withBody("SSE is not available over TLS yet.");
                     res.keep_alive = false;
-                    return .{ .respond = res };
+                    return respond(server, &req, res);
                 }
                 return .{ .hijack_sse = .{ .ctx = ctx_ptr, .run = runSseServe } };
             },
@@ -734,7 +765,7 @@ fn dispatchEventLoopRequest(
     server.applyCORSResponse(&req, &not_found) catch {};
     server.applySecurityHeadersTo(&not_found);
     not_found.keep_alive = server.clientWantsKeepAlive(&req);
-    return .{ .respond = not_found };
+    return respond(server, &req, not_found);
 }
 
 fn wsWriteAdapter(ctx: ?*anyopaque, target_fd: i32, data: []const u8) anyerror!usize {

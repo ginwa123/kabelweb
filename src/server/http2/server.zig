@@ -136,7 +136,7 @@ fn dispatch(
         var page = security.buildEngineBlockPage(alloc, gate, origin, host) catch return error.OutOfMemory;
         applySecurityHeaders(server, &page);
         try applyCors(server, &hreq, &page);
-        return toResponse(alloc, &page, pairs, status, body);
+        return toResponse(alloc, server, &hreq, &page, pairs, status, body);
     }
 
     // CORS preflight is browser-driven and h2 clients do not send it, but keep
@@ -144,7 +144,7 @@ fn dispatch(
     if (server.cors.enabled and std.mem.eql(u8, hreq.method, "OPTIONS")) {
         var preflight = security.buildPreflightResponse(alloc, &hreq, server.cors) catch return error.OutOfMemory;
         try applyCors(server, &hreq, &preflight);
-        return toResponse(alloc, &preflight, pairs, status, body);
+        return toResponse(alloc, server, &hreq, &preflight, pairs, status, body);
     }
 
     const http_ctx = http_parser.HttpContext{
@@ -166,7 +166,7 @@ fn dispatch(
                 if (route_gate != .pass) {
                     var page = security.buildEngineBlockPage(alloc, route_gate, null, "this route") catch return error.OutOfMemory;
                     applySecurityHeaders(server, &page);
-                    return toResponse(alloc, &page, pairs, status, body);
+                    return toResponse(alloc, server, &hreq, &page, pairs, status, body);
                 }
             }
             if (h.chain.on_pre_handler_fail) |fail_base| {
@@ -181,14 +181,14 @@ fn dispatch(
                     var gated = fail_resp;
                     try applyCors(server, &h.req, &gated);
                     applySecurityHeaders(server, &gated);
-                    return toResponse(alloc, &gated, pairs, status, body);
+                    return toResponse(alloc, server, &hreq, &gated, pairs, status, body);
                 }
             }
 
             var final_res = h.chain.run(h.ctx, h.req, h.res) catch http_parser.internalError("Handler error", alloc);
             try applyCors(server, &h.req, &final_res);
             applySecurityHeaders(server, &final_res);
-            return toResponse(alloc, &final_res, pairs, status, body);
+            return toResponse(alloc, server, &hreq, &final_res, pairs, status, body);
         },
         // Streaming transports are HTTP/1.1-only in phase 1 — a browser still
         // uses the h1 connection for them, and an h2 client gets an explicit
@@ -214,16 +214,17 @@ fn applyCors(server: *http_server.GinwaServer, req: *const http_parser.HttpReque
     return security.applyCORSResponse(resp, req, server.cors);
 }
 
-/// Convert an `HttpResponse` into h2 (status, header pairs). Header names are
-/// lowercased because RFC 9113 §8.2.1 makes an uppercase field name a
-/// PROTOCOL_ERROR on the peer's side — nghttp2 (and therefore curl) rejects it.
+/// Convert an `HttpResponse` into h2 (status, pairs, body): gzip first, then frame.
 fn toResponse(
     alloc: std.mem.Allocator,
+    server: *http_server.GinwaServer,
+    req: *const http_parser.HttpRequest,
     resp: *http_parser.HttpResponse,
     pairs: *std.ArrayList(hpack.Pair),
     status: *u16,
     body: *[]const u8,
 ) !void {
+    _ = server.compressResponse(req, resp);
     status.* = resp.status_code;
     body.* = resp.body;
     pairs.clearRetainingCapacity();
@@ -234,6 +235,21 @@ fn toResponse(
             .value = entry.value_ptr.*,
         });
     }
+    // An explicit length from the FINAL body, like the h1 path emits.
+    if (!hasPair(pairs.items, "content-length") and resp.body.len > 0 and
+        resp.status_code != 204 and resp.status_code != 304)
+    {
+        const length_text = try std.fmt.allocPrint(alloc, "{d}", .{resp.body.len});
+        try pairs.append(alloc, .{ .name = "content-length", .value = length_text });
+    }
+}
+
+/// Whether the pair list already carries `name` (h2 field names are lowercase).
+fn hasPair(pairs: []const hpack.Pair, name: []const u8) bool {
+    for (pairs) |pair| {
+        if (std.mem.eql(u8, pair.name, name)) return true;
+    }
+    return false;
 }
 
 /// Server-level security headers (CSP etc.). Wraps the same `security` helper the
